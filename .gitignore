@@ -1,0 +1,7 @@
+/example/embedded/data/
+*.bleve/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+/dist/
+.DS_Store
