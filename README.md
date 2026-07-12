@@ -16,10 +16,14 @@ go get github.com/bornholm/amoxtli
 
 Aucune directive `replace` n'est nécessaire : le backend `index/sqlitevec` embarque son propre build WASM de SQLite incluant l'extension sqlite-vec (voir `index/sqlitevec/internal/vec`).
 
-> **Backend sqlite-vec et version de `ncruces/go-sqlite3`.** Le build WASM embarqué est couplé à l'ABI de `github.com/ncruces/go-sqlite3` **v0.23.0** (variables `sqlite3.Binary` / `sqlite3.RuntimeConfig`, retirées dans les versions ultérieures). Si vous utilisez le backend sqlite-vec, épinglez cette version dans votre `go.mod` — sinon `go get` peut sélectionner une version plus récente incompatible :
+> **Backend sqlite-vec : versions de `ncruces/go-sqlite3` et `wazero`.** Le build WASM embarqué impose deux contraintes (déclarées dans le `go.mod` d'amoxtli, à préserver côté consommateur) :
 > ```
-> require github.com/ncruces/go-sqlite3 v0.23.0
+> require github.com/ncruces/go-sqlite3 v0.23.0   // ABI hôte du WASM
+> require github.com/tetratelabs/wazero v1.11.0   // >= v1.9.0
 > ```
+> - `ncruces/go-sqlite3` **v0.23.0** : le WASM est couplé à cette ABI (`sqlite3.Binary` / `sqlite3.RuntimeConfig`, retirées dans les versions ultérieures ; les versions ≥ v0.30.5 attendent un contrat guest incompatible).
+> - `tetratelabs/wazero` **≥ v1.9.0** : le compilateur de wazero v1.8.2 (version épinglée par défaut par ncruces v0.23.0) mis-compile `vec0Filter` de sqlite-vec et provoque un crash (`out of bounds memory access`) sur **toute** requête KNN. Corrigé depuis wazero v1.9.0.
+>
 > Les autres backends (bleve, postgres) et le magasin SQLite (`ingest/gorm`) ne sont pas concernés.
 
 ## Démarrage rapide

@@ -5,8 +5,21 @@
 // github.com/Bornholm/sqlite-vec-go-bindings (itself a fork of
 // github.com/asg017/sqlite-vec-go-bindings), inlined here so that amoxtli
 // remains installable with a plain `go get`, without a go.mod `replace`
-// directive. The embedded sqlite3.wasm is built against a recent
-// ncruces/go-sqlite3 release; update it in lockstep with that dependency.
+// directive.
+//
+// Version constraints (both enforced by go.mod, breaking either one breaks the
+// sqlite-vec backend):
+//
+//   - github.com/ncruces/go-sqlite3 must stay at v0.23.0: the embedded
+//     sqlite3.wasm targets that host ABI (2-arg go_busy_timeout, Binary /
+//     RuntimeConfig hooks). v0.17.1 and earlier fail to instantiate; v0.30.5+
+//     expect a newer guest contract (go_final) this wasm does not provide, and
+//     the newest releases dropped Binary / RuntimeConfig entirely.
+//   - github.com/tetratelabs/wazero must stay at v1.9.0 or later: the wazero
+//     v1.8.2 optimizing compiler (the version ncruces v0.23.0 pins by default)
+//     mis-compiles sqlite-vec's vec0Filter, causing an out-of-bounds memory
+//     access panic on every KNN query. v1.9.0+ fixes it; the interpreter
+//     runtime is unaffected but far slower.
 //
 // See LICENSE in this directory for the sqlite-vec license and attribution.
 package vec

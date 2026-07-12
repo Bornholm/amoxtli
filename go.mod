@@ -22,7 +22,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.37.0
 	github.com/testcontainers/testcontainers-go/modules/ollama v0.35.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.37.0
-	github.com/tetratelabs/wazero v1.8.2
+	github.com/tetratelabs/wazero v1.11.0
 	github.com/yuin/goldmark v1.7.8
 	github.com/yuin/goldmark-meta v1.1.0
 	golang.org/x/time v0.15.0
