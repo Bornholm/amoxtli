@@ -50,7 +50,7 @@ taskID, _ := codex.IndexFile(ctx, collID, "guide.md", file)
 results, _ := codex.Search(ctx, "comment faire…", amoxtli.WithSearchMaxResults(5))
 ```
 
-Exemples complets et exécutables : [`example/sqlite`](example/sqlite/main.go) (SQLite + bleve, sans LLM) et [`example/postgres`](example/postgres/main.go) (tout PostgreSQL).
+Exemples complets et exécutables : [`example/sqlite`](example/sqlite/main.go) (SQLite + bleve, sans LLM), [`example/postgres`](example/postgres/main.go) (tout PostgreSQL) et [`example/convert`](example/convert/main.go) (conversion de fichier + suivi de tâche).
 
 ## Architecture
 
@@ -113,6 +113,8 @@ Voir [`example/postgres`](example/postgres/main.go) pour un exemple complet et e
 ## Convertisseurs de fichiers
 
 Binaires externes requis selon le convertisseur : `pandoc` (`convert/pandoc`), `libreoffice` (`convert/libreoffice`). `convert/genai` utilise une API d'extraction LLM/OCR (Mistral OCR, Marker).
+
+Le convertisseur se branche via `amoxtli.WithFileConverter(...)` ; l'ingestion route alors automatiquement tout fichier non-markdown à travers lui avant parsing et indexation. `convert.NewRouted(...)` combine plusieurs convertisseurs par extension. L'ingestion étant asynchrone, `IndexFile` renvoie un `task.ID` : on suit la progression et les messages d'étape (« converting document », « parsing document », « indexing document »…) via `codex.TaskState(ctx, id)`. Voir [`example/convert`](example/convert/main.go) (implémente aussi un `convert.Converter` minimal, sans binaire externe).
 
 ## Tests
 
