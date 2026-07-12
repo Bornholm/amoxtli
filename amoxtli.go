@@ -15,6 +15,7 @@ import (
 	"github.com/bornholm/amoxtli/index/pipeline"
 	"github.com/bornholm/amoxtli/ingest"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/task"
 	taskMemory "github.com/bornholm/amoxtli/task/memory"
 
@@ -29,6 +30,8 @@ type Codex struct {
 	index            index.Index
 	store            ingest.Store
 	taskRunner       task.Runner
+	evaluator        retrieval.EvidenceEvaluator
+	orchestrator     *retrieval.Orchestrator
 	snapshotBoundary string
 	cancel           context.CancelFunc
 }
@@ -83,7 +86,11 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 		resultsTransformers := []pipeline.ResultsTransformer{
 			pipeline.NewDuplicateContentResultsTransformer(store),
 		}
-		if !opts.disableJudge && opts.llmClient != nil {
+		// When grounding is enabled the fused EvidenceEvaluator takes over
+		// relevance filtering (applied by Search and the orchestrator), so the
+		// Judge transformer is left out of the pipeline to avoid a redundant LLM
+		// pass over the same evidence.
+		if !opts.disableJudge && opts.llmClient != nil && !opts.groundingCheck {
 			resultsTransformers = append(resultsTransformers,
 				pipeline.NewJudgeResultsTransformer(opts.llmClient, store, opts.maxTotalWords),
 			)
@@ -125,9 +132,57 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	codex.index = idx
 	codex.store = store
 	codex.taskRunner = taskRunner
+
+	// The fused evidence evaluator (relevance filtering + grounding verdict) is
+	// shared across Search (filtering), CheckGrounding (verdict) and the
+	// orchestrator/SearchIterative (both). It replaces the pipeline Judge when
+	// enabled.
+	if opts.groundingCheck && opts.llmClient != nil {
+		codex.evaluator = retrieval.NewLLMEvidenceEvaluator(opts.llmClient, store, opts.maxTotalWords)
+	}
+	codex.orchestrator = newOrchestrator(opts, manager, codex.evaluator)
+
 	codex.cancel = cancel
 
 	return codex, nil
+}
+
+// newOrchestrator builds the explicit re-retrieval orchestrator (used by
+// SearchIterative) wired to the ingest manager's Search. When evaluator is nil
+// and no decomposition/reformulation is enabled it degrades to a plain search.
+func newOrchestrator(opts *options, manager *ingest.Manager, evaluator retrieval.EvidenceEvaluator) *retrieval.Orchestrator {
+	searchFn := func(ctx context.Context, query string, maxResults int, collections []model.CollectionID) ([]*index.SearchResult, error) {
+		ingestOpts := []ingest.SearchOptionFunc{
+			ingest.WithSearchMaxResults(maxResults),
+		}
+		if len(collections) > 0 {
+			ingestOpts = append(ingestOpts, ingest.WithSearchCollections(collections...))
+		}
+		return manager.Search(ctx, query, ingestOpts...)
+	}
+
+	orchestratorOpts := []retrieval.OrchestratorOption{}
+	if evaluator != nil {
+		orchestratorOpts = append(orchestratorOpts,
+			retrieval.WithEvidenceEvaluator(evaluator),
+			retrieval.WithGroundingMinScore(opts.groundingMinScore),
+		)
+	}
+	if opts.iterativeRetrieval && opts.llmClient != nil {
+		orchestratorOpts = append(orchestratorOpts,
+			retrieval.WithQueryReformulator(retrieval.NewLLMQueryReformulator(opts.llmClient)),
+			retrieval.WithMaxRounds(opts.iterativeMaxRounds),
+		)
+	}
+	if opts.queryDecomposition && opts.llmClient != nil {
+		orchestratorOpts = append(orchestratorOpts,
+			retrieval.WithQueryDecomposer(
+				retrieval.NewLLMQueryDecomposer(opts.llmClient, opts.decompositionMaxSubQueries),
+			),
+		)
+	}
+
+	return retrieval.NewOrchestrator(searchFn, orchestratorOpts...)
 }
 
 // IndexFile indexes a file into the given collection.
@@ -179,7 +234,60 @@ func (c *Codex) Search(ctx context.Context, query string, funcs ...SearchOption)
 		return nil, errors.WithStack(err)
 	}
 
+	// When grounding is enabled the Judge is out of the pipeline; the evidence
+	// evaluator provides the relevance filtering here instead (its verdict is
+	// computed but not surfaced by Search — use CheckGrounding for that).
+	if c.evaluator != nil {
+		evaluation, err := c.evaluator.Evaluate(ctx, query, results)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		results = retrieval.FilterRelevant(results, evaluation.Relevant)
+	}
+
 	return results, nil
+}
+
+// CheckGrounding evaluates whether the given search results support a reliable,
+// grounded answer to the query, returning a verdict (status + score +
+// explanation). It is a standalone step, fully decoupled from Search: run Search
+// first, then pass its results here to decide whether to trust them or abstain.
+// Requires WithGroundingCheck and an LLM client; otherwise it returns an error.
+func (c *Codex) CheckGrounding(ctx context.Context, query string, results []*index.SearchResult) (*retrieval.GroundingResult, error) {
+	if c.evaluator == nil {
+		return nil, errors.New("amoxtli: grounding not configured (use WithLLMClient and WithGroundingCheck)")
+	}
+
+	evaluation, err := c.evaluator.Evaluate(ctx, query, results)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	result := &evaluation.Grounding
+
+	return result, nil
+}
+
+// SearchIterative runs the explicit re-retrieval orchestration on top of Search:
+// optional query decomposition and, when a grounding checker and reformulator
+// are configured, grounding-gated iterative re-retrieval. It returns the fused
+// evidence together with the final grounding verdict (retrieval.Result). It is a
+// separate entry point from Search (which stays a plain, single-shot retrieval)
+// and from CheckGrounding; with none of the orchestration options enabled it is
+// equivalent to Search.
+func (c *Codex) SearchIterative(ctx context.Context, query string, funcs ...SearchOption) (*retrieval.Result, error) {
+	opts := &SearchOptions{
+		MaxResults: 5,
+	}
+	for _, fn := range funcs {
+		fn(opts)
+	}
+
+	result, err := c.orchestrator.Search(ctx, query, opts.MaxResults, opts.Collections)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return result, nil
 }
 
 // GetSectionsByIDs returns the sections matching the given IDs, typically

@@ -2,8 +2,6 @@ module github.com/bornholm/amoxtli
 
 go 1.25.5
 
-replace github.com/asg017/sqlite-vec-go-bindings => github.com/Bornholm/sqlite-vec-go-bindings v0.0.0-20250407170538-55971919e573
-
 // Dev convenience (sibling modules):
 // replace github.com/bornholm/genai => ../genai
 // replace github.com/bornholm/go-x => ../go-x
@@ -11,7 +9,6 @@ replace github.com/asg017/sqlite-vec-go-bindings => github.com/Bornholm/sqlite-v
 require (
 	github.com/Bornholm/amatl v0.21.1
 	github.com/abadojack/whatlanggo v1.0.1
-	github.com/asg017/sqlite-vec-go-bindings v0.0.0-00010101000000-000000000000
 	github.com/blevesearch/bleve/v2 v2.5.0
 	github.com/bornholm/genai v0.17.1
 	github.com/bornholm/go-x v0.0.0-20260127104343-c6737ea35324
@@ -25,6 +22,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.37.0
 	github.com/testcontainers/testcontainers-go/modules/ollama v0.35.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.37.0
+	github.com/tetratelabs/wazero v1.8.2
 	github.com/yuin/goldmark v1.7.8
 	github.com/yuin/goldmark-meta v1.1.0
 	golang.org/x/time v0.15.0
@@ -56,7 +54,6 @@ require (
 	github.com/blevesearch/zapx/v14 v14.4.1 // indirect
 	github.com/blevesearch/zapx/v15 v15.4.1 // indirect
 	github.com/blevesearch/zapx/v16 v16.2.2 // indirect
-	github.com/caarlos0/env/v11 v11.3.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
@@ -82,7 +79,6 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
@@ -107,7 +103,6 @@ require (
 	github.com/shirou/gopsutil/v4 v4.25.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
-	github.com/tetratelabs/wazero v1.8.2 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect

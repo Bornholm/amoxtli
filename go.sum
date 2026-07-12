@@ -6,8 +6,6 @@ github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 h1:L/gRVlceqvL25
 github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
 github.com/Bornholm/amatl v0.21.1 h1:PsqcpWxr84FgiEi3Z7Jaor1+oJ4EpzlTJkyQFrudQ24=
 github.com/Bornholm/amatl v0.21.1/go.mod h1:0YoVnIOwF/r/+KSlADd+LUmObnZET9N0YSRuGdyp6W8=
-github.com/Bornholm/sqlite-vec-go-bindings v0.0.0-20250407170538-55971919e573 h1:I2rFJnG2TKhIuUIczSVarby+2yUAmQHbBF03EaUNCpU=
-github.com/Bornholm/sqlite-vec-go-bindings v0.0.0-20250407170538-55971919e573/go.mod h1:H9PKzExSRvegIrOduGGDOMSuFDSub3j3h4bojaXIUoc=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/RealAlexandreAI/json-repair v0.0.14 h1:4kTqotVonDVTio5n2yweRUELVcNe2x518wl0bCsw0t0=
@@ -59,8 +57,6 @@ github.com/bornholm/genai v0.17.1 h1:n7xjk5aoyrq36vUK1gnEuoj5HS5t4rMSV5z2FlUMq+I
 github.com/bornholm/genai v0.17.1/go.mod h1:OmbuElbTAc78us9NFtktRIA7pb9QZnVk41zYtoHepqI=
 github.com/bornholm/go-x v0.0.0-20260127104343-c6737ea35324 h1:urrNBFQGXI3uvAivANnjEBdZVMDfmWn/okKIwDDqJ/w=
 github.com/bornholm/go-x v0.0.0-20260127104343-c6737ea35324/go.mod h1:LrDsNbXXqkdlQ/tlcbWKUF/FoFA/WjUEtNDRa/Xl19c=
-github.com/caarlos0/env/v11 v11.3.1 h1:cArPWC15hWmEt+gWk7YBi7lEXTXCvpaSdCiZE2X5mCA=
-github.com/caarlos0/env/v11 v11.3.1/go.mod h1:qupehSf/Y0TUTsxKywqRt/vJjN5nz6vauiYEUUr8P4U=
 github.com/cenkalti/backoff/v4 v4.3.0 h1:MyRJ/UdXutAwSAT+s3wNd7MfTIcy71VQueUuFK343L8=
 github.com/cenkalti/backoff/v4 v4.3.0/go.mod h1:Y3VNntkOUPxTVeUxJ/G5vcM//AlwfmyYozVcomhLiZE=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
@@ -130,8 +126,6 @@ github.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD
 github.com/jinzhu/inflection v1.0.0/go.mod h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc=
 github.com/jinzhu/now v1.1.5 h1:/o9tlHleP7gOFmsnYNz3RGnqzefHA47wQpKrrdTIwXQ=
 github.com/jinzhu/now v1.1.5/go.mod h1:d3SSVoowX0Lcu0IBviAWJpolVfI5UJVZZ7cO71lE/z8=
-github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
-github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=
 github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=
 github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
 github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=

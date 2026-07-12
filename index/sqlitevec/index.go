@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/url"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,16 +18,69 @@ import (
 	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
 
-	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/ncruces"
+	sqlite_vec "github.com/bornholm/amoxtli/index/sqlitevec/internal/vec"
 )
 
 type Index struct {
-	maxWords int
-	getConn  func(ctx context.Context) (*sqlite3.Conn, error)
-	llm      llm.Client
-	model    string
+	maxWords   int
+	vectorSize int
+	getConn    func(ctx context.Context) (*sqlite3.Conn, error)
+	llm        llm.Client
+	model      string
 	// rwLock allows concurrent Search operations while serializing Index/Delete
 	rwLock sync.RWMutex
+}
+
+// DefaultMaxWords bounds, by default, the number of words per chunk sent to the
+// embeddings model.
+const DefaultMaxWords int = 500
+
+// Options configures a sqlite-vec Index.
+type Options struct {
+	// EmbeddingsModel identifies the embeddings model. It is recorded in the
+	// index and opening an existing index with a different model is rejected
+	// (the stored vectors would no longer be comparable).
+	EmbeddingsModel string
+	// VectorSize is the dimension of the vec0 embedding column (default
+	// DefaultVectorSize). It is recorded in the index; opening an existing
+	// index with a different size is rejected.
+	VectorSize int
+	// MaxWords bounds the size of the chunks sent to the embeddings model.
+	MaxWords int
+}
+
+type OptionFunc func(opts *Options)
+
+// WithEmbeddingsModel records the embeddings model backing the index.
+func WithEmbeddingsModel(model string) OptionFunc {
+	return func(opts *Options) {
+		opts.EmbeddingsModel = model
+	}
+}
+
+// WithVectorSize sets the dimension of the vec0 embedding column.
+func WithVectorSize(size int) OptionFunc {
+	return func(opts *Options) {
+		opts.VectorSize = size
+	}
+}
+
+// WithMaxWords bounds the size of the chunks sent to the embeddings model.
+func WithMaxWords(maxWords int) OptionFunc {
+	return func(opts *Options) {
+		opts.MaxWords = maxWords
+	}
+}
+
+func NewOptions(funcs ...OptionFunc) *Options {
+	opts := &Options{
+		VectorSize: DefaultVectorSize,
+		MaxWords:   DefaultMaxWords,
+	}
+	for _, fn := range funcs {
+		fn(opts)
+	}
+	return opts
 }
 
 // DeleteByID implements index.Index.
@@ -333,7 +387,7 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 		vecStmt, _, err := conn.Prepare(fmt.Sprintf(`
 			INSERT INTO embeddings_vec (rowid, embedding)
 			VALUES (?, vec_normalize(vec_slice(?, 0, %d)));
-		`, VectorSize))
+		`, i.vectorSize))
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -507,7 +561,7 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 		}
 
 		// Use <column> match <value> syntax for vec0 KNN query
-		sql += fmt.Sprintf(` WHERE v.embedding match vec_normalize(vec_slice(?, 0, %d))`, VectorSize)
+		sql += fmt.Sprintf(` WHERE v.embedding match vec_normalize(vec_slice(?, 0, %d))`, i.vectorSize)
 
 		// Add k parameter for vec0 (number of nearest neighbors)
 		sql += ` AND k = ?`
@@ -664,7 +718,11 @@ func (i *Index) withRetry(ctx context.Context, fn func(ctx context.Context, conn
 				slog.DebugContext(ctx, "will retry transaction", slog.Int("retries", retries), slog.Duration("backoff", backoff))
 
 				retries++
-				time.Sleep(backoff)
+				select {
+				case <-ctx.Done():
+					return errors.WithStack(ctx.Err())
+				case <-time.After(backoff):
+				}
 				backoff *= 2
 				continue
 			}
@@ -676,17 +734,25 @@ func (i *Index) withRetry(ctx context.Context, fn func(ctx context.Context, conn
 	}
 }
 
-func NewIndex(conn *sqlite3.Conn, llm llm.Client, model string, maxWords int) *Index {
+// NewIndex creates a sqlite-vec backed vector index on top of the given
+// connection. The connection remains owned by the caller. The embeddings model
+// (WithEmbeddingsModel) and vector size (WithVectorSize) are recorded in the
+// index on first use; reopening an existing index with a different model or
+// size is rejected to prevent silently mixing incompatible vectors.
+func NewIndex(conn *sqlite3.Conn, client llm.Client, funcs ...OptionFunc) *Index {
+	opts := NewOptions(funcs...)
 	return &Index{
-		maxWords: maxWords,
-		llm:      llm,
-		getConn:  createGetConn(conn),
+		maxWords:   opts.MaxWords,
+		vectorSize: opts.VectorSize,
+		llm:        client,
+		model:      opts.EmbeddingsModel,
+		getConn:    createGetConn(conn, opts.EmbeddingsModel, opts.VectorSize),
 	}
 }
 
 var _ index.Index = &Index{}
 
-func createGetConn(conn *sqlite3.Conn) func(ctx context.Context) (*sqlite3.Conn, error) {
+func createGetConn(conn *sqlite3.Conn, model string, vectorSize int) func(ctx context.Context) (*sqlite3.Conn, error) {
 	var (
 		migrateOnce sync.Once
 		migrateErr  error
@@ -699,11 +765,16 @@ func createGetConn(conn *sqlite3.Conn) func(ctx context.Context) (*sqlite3.Conn,
 				return
 			}
 
-			for _, sql := range migrations {
+			for _, sql := range migrations(vectorSize) {
 				if err := conn.Exec(sql); err != nil {
 					migrateErr = errors.Wrapf(err, "could not execute migration '%s'", sql)
 					return
 				}
+			}
+
+			if err := checkMetadata(conn, model, vectorSize); err != nil {
+				migrateErr = errors.WithStack(err)
+				return
 			}
 		})
 		if migrateErr != nil {
@@ -712,6 +783,62 @@ func createGetConn(conn *sqlite3.Conn) func(ctx context.Context) (*sqlite3.Conn,
 
 		return conn, nil
 	}
+}
+
+// checkMetadata records the index identity (embeddings model + vector size) on
+// a fresh index, or verifies it against the configured values on an existing
+// one, returning an error on mismatch.
+func checkMetadata(conn *sqlite3.Conn, model string, vectorSize int) error {
+	expected := map[string]string{
+		"embeddings_model": model,
+		"vector_size":      strconv.Itoa(vectorSize),
+	}
+
+	stored := map[string]string{}
+	selectStmt, _, err := conn.Prepare("SELECT key, value FROM amoxtli_meta WHERE key IN ('embeddings_model', 'vector_size');")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	for selectStmt.Step() {
+		stored[selectStmt.ColumnText(0)] = selectStmt.ColumnText(1)
+	}
+	if err := selectStmt.Err(); err != nil {
+		selectStmt.Close()
+		return errors.WithStack(err)
+	}
+	selectStmt.Close()
+
+	for key, want := range expected {
+		got, ok := stored[key]
+		if !ok {
+			if err := setMetadata(conn, key, want); err != nil {
+				return errors.WithStack(err)
+			}
+			continue
+		}
+		if got != want {
+			return errors.Errorf("sqlitevec: index was built with %s=%q but %q was configured; reindex or open with the original setting", key, got, want)
+		}
+	}
+
+	return nil
+}
+
+func setMetadata(conn *sqlite3.Conn, key, value string) error {
+	stmt, _, err := conn.Prepare("INSERT OR REPLACE INTO amoxtli_meta (key, value) VALUES (?, ?);")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindText(1, key); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := stmt.BindText(2, value); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return errors.WithStack(stmt.Exec())
 }
 
 func toFloat32(f64 []float64) []float32 {

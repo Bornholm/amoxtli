@@ -30,6 +30,13 @@ type options struct {
 	disableHyDE        bool
 	disableJudge       bool
 	snapshotBoundary   string
+	// Grounding & explicit re-retrieval (see CheckGrounding / SearchIterative).
+	groundingCheck             bool
+	groundingMinScore          float64
+	iterativeRetrieval         bool
+	iterativeMaxRounds         int
+	queryDecomposition         bool
+	decompositionMaxSubQueries int
 	// Indexers composing the search pipeline.
 	indexers []Indexer
 	// Explicit components.
@@ -40,10 +47,13 @@ type options struct {
 
 func defaultOptions() *options {
 	return &options{
-		maxWordsPerSection: 250,
-		maxTotalWords:      50000,
-		taskParallelism:    5,
-		snapshotBoundary:   "amoxtli-snapshot-v1",
+		maxWordsPerSection:         250,
+		maxTotalWords:              50000,
+		taskParallelism:            5,
+		snapshotBoundary:           "amoxtli-snapshot-v1",
+		groundingMinScore:          0.4,
+		iterativeMaxRounds:         1,
+		decompositionMaxSubQueries: 3,
 	}
 }
 
@@ -110,6 +120,55 @@ func WithDisableHyDE() Option {
 func WithDisableJudge() Option {
 	return func(o *options) {
 		o.disableJudge = true
+	}
+}
+
+// WithGroundingCheck enables the fused evidence evaluator: a single LLM call
+// that both relevance-filters the retrieved evidence and judges whether it
+// supports a reliable answer (the grounding γ verdict). It makes CheckGrounding
+// available as a standalone step and gates the re-retrieval loop of
+// SearchIterative. When enabled it replaces the Judge results transformer in the
+// pipeline (Search then relies on the evaluator for relevance filtering),
+// avoiding a redundant LLM pass over the same evidence. Requires an LLM client
+// (WithLLMClient). Disabled by default.
+func WithGroundingCheck() Option {
+	return func(o *options) {
+		o.groundingCheck = true
+	}
+}
+
+// WithGroundingMinScore sets the grounding score threshold below which the
+// verdict is considered not confident (default 0.4). Only meaningful together
+// with WithGroundingCheck.
+func WithGroundingMinScore(minScore float64) Option {
+	return func(o *options) {
+		o.groundingMinScore = minScore
+	}
+}
+
+// WithIterativeRetrieval enables grounding-driven re-retrieval in
+// SearchIterative: when the evidence is not confidently grounded the query is
+// reformulated and searched again, up to rounds times (rounds <= 0 means 1).
+// Requires WithGroundingCheck and an LLM client.
+func WithIterativeRetrieval(rounds int) Option {
+	return func(o *options) {
+		o.iterativeRetrieval = true
+		if rounds > 0 {
+			o.iterativeMaxRounds = rounds
+		}
+	}
+}
+
+// WithQueryDecomposition enables splitting a complex question into at most
+// maxSubQueries sub-questions in SearchIterative, searching each and fusing
+// their evidence. Requires an LLM client. maxSubQueries <= 0 keeps the default
+// (3).
+func WithQueryDecomposition(maxSubQueries int) Option {
+	return func(o *options) {
+		o.queryDecomposition = true
+		if maxSubQueries > 0 {
+			o.decompositionMaxSubQueries = maxSubQueries
+		}
 	}
 }
 

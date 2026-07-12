@@ -474,8 +474,8 @@ func (i *Index) mergeResults(indexResults []*indexSearchResults, maxResults int)
 		})
 	}
 
-	if len(merged) > maxResults && maxResults > 1 {
-		merged = merged[0 : maxResults-1]
+	if maxResults > 0 && len(merged) > maxResults {
+		merged = merged[:maxResults]
 	}
 
 	return merged, nil
