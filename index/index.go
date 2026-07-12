@@ -43,4 +43,31 @@ type SearchOptions struct {
 type SearchResult struct {
 	Source   *url.URL
 	Sections []model.SectionID
+	// Score is the relevance score of the result (higher is better). Its scale
+	// is backend-specific and only meaningful for ranking results within the
+	// same Search response — not as an absolute confidence across queries or
+	// backends.
+	Score float64
+	// SectionScores holds the per-section relevance scores when the backend
+	// exposes them, keyed by section ID. It may be nil.
+	SectionScores map[model.SectionID]float64
+}
+
+// Semantic is an optional capability implemented by indexes performing
+// embedding/vector similarity search, which therefore benefit from query
+// expansion such as HyDE. Full-text (lexical) indexes must not implement it —
+// or must return false — so the search pipeline queries them with the raw
+// query. Hybrid indexes that manage their own lexical/vector fusion internally
+// should also report false, to avoid polluting their lexical leg with an
+// expanded query.
+type Semantic interface {
+	// Semantic reports whether the index performs vector similarity search.
+	Semantic() bool
+}
+
+// IsSemantic reports whether idx declares itself as a semantic (vector) index
+// via the Semantic capability.
+func IsSemantic(idx Index) bool {
+	s, ok := idx.(Semantic)
+	return ok && s.Semantic()
 }

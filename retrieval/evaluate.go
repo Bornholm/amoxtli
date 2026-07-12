@@ -283,11 +283,29 @@ func FilterRelevant(results []*index.SearchResult, relevant []model.SectionID) [
 			continue
 		}
 		out = append(out, &index.SearchResult{
-			Source:   r.Source,
-			Sections: sections,
+			Source:        r.Source,
+			Sections:      sections,
+			Score:         r.Score,
+			SectionScores: filterSectionScores(r.SectionScores, sections),
 		})
 	}
 
+	return out
+}
+
+// filterSectionScores returns the subset of scores whose section is in keep,
+// preserving the per-section scores of a SearchResult after its section set has
+// been filtered. It returns nil when scores is nil.
+func filterSectionScores(scores map[model.SectionID]float64, keep []model.SectionID) map[model.SectionID]float64 {
+	if scores == nil {
+		return nil
+	}
+	out := make(map[model.SectionID]float64, len(keep))
+	for _, s := range keep {
+		if score, ok := scores[s]; ok {
+			out[s] = score
+		}
+	}
 	return out
 }
 

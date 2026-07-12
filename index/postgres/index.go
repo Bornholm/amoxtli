@@ -430,13 +430,18 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 
 	mappedScores := map[string]float64{}
 	mappedSections := map[string][]model.SectionID{}
+	mappedSectionScores := map[string]map[model.SectionID]float64{}
 
 	for id, hit := range hitsByID {
 		sectionID := model.SectionID(hit.SectionID)
+		if _, ok := mappedSectionScores[hit.Source]; !ok {
+			mappedSectionScores[hit.Source] = map[model.SectionID]float64{}
+		}
 		if !slices.Contains(mappedSections[hit.Source], sectionID) {
 			mappedSections[hit.Source] = append(mappedSections[hit.Source], sectionID)
 		}
 		mappedScores[hit.Source] += fusedScores[id]
+		mappedSectionScores[hit.Source][sectionID] += fusedScores[id]
 	}
 
 	searchResults := make([]*index.SearchResult, 0, len(mappedSections))
@@ -448,8 +453,10 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 		}
 
 		searchResults = append(searchResults, &index.SearchResult{
-			Source:   source,
-			Sections: sectionIDs,
+			Source:        source,
+			Sections:      sectionIDs,
+			Score:         mappedScores[rawSource],
+			SectionScores: mappedSectionScores[rawSource],
 		})
 	}
 

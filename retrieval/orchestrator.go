@@ -239,8 +239,10 @@ func fuseResults(groups ...[]*index.SearchResult) []*index.SearchResult {
 			}
 
 			out = append(out, &index.SearchResult{
-				Source:   r.Source,
-				Sections: kept,
+				Source:        r.Source,
+				Sections:      kept,
+				Score:         r.Score,
+				SectionScores: filterSectionScores(r.SectionScores, kept),
 			})
 		}
 	}

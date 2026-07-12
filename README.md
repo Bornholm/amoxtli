@@ -2,7 +2,7 @@
 
 > *Amoxtli* — « livre, codex » en nahuatl.
 
-Bibliothèque Go d'indexation documentaire multi-backend et d'ingestion de fichiers : recherche plein-texte ([bleve](https://github.com/blevesearch/bleve)), recherche vectorielle ([sqlite-vec](https://github.com/asg017/sqlite-vec)), recherche hybride PostgreSQL ([pgvector](https://github.com/pgvector/pgvector) + FTS natif), fusion pondérée des résultats, découpage markdown en sections, conversion de fichiers (pandoc, LibreOffice, OCR/LLM), grounding (récupération vérifiée) et sauvegarde/restauration des index.
+Bibliothèque Go d'indexation documentaire multi-backend et d'ingestion de fichiers : recherche plein-texte ([bleve](https://github.com/blevesearch/bleve)), recherche vectorielle ([sqlite-vec](https://github.com/asg017/sqlite-vec)), recherche hybride PostgreSQL ([pgvector](https://github.com/pgvector/pgvector) + FTS natif), fusion des résultats par Reciprocal Rank Fusion (pondérée par index), découpage markdown en sections, conversion de fichiers (pandoc, LibreOffice, OCR/LLM), grounding (récupération vérifiée) et sauvegarde/restauration des index.
 
 Extraite du projet [bornholm/corpus](https://github.com/Bornholm/corpus), dont elle constitue le cœur, mais indépendante de celui-ci.
 

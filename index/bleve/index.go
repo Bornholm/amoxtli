@@ -185,6 +185,7 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 
 	mappedScores := map[string]float64{}
 	mappedSections := map[string][]model.SectionID{}
+	mappedSectionScores := map[string]map[model.SectionID]float64{}
 
 	for _, r := range result.Hits {
 		rawSource, ok := r.Fields["source"].(string)
@@ -200,16 +201,19 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 		sectionID := model.SectionID(r.ID)
 
 		source.Fragment = ""
+		key := source.String()
 
-		sectionIDs, exists := mappedSections[source.String()]
+		sectionIDs, exists := mappedSections[key]
 		if !exists {
 			sectionIDs = make([]model.SectionID, 0)
+			mappedSectionScores[key] = map[model.SectionID]float64{}
 		}
 
 		sectionIDs = append(sectionIDs, sectionID)
 
-		mappedSections[source.String()] = sectionIDs
-		mappedScores[source.String()] += r.Score
+		mappedSections[key] = sectionIDs
+		mappedScores[key] += r.Score
+		mappedSectionScores[key][sectionID] += r.Score
 	}
 
 	searchResults := make([]*index.SearchResult, 0)
@@ -221,8 +225,10 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 		}
 
 		searchResults = append(searchResults, &index.SearchResult{
-			Source:   source,
-			Sections: sectionIDs,
+			Source:        source,
+			Sections:      sectionIDs,
+			Score:         mappedScores[rawSource],
+			SectionScores: mappedSectionScores[rawSource],
 		})
 	}
 

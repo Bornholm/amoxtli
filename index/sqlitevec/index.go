@@ -621,6 +621,7 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 
 		mappedScores := map[string]float64{}
 		mappedSections := map[string][]model.SectionID{}
+		mappedSectionScores := map[string]map[model.SectionID]float64{}
 
 		for stmt.Step() {
 			source := stmt.ColumnText(0)
@@ -629,14 +630,18 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 
 			if _, exists := mappedSections[source]; !exists {
 				mappedSections[source] = make([]model.SectionID, 0)
+				mappedSectionScores[source] = map[model.SectionID]float64{}
 			}
 
 			if distance == 0 {
 				distance = math.SmallestNonzeroFloat64
 			}
 
+			score := 1 / distance
+
 			mappedSections[source] = append(mappedSections[source], model.SectionID(sectionID))
-			mappedScores[source] += 1 / distance
+			mappedScores[source] += score
+			mappedSectionScores[source][model.SectionID(sectionID)] += score
 		}
 
 		if err := stmt.Err(); err != nil {
@@ -652,8 +657,10 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 			}
 
 			searchResults = append(searchResults, &index.SearchResult{
-				Source:   source,
-				Sections: sectionIDs,
+				Source:        source,
+				Sections:      sectionIDs,
+				Score:         mappedScores[rawSource],
+				SectionScores: mappedSectionScores[rawSource],
 			})
 		}
 
@@ -750,7 +757,14 @@ func NewIndex(conn *sqlite3.Conn, client llm.Client, funcs ...OptionFunc) *Index
 	}
 }
 
-var _ index.Index = &Index{}
+var (
+	_ index.Index    = &Index{}
+	_ index.Semantic = &Index{}
+)
+
+// Semantic implements index.Semantic: sqlite-vec performs vector similarity
+// search and therefore benefits from query expansion such as HyDE.
+func (i *Index) Semantic() bool { return true }
 
 func createGetConn(conn *sqlite3.Conn, model string, vectorSize int) func(ctx context.Context) (*sqlite3.Conn, error) {
 	var (

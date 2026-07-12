@@ -20,8 +20,10 @@ func (t *DuplicateContentResultsTransformer) TransformResults(ctx context.Contex
 
 	for _, r := range results {
 		updated := &index.SearchResult{
-			Source:   r.Source,
-			Sections: make([]model.SectionID, 0),
+			Source:        r.Source,
+			Sections:      make([]model.SectionID, 0),
+			Score:         r.Score,
+			SectionScores: r.SectionScores,
 		}
 
 		// Batch load all sections for this result

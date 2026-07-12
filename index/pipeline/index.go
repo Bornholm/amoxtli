@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -244,7 +245,11 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 
 // Search implements index.Index.
 func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptions) ([]*index.SearchResult, error) {
-	query, err := i.transformQuery(ctx, query, opts)
+	// Query transformation is per-index: semantic (vector) indexes receive the
+	// query expanded by the semantic-only transformers (e.g. HyDE) while
+	// lexical indexes keep the raw (universally transformed) query, as query
+	// expansion tends to help vector search but degrade full-text search.
+	baseQuery, semanticQuery, err := i.transformQueries(ctx, query, opts)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -290,7 +295,12 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 
 			indexCtx := slogx.WithAttrs(ctx, slog.String("index_type", fmt.Sprintf("%T", identified.Index())))
 
-			results, err := identified.Index().Search(indexCtx, query, index.SearchOptions{
+			indexQuery := baseQuery
+			if index.IsSemantic(identified.Index()) {
+				indexQuery = semanticQuery
+			}
+
+			results, err := identified.Index().Search(indexCtx, indexQuery, index.SearchOptions{
 				MaxResults:  maxResults * 2,
 				Collections: collections,
 			})
@@ -353,16 +363,53 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 	return transformed, nil
 }
 
-func (i *Index) transformQuery(ctx context.Context, query string, opts index.SearchOptions) (string, error) {
-	var err error
+// transformQueries computes the two query variants dispatched to the underlying
+// indexes: baseQuery, obtained by applying the universal query transformers, is
+// sent to lexical indexes; semanticQuery, obtained by additionally applying the
+// semantic-only transformers (e.g. HyDE) on top of baseQuery, is sent to vector
+// indexes. The semantic variant — and thus any LLM call it entails — is only
+// computed when at least one index declares itself semantic, so lexical-only
+// pipelines never pay for HyDE.
+func (i *Index) transformQueries(ctx context.Context, query string, opts index.SearchOptions) (baseQuery string, semanticQuery string, err error) {
+	baseQuery = query
 	for _, t := range i.queryTransformers {
-		query, err = t.TransformQuery(ctx, query, opts)
+		if isSemanticOnly(t) {
+			continue
+		}
+		baseQuery, err = t.TransformQuery(ctx, baseQuery, opts)
 		if err != nil {
-			return "", errors.WithStack(err)
+			return "", "", errors.WithStack(err)
 		}
 	}
 
-	return query, nil
+	semanticQuery = baseQuery
+
+	if !i.hasSemanticIndex() {
+		return baseQuery, semanticQuery, nil
+	}
+
+	for _, t := range i.queryTransformers {
+		if !isSemanticOnly(t) {
+			continue
+		}
+		semanticQuery, err = t.TransformQuery(ctx, semanticQuery, opts)
+		if err != nil {
+			return "", "", errors.WithStack(err)
+		}
+	}
+
+	return baseQuery, semanticQuery, nil
+}
+
+// hasSemanticIndex reports whether at least one registered index declares the
+// index.Semantic capability.
+func (i *Index) hasSemanticIndex() bool {
+	for identified := range i.indexes {
+		if index.IsSemantic(identified.Index()) {
+			return true
+		}
+	}
+	return false
 }
 
 func (i *Index) transformResults(ctx context.Context, query string, results []*index.SearchResult, opts index.SearchOptions) ([]*index.SearchResult, error) {
@@ -381,67 +428,54 @@ func (i *Index) transformResults(ctx context.Context, query string, results []*i
 	return results, nil
 }
 
-func (i *Index) mergeResults(indexResults []*indexSearchResults, maxResults int) ([]*index.SearchResult, error) {
-	type scoreItem struct {
-		Score    float64
-		Sections map[model.SectionID]float64
-	}
+// rrfK is the standard Reciprocal Rank Fusion smoothing constant. A larger k
+// flattens the contribution of the top ranks; 60 is the value from the original
+// RRF paper and the de-facto default.
+const rrfK = 60
 
-	scores := map[string]scoreItem{}
+// mergeResults fuses the per-index result lists with Reciprocal Rank Fusion.
+// Each index leg contributes to a source (and to its sections) an amount
+// inversely proportional to the rank at which it appears in that leg, scaled by
+// the leg's configured weight. Unlike the previous occurrence-count scoring,
+// this is rank-sensitive: a result ranked first weighs more than one ranked
+// tenth, and results corroborated by several indexes accumulate. The fused
+// scores are exposed on the returned SearchResult (Score / SectionScores).
+func (i *Index) mergeResults(indexResults []*indexSearchResults, maxResults int) ([]*index.SearchResult, error) {
+	sourceScores := map[string]float64{}
+	sectionScores := map[string]map[model.SectionID]float64{}
 
 	for _, r := range indexResults {
-		for _, rr := range r.Results {
+		weight := i.indexes[r.Index]
+
+		for rank, rr := range r.Results {
 			source := rr.Source.String()
+			sourceScores[source] += weight / float64(rrfK+rank+1)
 
-			var resultScore scoreItem
-			if _, exists := scores[source]; !exists {
-				scores[source] = scoreItem{
-					Score:    0,
-					Sections: make(map[model.SectionID]float64),
-				}
+			sections, exists := sectionScores[source]
+			if !exists {
+				sections = map[model.SectionID]float64{}
+				sectionScores[source] = sections
 			}
 
-			resultScore = scores[source]
-			resultScore.Score += 1.5 * i.indexes[r.Index]
-
-			for _, s := range rr.Sections {
-				if _, exists := resultScore.Sections[s]; !exists {
-					resultScore.Sections[s] = 0
-				}
-
-				resultScore.Sections[s] += 1 * i.indexes[r.Index]
+			for sectionRank, s := range rr.Sections {
+				sections[s] += weight / float64(rrfK+sectionRank+1)
 			}
-
-			scores[source] = resultScore
 		}
 	}
 
-	sources := []string{}
-	for s := range scores {
+	sources := make([]string, 0, len(sourceScores))
+	for s := range sourceScores {
 		sources = append(sources, s)
 	}
 
 	slices.SortFunc(sources, func(s1, s2 string) int {
-		score1 := scores[s1].Score
-		for _, v := range scores[s1].Sections {
-			score1 += v
-		}
-
-		score2 := scores[s2].Score
-		for _, v := range scores[s2].Sections {
-			score2 += v
-		}
-
-		if score1 < score2 {
-			return 1
-		}
-		if score1 > score2 {
-			return -1
+		if c := cmp.Compare(sourceScores[s2], sourceScores[s1]); c != 0 {
+			return c
 		}
 		return strings.Compare(s1, s2)
 	})
 
-	merged := make([]*index.SearchResult, 0)
+	merged := make([]*index.SearchResult, 0, len(sources))
 
 	for _, rawSource := range sources {
 		source, err := url.Parse(rawSource)
@@ -449,28 +483,25 @@ func (i *Index) mergeResults(indexResults []*indexSearchResults, maxResults int)
 			return nil, errors.WithStack(err)
 		}
 
-		sectionScores := scores[rawSource].Sections
+		sections := sectionScores[rawSource]
 
-		sectionIDs := []model.SectionID{}
-		for id := range sectionScores {
+		sectionIDs := make([]model.SectionID, 0, len(sections))
+		for id := range sections {
 			sectionIDs = append(sectionIDs, id)
 		}
 
 		slices.SortFunc(sectionIDs, func(id1, id2 model.SectionID) int {
-			score1 := sectionScores[id1]
-			score2 := sectionScores[id2]
-			if score1 < score2 {
-				return 1
-			}
-			if score1 > score2 {
-				return -1
+			if c := cmp.Compare(sections[id2], sections[id1]); c != 0 {
+				return c
 			}
 			return strings.Compare(string(id1), string(id2))
 		})
 
 		merged = append(merged, &index.SearchResult{
-			Source:   source,
-			Sections: sectionIDs,
+			Source:        source,
+			Sections:      sectionIDs,
+			Score:         sourceScores[rawSource],
+			SectionScores: sections,
 		})
 	}
 
