@@ -7,6 +7,7 @@ import (
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/index/testsuite"
+	"github.com/bornholm/amoxtli/internal/ollamatest"
 	"github.com/bornholm/genai/llm/provider"
 	"github.com/bornholm/genai/llm/provider/openai"
 	_ "github.com/bornholm/genai/llm/provider/openai"
@@ -51,16 +52,8 @@ func TestIndex(t *testing.T) {
 
 	chatCompletionModel := "qwen2.5:3b"
 	embeddingsModel := "mxbai-embed-large:latest"
-	models := []string{chatCompletionModel, embeddingsModel}
 
-	for _, m := range models {
-		t.Logf("Pulling model '%s'", m)
-
-		_, _, err = ollamaContainer.Exec(ctx, []string{"ollama", "pull", m})
-		if err != nil {
-			t.Fatalf("failed to pull model %s: %+v", m, errors.WithStack(err))
-		}
-	}
+	ollamatest.EnsureModels(t, ctx, ollamaContainer, chatCompletionModel, embeddingsModel)
 
 	connectionStr, err := ollamaContainer.ConnectionString(ctx)
 	if err != nil {

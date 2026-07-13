@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/internal/ollamatest"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/genai/llm"
 	"github.com/bornholm/genai/llm/provider"
@@ -52,11 +53,7 @@ func newOllamaClient(t *testing.T) llm.Client {
 		t.Fatalf("failed to start container: %+v", err)
 	}
 
-	t.Logf("pulling model %q", chatModel)
-
-	if _, _, err := ollamaContainer.Exec(ctx, []string{"ollama", "pull", chatModel}); err != nil {
-		t.Fatalf("failed to pull model %s: %+v", chatModel, errors.WithStack(err))
-	}
+	ollamatest.EnsureModels(t, ctx, ollamaContainer, chatModel)
 
 	connectionStr, err := ollamaContainer.ConnectionString(ctx)
 	if err != nil {

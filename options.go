@@ -2,6 +2,7 @@ package amoxtli
 
 import (
 	"net/url"
+	"time"
 
 	"github.com/bornholm/amoxtli/convert"
 	"github.com/bornholm/amoxtli/index"
@@ -32,6 +33,7 @@ type options struct {
 	snapshotBoundary   string
 	// Grounding & explicit re-retrieval (see CheckGrounding / SearchIterative).
 	groundingCheck             bool
+	groundingFailOpen          bool
 	groundingMinScore          float64
 	iterativeRetrieval         bool
 	iterativeMaxRounds         int
@@ -43,6 +45,8 @@ type options struct {
 	index      index.Index
 	store      ingest.Store
 	taskRunner task.Runner
+	// closeTimeout bounds how long Close waits for in-flight tasks to drain.
+	closeTimeout time.Duration
 }
 
 func defaultOptions() *options {
@@ -54,6 +58,7 @@ func defaultOptions() *options {
 		groundingMinScore:          0.4,
 		iterativeMaxRounds:         1,
 		decompositionMaxSubQueries: 3,
+		closeTimeout:               30 * time.Second,
 	}
 }
 
@@ -137,6 +142,17 @@ func WithGroundingCheck() Option {
 	}
 }
 
+// WithGroundingFailOpen makes Search degrade gracefully when the grounding
+// evidence evaluator (an LLM call) fails: instead of returning the error, Search
+// logs a warning and returns the retrieved results unfiltered. Without it, a
+// transient LLM failure in the evaluator fails the whole Search. Only meaningful
+// together with WithGroundingCheck. Disabled by default (fail-closed).
+func WithGroundingFailOpen() Option {
+	return func(o *options) {
+		o.groundingFailOpen = true
+	}
+}
+
 // WithGroundingMinScore sets the grounding score threshold below which the
 // verdict is considered not confident (default 0.4). Only meaningful together
 // with WithGroundingCheck.
@@ -201,6 +217,17 @@ func WithStore(store ingest.Store) Option {
 func WithTaskRunner(runner task.Runner) Option {
 	return func(o *options) {
 		o.taskRunner = runner
+	}
+}
+
+// WithCloseTimeout bounds how long Close waits for in-flight indexing tasks to
+// drain before giving up (default 30s). A non-positive duration keeps the
+// default.
+func WithCloseTimeout(d time.Duration) Option {
+	return func(o *options) {
+		if d > 0 {
+			o.closeTimeout = d
+		}
 	}
 }
 

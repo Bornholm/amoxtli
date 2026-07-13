@@ -10,6 +10,7 @@
 | `index/postgres` | Backend hybride PostgreSQL (FTS `tsvector` + pgvector, fusion RRF) |
 | `index/pipeline` | Index composite : fusion RRF pondérée par index + transformers (HyDE, Judge, dédup) |
 | `retrieval` | Orchestration de récupération pilotée par le grounding (γ) : vérification, re-retrieval itératif, décomposition de requête |
+| `llmx` | Décorateurs `llm.Client` : `RetryClient` (retries à backoff + rate-limit optionnel) |
 | `index/testsuite` | Suite de conformité pour les implémentations de `index.Index` |
 | `markdown` | Parsing/chunking markdown en sections |
 | `convert` | Conversion de fichiers vers markdown (`pandoc`, `libreoffice`, `genai`) |

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/bornholm/amoxtli/convert"
 	"github.com/bornholm/amoxtli/index"
@@ -56,6 +57,12 @@ type Manager struct {
 	fileConverter     convert.Converter
 	index             index.Index
 	taskRunner        task.Runner
+
+	// Per-manager staging directory for files awaiting indexing (created
+	// lazily by IndexFile, removed by CleanupTempDir).
+	tempDirOnce sync.Once
+	tempDir     string
+	tempDirErr  error
 }
 
 type SearchOptions struct {
@@ -161,7 +168,7 @@ func NewIndexFileOptions(funcs ...IndexFileOptionFunc) *IndexFileOptions {
 func (m *Manager) IndexFile(ctx context.Context, filename string, r io.Reader, funcs ...IndexFileOptionFunc) (task.ID, error) {
 	opts := NewIndexFileOptions(funcs...)
 
-	tempDir, err := sharedTempDir()
+	tempDir, err := m.stagingDir()
 	if err != nil {
 		return "", errors.WithStack(err)
 	}
@@ -225,6 +232,12 @@ func (m *Manager) RegisterHandlers(runner task.Runner) {
 func NewManager(store Store, idx index.Index, taskRunner task.Runner, funcs ...ManagerOptionFunc) *Manager {
 	opts := NewManagerOptions(funcs...)
 
+	// Best-effort: sweep staging directories left behind by previous runs that
+	// crashed before their indexing tasks removed the staged files. Only dirs
+	// older than staleTempDirAge are removed, so a concurrently-running
+	// instance's fresh directory is never touched.
+	cleanStaleTempDirs(staleTempDirAge)
+
 	manager := &Manager{
 		maxWordPerSection: opts.MaxWordPerSection,
 		Store:             store,
@@ -236,25 +249,63 @@ func NewManager(store Store, idx index.Index, taskRunner task.Runner, funcs ...M
 	return manager
 }
 
-var (
-	createTempDirOnce sync.Once
-	createTempDirErr  error
-	tempDir           string
-)
+// tempDirPrefix names this library's staging directories under os.TempDir().
+const tempDirPrefix = "amoxtli-"
 
-func sharedTempDir() (string, error) {
-	createTempDirOnce.Do(func() {
-		tmp, err := os.MkdirTemp("", "amoxtli-*")
+// staleTempDirAge is how old a staging directory must be before the startup
+// sweep considers it orphaned.
+const staleTempDirAge = 24 * time.Hour
+
+// stagingDir returns the per-manager staging directory, creating it on first
+// use.
+func (m *Manager) stagingDir() (string, error) {
+	m.tempDirOnce.Do(func() {
+		tmp, err := os.MkdirTemp("", tempDirPrefix+"*")
 		if err != nil {
-			createTempDirErr = errors.WithStack(err)
+			m.tempDirErr = errors.WithStack(err)
 			return
 		}
-
-		tempDir = tmp
+		m.tempDir = tmp
 	})
-	if createTempDirErr != nil {
-		return "", errors.WithStack(createTempDirErr)
+	if m.tempDirErr != nil {
+		return "", errors.WithStack(m.tempDirErr)
+	}
+	return m.tempDir, nil
+}
+
+// CleanupTempDir removes this manager's staging directory and everything left
+// in it. It is a best-effort, idempotent operation typically called on
+// shutdown, once in-flight indexing tasks have drained.
+func (m *Manager) CleanupTempDir() error {
+	if m.tempDir == "" {
+		return nil
+	}
+	if err := os.RemoveAll(m.tempDir); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+// cleanStaleTempDirs removes staging directories under os.TempDir() whose
+// modification time is older than maxAge. Errors are logged and ignored so a
+// cleanup failure never prevents startup.
+func cleanStaleTempDirs(maxAge time.Duration) {
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), tempDirPrefix+"*"))
+	if err != nil {
+		slog.Warn("could not list stale staging directories", slog.Any("error", errors.WithStack(err)))
+		return
 	}
 
-	return tempDir, nil
+	cutoff := time.Now().Add(-maxAge)
+	for _, dir := range matches {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Warn("could not remove stale staging directory", slog.String("dir", dir), slog.Any("error", errors.WithStack(err)))
+			continue
+		}
+		slog.Debug("removed stale staging directory", slog.String("dir", dir))
+	}
 }

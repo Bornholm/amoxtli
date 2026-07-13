@@ -26,14 +26,17 @@ import (
 // Codex is the main embedded instance: a store, index pipeline and task
 // runner behind a single API.
 type Codex struct {
-	manager          *ingest.Manager
-	index            index.Index
-	store            ingest.Store
-	taskRunner       task.Runner
-	evaluator        retrieval.EvidenceEvaluator
-	orchestrator     *retrieval.Orchestrator
-	snapshotBoundary string
-	cancel           context.CancelFunc
+	manager           *ingest.Manager
+	index             index.Index
+	store             ingest.Store
+	taskRunner        task.Runner
+	evaluator         retrieval.EvidenceEvaluator
+	groundingFailOpen bool
+	orchestrator      *retrieval.Orchestrator
+	snapshotBoundary  string
+	cancel            context.CancelFunc
+	runnerDone        chan struct{}
+	closeTimeout      time.Duration
 }
 
 // New creates a new embedded Codex instance.
@@ -120,9 +123,13 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	manager := ingest.NewManager(store, idx, taskRunner, managerOpts...)
 	manager.RegisterHandlers(taskRunner)
 
-	// Start task runner
+	// Start task runner. runnerDone is closed once Run returns, which the
+	// memory runner does only after in-flight tasks have drained — Close waits
+	// on it (bounded by closeTimeout) for a graceful shutdown.
 	runnerCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	runnerDone := make(chan struct{})
 	go func() {
+		defer close(runnerDone)
 		if err := taskRunner.Run(runnerCtx); err != nil && !errors.Is(err, context.Canceled) {
 			slog.ErrorContext(runnerCtx, "amoxtli task runner stopped", slog.Any("error", err))
 		}
@@ -140,9 +147,12 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	if opts.groundingCheck && opts.llmClient != nil {
 		codex.evaluator = retrieval.NewLLMEvidenceEvaluator(opts.llmClient, store, opts.maxTotalWords)
 	}
+	codex.groundingFailOpen = opts.groundingFailOpen
 	codex.orchestrator = newOrchestrator(opts, manager, codex.evaluator)
 
 	codex.cancel = cancel
+	codex.runnerDone = runnerDone
+	codex.closeTimeout = opts.closeTimeout
 
 	return codex, nil
 }
@@ -240,6 +250,12 @@ func (c *Codex) Search(ctx context.Context, query string, funcs ...SearchOption)
 	if c.evaluator != nil {
 		evaluation, err := c.evaluator.Evaluate(ctx, query, results)
 		if err != nil {
+			// Fail-open: a transient evaluator (LLM) failure returns the
+			// retrieved results unfiltered rather than failing the whole Search.
+			if c.groundingFailOpen {
+				slog.WarnContext(ctx, "amoxtli: grounding evaluation failed, returning unfiltered results (fail-open)", slog.Any("error", errors.WithStack(err)))
+				return results, nil
+			}
 			return nil, errors.WithStack(err)
 		}
 		results = retrieval.FilterRelevant(results, evaluation.Relevant)
@@ -408,12 +424,39 @@ func (c *Codex) Index() index.Index {
 	return c.index
 }
 
-// Close stops the task runner. Resources passed in through WithStore,
-// WithIndex/WithIndexers and WithTaskRunner are owned by the caller and must
-// be closed by them.
+// Close stops the task runner, waiting up to the configured close timeout
+// (WithCloseTimeout, default 30s) for in-flight indexing tasks to drain, then
+// removes the ingestion staging directory. Resources passed in through
+// WithStore, WithIndex/WithIndexers and WithTaskRunner are owned by the caller
+// and must be closed by them.
 func (c *Codex) Close() error {
 	if c.cancel != nil {
 		c.cancel()
+	}
+
+	// Wait for the task runner to drain in-flight tasks, bounded by the timeout.
+	if c.runnerDone != nil {
+		timeout := c.closeTimeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		select {
+		case <-c.runnerDone:
+		case <-timer.C:
+			slog.Warn("amoxtli: task runner drain timed out on Close", slog.Duration("timeout", timeout))
+		}
+	}
+
+	// Best-effort staging directory cleanup: after a graceful drain no task
+	// still needs its staged file.
+	if c.manager != nil {
+		if err := c.manager.CleanupTempDir(); err != nil {
+			slog.Warn("amoxtli: could not remove staging directory on Close", slog.Any("error", errors.WithStack(err)))
+		}
 	}
 
 	return nil

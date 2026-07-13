@@ -283,18 +283,113 @@ const (
 
 // Index implements index.Index.
 func (i *Index) Index(ctx context.Context, document model.Document, funcs ...index.OptionFunc) error {
-	i.rwLock.Lock()
-	defer i.rwLock.Unlock()
-
 	opts := index.NewOptions(funcs...)
 
 	source := document.Source()
+
+	chunksToProcess, err := i.collectChunks(document)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	defer func() {
+		if opts.OnProgress != nil {
+			opts.OnProgress(1.0)
+		}
+	}()
+
+	// Compute the embeddings BEFORE taking the write lock: the LLM calls are the
+	// slow part, and holding the write lock across them would block every
+	// concurrent Search (which only needs the read lock) for their whole
+	// duration. As a bonus, a failure here leaves the existing content intact
+	// (the delete below only runs once the vectors are ready).
+	vectors, err := i.computeEmbeddings(ctx, chunksToProcess)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	i.rwLock.Lock()
+	defer i.rwLock.Unlock()
+
 	if source != nil {
 		if err := i.deleteBySourceLocked(ctx, source); err != nil {
 			return errors.WithStack(err)
 		}
 	}
 
+	if len(chunksToProcess) == 0 {
+		return nil
+	}
+
+	return i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		// Insert into main embeddings table (metadata only - vectors go to vec0)
+		stmt, _, err := conn.Prepare(`
+			INSERT INTO embeddings (source, section_id, chunk_index)
+			VALUES (?, ?, ?)
+			RETURNING id;
+		`)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		defer stmt.Close()
+
+		// Prepare vec0 statement for HNSW index
+		vecStmt, _, err := conn.Prepare(fmt.Sprintf(`
+			INSERT INTO embeddings_vec (rowid, embedding)
+			VALUES (?, vec_normalize(vec_slice(?, 0, %d)));
+		`, i.vectorSize))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		defer vecStmt.Close()
+
+		for idx, item := range chunksToProcess {
+			vecBlob := vectors[idx]
+
+			if err := stmt.BindText(1, item.Section.Document().Source().String()); err != nil {
+				return err
+			}
+			if err := stmt.BindText(2, string(item.Section.ID())); err != nil {
+				return err
+			}
+			if err := stmt.BindInt64(3, int64(item.ChunkIdx)); err != nil {
+				return err
+			}
+
+			if hasRow := stmt.Step(); !hasRow {
+				return errors.New("no id returned")
+			}
+
+			embeddingsID := stmt.ColumnInt(0)
+			stmt.Reset()
+
+			// Insert into vec0 for HNSW index
+			if err := vecStmt.BindInt(1, embeddingsID); err != nil {
+				return err
+			}
+			if err := vecStmt.BindBlob(2, vecBlob); err != nil {
+				return err
+			}
+			if err := vecStmt.Exec(); err != nil {
+				return err
+			}
+			vecStmt.Reset()
+
+			for _, coll := range item.Section.Document().Collections() {
+				if err := i.insertCollection(ctx, conn, embeddingsID, coll.ID()); err != nil {
+					return errors.WithStack(err)
+				}
+			}
+		}
+
+		return nil
+	}, sqlite3.BUSY, sqlite3.LOCKED)
+}
+
+// collectChunks walks the document sections and splits their content into the
+// chunks to embed (character-window with overlap for oversized sections). It
+// performs no I/O beyond reading section content and takes no lock.
+func (i *Index) collectChunks(document model.Document) ([]*indexableChunk, error) {
 	var chunksToProcess []*indexableChunk
 
 	limitChars := i.maxWords * 6
@@ -303,7 +398,7 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 	collect = func(s model.Section) error {
 		content, err := s.Content()
 		if err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 		textStr := string(content)
 		textLen := len(textStr)
@@ -357,134 +452,77 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 
 	for _, s := range document.Sections() {
 		if err := collect(s); err != nil {
-			return errors.WithStack(err)
+			return nil, errors.WithStack(err)
 		}
 	}
 
-	defer func() {
-		if opts.OnProgress != nil {
-			opts.OnProgress(1.0)
-		}
-	}()
+	return chunksToProcess, nil
+}
 
-	if len(chunksToProcess) == 0 {
-		return nil
-	}
+// computeEmbeddings runs the embeddings model over every chunk (same batching
+// as before) and returns the serialized vectors aligned by index with chunks.
+// It performs no database access and holds no lock, so it runs concurrently
+// with searches.
+func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk) ([][]byte, error) {
+	vectors := make([][]byte, len(chunks))
 
-	return i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
-		// Insert into main embeddings table (metadata only - vectors go to vec0)
-		stmt, _, err := conn.Prepare(`
-			INSERT INTO embeddings (source, section_id, chunk_index)
-			VALUES (?, ?, ?)
-			RETURNING id;
-		`)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		defer stmt.Close()
+	var (
+		batchIdx    []int
+		batchTexts  []string
+		batchTokens int
+	)
 
-		// Prepare vec0 statement for HNSW index
-		vecStmt, _, err := conn.Prepare(fmt.Sprintf(`
-			INSERT INTO embeddings_vec (rowid, embedding)
-			VALUES (?, vec_normalize(vec_slice(?, 0, %d)));
-		`, i.vectorSize))
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		defer vecStmt.Close()
-
-		var batchItems []*indexableChunk
-		var batchTexts []string
-		currentBatchTokens := 0
-
-		flushBatch := func() error {
-			if len(batchItems) == 0 {
-				return nil
-			}
-
-			res, err := i.llm.Embeddings(ctx, batchTexts)
-			if err != nil {
-				return errors.Wrap(err, "generation failed")
-			}
-
-			embeddings := res.Embeddings()
-
-			if len(embeddings) != len(batchItems) {
-				return errors.New("vector count mismatch")
-			}
-
-			for idx, item := range batchItems {
-				vecBlob, err := sqlite_vec.SerializeFloat32(toFloat32(embeddings[idx]))
-				if err != nil {
-					return err
-				}
-
-				if err := stmt.BindText(1, item.Section.Document().Source().String()); err != nil {
-					return err
-				}
-				if err := stmt.BindText(2, string(item.Section.ID())); err != nil {
-					return err
-				}
-				if err := stmt.BindInt64(3, int64(item.ChunkIdx)); err != nil {
-					return err
-				}
-
-				if hasRow := stmt.Step(); !hasRow {
-					return errors.New("no id returned")
-				}
-
-				embeddingsID := stmt.ColumnInt(0)
-				stmt.Reset()
-
-				// Insert into vec0 for HNSW index
-				if err := vecStmt.BindInt(1, embeddingsID); err != nil {
-					return err
-				}
-				if err := vecStmt.BindBlob(2, vecBlob); err != nil {
-					return err
-				}
-				if err := vecStmt.Exec(); err != nil {
-					return err
-				}
-				vecStmt.Reset()
-
-				for _, coll := range item.Section.Document().Collections() {
-					if err := i.insertCollection(ctx, conn, embeddingsID, coll.ID()); err != nil {
-						return errors.WithStack(err)
-					}
-				}
-			}
+	flush := func() error {
+		if len(batchTexts) == 0 {
 			return nil
 		}
 
-		for _, chunk := range chunksToProcess {
-			tokenEst := estimateTokens(chunk.Text)
-
-			isBatchFull := (len(batchItems) >= maxBatchItemCount) ||
-				(currentBatchTokens+tokenEst >= targetBatchTokens)
-
-			if isBatchFull {
-				if err := flushBatch(); err != nil {
-					return err
-				}
-				batchItems = nil
-				batchTexts = nil
-				currentBatchTokens = 0
-			}
-
-			batchItems = append(batchItems, chunk)
-			batchTexts = append(batchTexts, chunk.Text)
-			currentBatchTokens += tokenEst
+		res, err := i.llm.Embeddings(ctx, batchTexts)
+		if err != nil {
+			return errors.Wrap(err, "generation failed")
 		}
 
-		if len(batchItems) > 0 {
-			if err := flushBatch(); err != nil {
-				return err
-			}
+		embeddings := res.Embeddings()
+		if len(embeddings) != len(batchTexts) {
+			return errors.New("vector count mismatch")
 		}
 
+		for j, chunkIdx := range batchIdx {
+			blob, err := sqlite_vec.SerializeFloat32(toFloat32(embeddings[j]))
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			vectors[chunkIdx] = blob
+		}
+
+		batchIdx = batchIdx[:0]
+		batchTexts = batchTexts[:0]
+		batchTokens = 0
 		return nil
-	}, sqlite3.BUSY, sqlite3.LOCKED)
+	}
+
+	for idx, chunk := range chunks {
+		tokenEst := estimateTokens(chunk.Text)
+
+		isBatchFull := (len(batchTexts) >= maxBatchItemCount) ||
+			(batchTokens+tokenEst >= targetBatchTokens)
+
+		if isBatchFull {
+			if err := flush(); err != nil {
+				return nil, errors.WithStack(err)
+			}
+		}
+
+		batchIdx = append(batchIdx, idx)
+		batchTexts = append(batchTexts, chunk.Text)
+		batchTokens += tokenEst
+	}
+
+	if err := flush(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return vectors, nil
 }
 
 func (i *Index) insertCollection(ctx context.Context, conn *sqlite3.Conn, embeddingsID int, collectionID model.CollectionID) error {

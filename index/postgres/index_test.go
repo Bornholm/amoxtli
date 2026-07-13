@@ -7,6 +7,7 @@ import (
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/index/testsuite"
+	"github.com/bornholm/amoxtli/internal/ollamatest"
 	"github.com/bornholm/genai/llm"
 	"github.com/bornholm/genai/llm/provider"
 	"github.com/bornholm/genai/llm/provider/openai"
@@ -146,14 +147,7 @@ func startOllamaClient(t *testing.T, ctx context.Context, models ...string) llm.
 		t.Fatalf("failed to start container: %+v", err)
 	}
 
-	for _, m := range models {
-		t.Logf("Pulling model '%s'", m)
-
-		_, _, err = ollamaContainer.Exec(ctx, []string{"ollama", "pull", m})
-		if err != nil {
-			t.Fatalf("failed to pull model %s: %+v", m, errors.WithStack(err))
-		}
-	}
+	ollamatest.EnsureModels(t, ctx, ollamaContainer, models...)
 
 	connectionStr, err := ollamaContainer.ConnectionString(ctx)
 	if err != nil {
