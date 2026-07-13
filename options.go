@@ -49,6 +49,11 @@ type options struct {
 	taskRunner task.Runner
 	// closeTimeout bounds how long Close waits for in-flight tasks to drain.
 	closeTimeout time.Duration
+	// persistentTasks enables a gorm-backed task runner sharing the store's
+	// database; stagingDir is the stable staging directory tasks are resumed
+	// from.
+	persistentTasks bool
+	stagingDir      string
 }
 
 func defaultOptions() *options {
@@ -229,6 +234,20 @@ func WithStore(store ingest.Store) Option {
 func WithTaskRunner(runner task.Runner) Option {
 	return func(o *options) {
 		o.taskRunner = runner
+	}
+}
+
+// WithPersistentTasks enables a persistent, gorm-backed task runner that shares
+// the document store's database. Pending indexing tasks — and tasks left
+// running by a previous, interrupted process — are resumed on startup. It
+// requires a gorm-backed store (gorm.NewSQLiteStore / gorm.NewPostgresStore)
+// and a stable stagingDir where files awaiting indexing are kept across
+// restarts (it must be a durable path, not a temporary directory). It is
+// ignored when a runner is supplied explicitly with WithTaskRunner.
+func WithPersistentTasks(stagingDir string) Option {
+	return func(o *options) {
+		o.persistentTasks = true
+		o.stagingDir = stagingDir
 	}
 }
 

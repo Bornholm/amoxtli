@@ -69,6 +69,16 @@ func NewCleanupTask(collections []model.CollectionID) *CleanupTask {
 
 var _ task.Task = &CleanupTask{}
 
+// CleanupTaskFactory rebuilds a CleanupTask from its persisted payload, used by
+// persistent task runners to resume or fetch the task.
+func CleanupTaskFactory(id task.ID, payload []byte) (task.Task, error) {
+	t := &CleanupTask{id: id}
+	if err := t.UnmarshalJSON(payload); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return t, nil
+}
+
 type CleanupHandler struct {
 	index index.Index
 	store Store

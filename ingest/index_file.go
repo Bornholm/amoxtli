@@ -115,6 +115,16 @@ func (i *IndexFileTask) Type() task.Type {
 
 var _ task.Task = &IndexFileTask{}
 
+// IndexFileTaskFactory rebuilds an IndexFileTask from its persisted payload,
+// used by persistent task runners to resume or fetch the task.
+func IndexFileTaskFactory(id task.ID, payload []byte) (task.Task, error) {
+	t := &IndexFileTask{id: id}
+	if err := t.UnmarshalJSON(payload); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return t, nil
+}
+
 const indexFileTaskTimeout = 2 * time.Hour
 
 type IndexFileHandler struct {

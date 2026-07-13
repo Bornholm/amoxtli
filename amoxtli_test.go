@@ -3,6 +3,7 @@ package amoxtli
 import (
 	"context"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,9 +11,11 @@ import (
 
 	"github.com/bornholm/amoxtli/index"
 	bleveIndex "github.com/bornholm/amoxtli/index/bleve"
+	"github.com/bornholm/amoxtli/ingest"
 	gormStore "github.com/bornholm/amoxtli/ingest/gorm"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/task"
+	taskGorm "github.com/bornholm/amoxtli/task/gorm"
 	"github.com/bornholm/genai/llm"
 	"github.com/pkg/errors"
 )
@@ -444,5 +447,111 @@ func TestCodexCursorPagination(t *testing.T) {
 
 	if len(seen) != 3 || !seen["boeuf"] || !seen["cassoulet"] || !seen["pasta"] {
 		t.Fatalf("expected all 3 documents across pages, got %v", seen)
+	}
+}
+
+// TestCodexPersistentTaskResume exercises the persistent task runner end-to-end
+// across a simulated restart: a first "process" stages a file and persists a
+// pending indexing task but dies before running it; a fresh Codex opened on the
+// same store, index and staging directory (WithPersistentTasks) resumes the task
+// and the document becomes searchable.
+func TestCodexPersistentTaskResume(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "data.sqlite")
+	indexPath := filepath.Join(dir, "index.bleve")
+	stagingDir := filepath.Join(dir, "staging")
+	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
+		t.Fatalf("could not create staging dir: %+v", errors.WithStack(err))
+	}
+
+	// --- First process: create the collection, stage the file and persist a
+	// pending indexing task, then stop without ever running it. ---
+	store, err := gormStore.NewSQLiteStore(storePath)
+	if err != nil {
+		t.Fatalf("could not open store: %+v", errors.WithStack(err))
+	}
+
+	coll, err := store.CreateCollection(ctx, "test")
+	if err != nil {
+		t.Fatalf("could not create collection: %+v", errors.WithStack(err))
+	}
+	collID := coll.ID()
+
+	stagedPath := filepath.Join(stagingDir, "doc.md")
+	if err := os.WriteFile(stagedPath, []byte(testDocument), 0o600); err != nil {
+		t.Fatalf("could not stage file: %+v", errors.WithStack(err))
+	}
+
+	source, _ := url.Parse("https://persist/doc.md")
+	pending := ingest.NewIndexFileTask(stagedPath, "doc.md", "", source, []model.CollectionID{collID}, nil)
+
+	// Persist the task as pending (ScheduleTask writes the row); the runner is
+	// never Run, so the task stays pending — as if the process had crashed.
+	pre := taskGorm.NewTaskRunner(store.DB(), 1, time.Hour, time.Minute)
+	if err := pre.ScheduleTask(ctx, pending); err != nil {
+		t.Fatalf("could not persist pending task: %+v", errors.WithStack(err))
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("could not close store: %+v", errors.WithStack(err))
+	}
+
+	// --- Second process: a fresh Codex on the same store + index + staging dir
+	// must resume and complete the pending task. ---
+	store2, err := gormStore.NewSQLiteStore(storePath)
+	if err != nil {
+		t.Fatalf("could not reopen store: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { store2.Close() })
+
+	bleveIdx, err := bleveIndex.OpenOrCreate(ctx, indexPath)
+	if err != nil {
+		t.Fatalf("could not open bleve index: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { bleveIdx.Close() })
+
+	codex, err := New(ctx,
+		WithStore(store2),
+		WithIndexers(Indexer{ID: "bleve", Index: bleveIdx, Weight: 1}),
+		WithDisableHyDE(),
+		WithDisableJudge(),
+		WithPersistentTasks(stagingDir),
+	)
+	if err != nil {
+		t.Fatalf("could not create codex: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { codex.Close() })
+
+	// Wait for the resumed task to finish (its ID survived the restart).
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		state, err := codex.TaskState(ctx, pending.ID())
+		if err != nil {
+			t.Fatalf("could not get resumed task state: %+v", errors.WithStack(err))
+		}
+		if state.Status == task.StatusSucceeded {
+			break
+		}
+		if state.Status == task.StatusFailed {
+			t.Fatalf("resumed indexing task failed: %+v", state.Error)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("resumed indexing task did not finish in time (status: %s)", state.Status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// The document indexed by the resumed task is now searchable.
+	results, err := codex.Search(ctx, "recette", WithSearchMaxResults(5))
+	if err != nil {
+		t.Fatalf("search: %+v", errors.WithStack(err))
+	}
+	if !hostsOf(results)["persist"] {
+		t.Fatalf("expected the resumed document to be searchable, got hosts %v", hostsOf(results))
+	}
+
+	// The staged file must have been consumed (removed) by the resumed task.
+	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
+		t.Errorf("expected staged file to be removed after indexing, stat err: %v", err)
 	}
 }

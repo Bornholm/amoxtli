@@ -78,6 +78,16 @@ func NewReindexTask(collectionID model.CollectionID) *ReindexTask {
 
 var _ task.Task = &ReindexTask{}
 
+// ReindexTaskFactory rebuilds a ReindexTask from its persisted payload, used by
+// persistent task runners to resume or fetch the task.
+func ReindexTaskFactory(id task.ID, payload []byte) (task.Task, error) {
+	t := &ReindexTask{id: id}
+	if err := t.UnmarshalJSON(payload); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return t, nil
+}
+
 type ReindexHandler struct {
 	store             Store
 	index             index.Index

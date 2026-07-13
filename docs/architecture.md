@@ -14,7 +14,7 @@
 | `index/testsuite` | Suite de conformité pour les implémentations de `index.Index` |
 | `markdown` | Parsing/chunking markdown en sections |
 | `convert` | Conversion de fichiers vers markdown (`pandoc`, `libreoffice`, `genai`) |
-| `task` / `task/memory` | Exécution de tâches asynchrones |
+| `task` / `task/memory` / `task/gorm` | Exécution de tâches asynchrones : contrat `task.Runner`, runner en mémoire, runner persistant gorm (reprise au démarrage) |
 | `ingest` / `ingest/gorm` | Pipeline d'ingestion + magasin de documents (SQLite ou PostgreSQL) |
 | `backup` | Abstraction snapshot/restore |
 
@@ -49,6 +49,36 @@ Un document peut porter des métadonnées arbitraires (`map[string]any` : auteur
 ### Reranking (`ingest.Reranker`)
 
 `WithReranking()` insère un reranker LLM (`retrieval.NewLLMReranker`) dans le pipeline de recherche : il réordonne les candidats fusionnés (et filtrés) par pertinence à la requête, réutilisant le budget `WithMaxTotalWords` pour borner le prompt. Contrairement au Judge (qui filtre), le reranker ne fait que réordonner. Il s'exécute après le filtrage métadonnées et avant la pagination, donc l'ordre reranké est celui exposé et encodé dans les curseurs.
+
+### Runner de tâches persistant (`task/gorm`)
+
+L'ingestion (`IndexFile`, `Reindex`, `CleanupIndex`) est asynchrone : elle
+planifie une tâche exécutée par un `task.Runner`. Par défaut le runner est en
+mémoire (`task/memory`) — un redémarrage perd les tâches en attente. Le package
+`task/gorm` fournit un runner **persistant** adossé à la même base que le store
+(SQLite ou PostgreSQL), activé par `amoxtli.WithPersistentTasks(stagingDir)`.
+
+Chaque tâche est sérialisée via son `json.Marshaler` et persistée (table
+`amoxtli_tasks`) dès la planification. Au démarrage (`Run`), le runner **reprend**
+le travail persisté : les tâches laissées `running` par un process interrompu
+sont d'abord remises `pending` en une passe groupée *avant* le démarrage des
+workers (à cet instant aucune tâche du process courant n'est encore en cours, donc
+seuls de vrais orphelins sont touchés), puis toutes les `pending` sont ré-enfilées
+et reconstruites via les `task.Factory` enregistrées (`RegisterFactory`, câblées
+par `Manager.RegisterHandlers` pour les trois types d'ingestion). Un **claim
+atomique** — transition `pending → running` gardée par `WHERE status = 'pending'`
+et vérifiée sur `RowsAffected` — garantit qu'une tâche enfilée deux fois
+(planifiée puis reprise, ou reprise par plusieurs runners partageant la base) ne
+s'exécute qu'une seule fois. Les transitions d'état et l'état terminal sont
+persistés immédiatement ; la progression intermédiaire est écrite de façon
+throttlée pour ne pas marteler la base.
+
+La reprise d'une tâche `IndexFile` suppose que son fichier mis en attente survive
+au redémarrage : `WithPersistentTasks` épingle donc le répertoire de staging à un
+chemin **stable** (`WithManagerStagingDir`), non supprimé à l'arrêt, au lieu du
+répertoire temporaire éphémère par-process utilisé par défaut. Les handlers
+d'ingestion sont idempotents (suppression par source puis ré-écriture), une tâche
+reprise depuis le début est donc sûre.
 
 ### Pagination par curseur
 

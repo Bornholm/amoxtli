@@ -25,9 +25,25 @@ type ManagerOptions struct {
 	MaxWordPerSection int
 	FileConverter     convert.Converter
 	Reranker          Reranker
+	// StagingDir, when set, pins the directory where files awaiting indexing are
+	// staged to a stable location instead of a per-process temporary directory.
+	// It is required for a persistent task runner: a resumed IndexFile task must
+	// still find its staged file after a restart.
+	StagingDir string
 }
 
 type ManagerOptionFunc func(opts *ManagerOptions)
+
+// WithManagerStagingDir pins the ingestion staging directory to a stable
+// location. Use it together with a persistent task runner so that files staged
+// by IndexFile survive a restart and their resumed indexing tasks can find
+// them. When set, the directory is not removed on shutdown (CleanupTempDir
+// becomes a no-op).
+func WithManagerStagingDir(dir string) ManagerOptionFunc {
+	return func(opts *ManagerOptions) {
+		opts.StagingDir = dir
+	}
+}
 
 // WithManagerReranker plugs a reranker into the search pipeline: it reorders
 // the fused (and filtered) candidates before pagination.
@@ -71,10 +87,13 @@ type Manager struct {
 	reranker          Reranker
 
 	// Per-manager staging directory for files awaiting indexing (created
-	// lazily by IndexFile, removed by CleanupTempDir).
-	tempDirOnce sync.Once
-	tempDir     string
-	tempDirErr  error
+	// lazily by IndexFile, removed by CleanupTempDir). When stagingDirOverride
+	// is set the staging directory is that stable path and is never removed on
+	// shutdown, so a persistent runner can resume its indexing tasks.
+	tempDirOnce        sync.Once
+	tempDir            string
+	tempDirErr         error
+	stagingDirOverride string
 }
 
 type SearchOptions struct {
@@ -446,10 +465,19 @@ func (m *Manager) Reindex(ctx context.Context) (task.ID, error) {
 }
 
 // RegisterHandlers registers the ingestion task handlers on the given runner.
+// When the runner is a task.PersistentRunner, the matching deserialization
+// factories are registered too so pending tasks can be rebuilt and resumed
+// after a restart.
 func (m *Manager) RegisterHandlers(runner task.Runner) {
 	runner.RegisterTask(TaskTypeIndexFile, NewIndexFileHandler(m.Store, m.fileConverter, m.index, m.maxWordPerSection))
 	runner.RegisterTask(TaskTypeCleanup, NewCleanupHandler(m.index, m.Store))
 	runner.RegisterTask(TaskTypeReindex, NewReindexHandler(m.Store, m.index, m.maxWordPerSection))
+
+	if persistent, ok := runner.(task.PersistentRunner); ok {
+		persistent.RegisterFactory(TaskTypeIndexFile, IndexFileTaskFactory)
+		persistent.RegisterFactory(TaskTypeCleanup, CleanupTaskFactory)
+		persistent.RegisterFactory(TaskTypeReindex, ReindexTaskFactory)
+	}
 }
 
 func NewManager(store Store, idx index.Index, taskRunner task.Runner, funcs ...ManagerOptionFunc) *Manager {
@@ -458,16 +486,20 @@ func NewManager(store Store, idx index.Index, taskRunner task.Runner, funcs ...M
 	// Best-effort: sweep staging directories left behind by previous runs that
 	// crashed before their indexing tasks removed the staged files. Only dirs
 	// older than staleTempDirAge are removed, so a concurrently-running
-	// instance's fresh directory is never touched.
-	cleanStaleTempDirs(staleTempDirAge)
+	// instance's fresh directory is never touched. Skipped when a stable staging
+	// directory is configured (its files may back pending, resumable tasks).
+	if opts.StagingDir == "" {
+		cleanStaleTempDirs(staleTempDirAge)
+	}
 
 	manager := &Manager{
-		maxWordPerSection: opts.MaxWordPerSection,
-		Store:             store,
-		taskRunner:        taskRunner,
-		index:             idx,
-		fileConverter:     opts.FileConverter,
-		reranker:          opts.Reranker,
+		maxWordPerSection:  opts.MaxWordPerSection,
+		Store:              store,
+		taskRunner:         taskRunner,
+		index:              idx,
+		fileConverter:      opts.FileConverter,
+		reranker:           opts.Reranker,
+		stagingDirOverride: opts.StagingDir,
 	}
 
 	return manager
@@ -481,9 +513,19 @@ const tempDirPrefix = "amoxtli-"
 const staleTempDirAge = 24 * time.Hour
 
 // stagingDir returns the per-manager staging directory, creating it on first
-// use.
+// use. When a stable staging directory is configured (WithManagerStagingDir) it
+// is used as-is (created if missing) instead of a per-process temporary
+// directory.
 func (m *Manager) stagingDir() (string, error) {
 	m.tempDirOnce.Do(func() {
+		if m.stagingDirOverride != "" {
+			if err := os.MkdirAll(m.stagingDirOverride, 0o700); err != nil {
+				m.tempDirErr = errors.WithStack(err)
+				return
+			}
+			m.tempDir = m.stagingDirOverride
+			return
+		}
 		tmp, err := os.MkdirTemp("", tempDirPrefix+"*")
 		if err != nil {
 			m.tempDirErr = errors.WithStack(err)
@@ -499,8 +541,13 @@ func (m *Manager) stagingDir() (string, error) {
 
 // CleanupTempDir removes this manager's staging directory and everything left
 // in it. It is a best-effort, idempotent operation typically called on
-// shutdown, once in-flight indexing tasks have drained.
+// shutdown, once in-flight indexing tasks have drained. It is a no-op when a
+// stable staging directory is configured, since its files may back pending,
+// resumable tasks that must survive the restart.
 func (m *Manager) CleanupTempDir() error {
+	if m.stagingDirOverride != "" {
+		return nil
+	}
 	if m.tempDir == "" {
 		return nil
 	}

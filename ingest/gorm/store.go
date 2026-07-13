@@ -68,6 +68,12 @@ func (s *Store) withRetry(ctx context.Context, withTx bool, fn func(ctx context.
 	}
 }
 
+// DB returns the underlying *gorm.DB. It is intended for advanced usage such as
+// sharing the connection with a persistent task runner (task/gorm).
+func (s *Store) DB() *gorm.DB {
+	return s.db
+}
+
 func NewStore(db *gorm.DB) *Store {
 	return &Store{
 		db: db,

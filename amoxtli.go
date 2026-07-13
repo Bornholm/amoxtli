@@ -17,11 +17,19 @@ import (
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/task"
+	taskGorm "github.com/bornholm/amoxtli/task/gorm"
 	taskMemory "github.com/bornholm/amoxtli/task/memory"
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/pkg/errors"
+	"gorm.io/gorm"
 )
+
+// gormDBProvider is satisfied by the gorm-backed store, exposing the shared
+// *gorm.DB used to build the persistent task runner (WithPersistentTasks).
+type gormDBProvider interface {
+	DB() *gorm.DB
+}
 
 // Codex is the main embedded instance: a store, index pipeline and task
 // runner behind a single API.
@@ -105,17 +113,40 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 		idx = pipeline.NewIndex(weightedIndexes, pipelineOpts...)
 	}
 
-	if taskRunner == nil {
-		taskRunner = taskMemory.NewTaskRunner(
-			opts.taskParallelism,
-			60*time.Minute,
-			10*time.Minute,
-		)
-	}
-
 	managerOpts := []ingest.ManagerOptionFunc{
 		ingest.WithManagerMaxWordPerSection(opts.maxWordsPerSection),
 	}
+
+	if taskRunner == nil {
+		if opts.persistentTasks {
+			if opts.stagingDir == "" {
+				return nil, errors.New("amoxtli: WithPersistentTasks requires a non-empty staging directory")
+			}
+
+			provider, ok := store.(gormDBProvider)
+			if !ok {
+				return nil, errors.New("amoxtli: WithPersistentTasks requires a gorm-backed store (gorm.NewSQLiteStore / gorm.NewPostgresStore)")
+			}
+
+			taskRunner = taskGorm.NewTaskRunner(
+				provider.DB(),
+				opts.taskParallelism,
+				60*time.Minute,
+				10*time.Minute,
+			)
+
+			// A resumed IndexFile task must find its staged file after a restart,
+			// so the staging directory must be stable rather than per-process.
+			managerOpts = append(managerOpts, ingest.WithManagerStagingDir(opts.stagingDir))
+		} else {
+			taskRunner = taskMemory.NewTaskRunner(
+				opts.taskParallelism,
+				60*time.Minute,
+				10*time.Minute,
+			)
+		}
+	}
+
 	if opts.fileConverter != nil {
 		managerOpts = append(managerOpts, ingest.WithManagerFileConverter(opts.fileConverter))
 	}
