@@ -30,6 +30,8 @@ type IndexFileTask struct {
 	source       *url.URL
 	// Names of the collection to associate with the document
 	collections []model.CollectionID
+	// Arbitrary document metadata used for filtering at search time.
+	metadata map[string]any
 }
 
 type indexTaskPayload struct {
@@ -38,6 +40,7 @@ type indexTaskPayload struct {
 	Etag         string               `json:"etag"`
 	Source       string               `json:"source"`
 	Collections  []model.CollectionID `json:"collections"`
+	Metadata     map[string]any       `json:"metadata,omitempty"`
 }
 
 // MarshalJSON implements [task.Task].
@@ -53,6 +56,7 @@ func (i *IndexFileTask) MarshalJSON() ([]byte, error) {
 		Etag:         i.etag,
 		Source:       sourceStr,
 		Collections:  i.collections,
+		Metadata:     i.metadata,
 	}
 
 	data, err := json.Marshal(payload)
@@ -75,6 +79,7 @@ func (i *IndexFileTask) UnmarshalJSON(data []byte) error {
 	i.etag = payload.Etag
 	i.originalName = payload.OriginalName
 	i.path = payload.Path
+	i.metadata = payload.Metadata
 
 	source, err := url.Parse(payload.Source)
 	if err != nil {
@@ -86,7 +91,7 @@ func (i *IndexFileTask) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func NewIndexFileTask(path string, originalName string, etag string, source *url.URL, collections []model.CollectionID) *IndexFileTask {
+func NewIndexFileTask(path string, originalName string, etag string, source *url.URL, collections []model.CollectionID, metadata map[string]any) *IndexFileTask {
 	return &IndexFileTask{
 		id:           task.NewID(),
 		path:         path,
@@ -94,6 +99,7 @@ func NewIndexFileTask(path string, originalName string, etag string, source *url
 		etag:         etag,
 		source:       source,
 		collections:  collections,
+		metadata:     metadata,
 	}
 }
 
@@ -215,6 +221,10 @@ func (h *IndexFileHandler) Handle(ctx context.Context, tsk task.Task, events cha
 
 				if indexFileTask.etag != "" {
 					doc.SetETag(indexFileTask.etag)
+				}
+
+				if len(indexFileTask.metadata) > 0 {
+					doc.SetMetadata(indexFileTask.metadata)
 				}
 
 				if len(indexFileTask.collections) == 0 {

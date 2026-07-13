@@ -27,3 +27,20 @@ type PersistedDocument interface {
 	Document
 	WithLifecycle
 }
+
+// WithMetadata is an optional capability a Document may implement to carry
+// arbitrary key/value metadata (author, tags, dates, ...). It is used for
+// metadata filtering at search time. Implementations that don't need metadata
+// can simply not implement it.
+type WithMetadata interface {
+	Metadata() map[string]any
+}
+
+// Metadata returns the document's metadata when it implements WithMetadata, or
+// nil otherwise.
+func Metadata(d Document) map[string]any {
+	if m, ok := d.(WithMetadata); ok {
+		return m.Metadata()
+	}
+	return nil
+}

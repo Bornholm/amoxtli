@@ -43,6 +43,17 @@ type Store interface {
 	DeleteCollection(ctx context.Context, id model.CollectionID) error
 }
 
+// MetadataProvider is an optional capability a Store may implement to expose
+// document metadata keyed by source URL. The ingestion Manager uses it to apply
+// metadata filters at search time. A Store that does not implement it cannot be
+// used together with a search metadata filter.
+type MetadataProvider interface {
+	// GetDocumentsMetadataBySources returns, for each of the given source URLs
+	// that maps to a stored document, the document's metadata. Sources without
+	// a document (or without metadata) may be omitted from the result.
+	GetDocumentsMetadataBySources(ctx context.Context, sources []string) (map[string]map[string]any, error)
+}
+
 type QueryDocumentsOptions struct {
 	Page  *int
 	Limit *int

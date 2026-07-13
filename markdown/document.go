@@ -14,6 +14,7 @@ type Document struct {
 	source      *url.URL
 	collections []model.Collection
 	sections    []*Section
+	metadata    map[string]any
 }
 
 // ETag implements model.Document.
@@ -70,6 +71,16 @@ func (d *Document) AddCollection(coll model.Collection) {
 	d.collections = append(d.collections, coll)
 }
 
+// Metadata implements model.WithMetadata.
+func (d *Document) Metadata() map[string]any {
+	return d.metadata
+}
+
+// SetMetadata attaches arbitrary metadata used for filtering at search time.
+func (d *Document) SetMetadata(metadata map[string]any) {
+	d.metadata = metadata
+}
+
 // Collections implements model.Document.
 func (d *Document) Collections() []model.Collection {
 	return d.collections
@@ -98,7 +109,10 @@ func (d *Document) SetSource(source *url.URL) {
 	d.source = source
 }
 
-var _ model.Document = &Document{}
+var (
+	_ model.Document     = &Document{}
+	_ model.WithMetadata = &Document{}
+)
 
 type Section struct {
 	id       model.SectionID

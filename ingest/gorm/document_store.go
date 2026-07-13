@@ -2,6 +2,8 @@ package gorm
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"net/url"
 	"slices"
 	"strings"
@@ -13,6 +15,44 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// GetDocumentsMetadataBySources implements ingest.MetadataProvider.
+func (s *Store) GetDocumentsMetadataBySources(ctx context.Context, sources []string) (map[string]map[string]any, error) {
+	result := make(map[string]map[string]any, len(sources))
+	if len(sources) == 0 {
+		return result, nil
+	}
+
+	type row struct {
+		Source   string
+		Metadata []byte
+	}
+
+	var rows []row
+
+	err := s.withRetry(ctx, false, func(ctx context.Context, db *gorm.DB) error {
+		return db.Model(&Document{}).Select("source, metadata").Where("source IN ?", sources).Scan(&rows).Error
+	}, sqlite3.LOCKED, sqlite3.BUSY)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	for _, r := range rows {
+		if len(r.Metadata) == 0 {
+			result[r.Source] = nil
+			continue
+		}
+		var metadata map[string]any
+		if err := json.Unmarshal(r.Metadata, &metadata); err != nil {
+			slog.WarnContext(ctx, "could not unmarshal document metadata", slog.String("source", r.Source), slog.Any("error", errors.WithStack(err)))
+			result[r.Source] = nil
+			continue
+		}
+		result[r.Source] = metadata
+	}
+
+	return result, nil
+}
 
 // ListDocumentDigests implements ingest.Store.
 func (s *Store) ListDocumentDigests(ctx context.Context, sourcePrefix string, page int, pageSize int) ([]ingest.DocumentDigest, error) {

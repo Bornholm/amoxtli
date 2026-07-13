@@ -9,6 +9,7 @@ import (
 
 	"github.com/bornholm/amoxtli/ingest"
 	"github.com/bornholm/amoxtli/markdown"
+	"github.com/bornholm/amoxtli/model"
 	"github.com/pkg/errors"
 
 	gormlite "github.com/ncruces/go-sqlite3/gormlite"
@@ -84,6 +85,7 @@ func testStoreConformance(t *testing.T, ctx context.Context, store *Store) {
 	source, _ := url.Parse("https://example.net/test.md")
 	doc.SetSource(source)
 	doc.AddCollection(coll)
+	doc.SetMetadata(map[string]any{"author": "william", "year": float64(2026)})
 
 	if err := store.SaveDocuments(ctx, doc); err != nil {
 		t.Fatalf("could not save document: %+v", errors.WithStack(err))
@@ -96,6 +98,20 @@ func testStoreConformance(t *testing.T, ctx context.Context, store *Store) {
 
 	if e, g := source.String(), persisted.Source().String(); e != g {
 		t.Errorf("persisted.Source(): expected %s, got %s", e, g)
+	}
+
+	// Metadata roundtrip: via the document capability and the MetadataProvider
+	// lookup used by search filtering (exercises the JSON column for both the
+	// SQLite and PostgreSQL dialects).
+	if g := model.Metadata(persisted); g["author"] != "william" {
+		t.Errorf("persisted metadata author: expected william, got %v", g["author"])
+	}
+	bySource, err := store.GetDocumentsMetadataBySources(ctx, []string{source.String()})
+	if err != nil {
+		t.Fatalf("GetDocumentsMetadataBySources: %+v", errors.WithStack(err))
+	}
+	if got := bySource[source.String()]; got["author"] != "william" || got["year"].(float64) != 2026 {
+		t.Errorf("metadata by source: unexpected %+v", got)
 	}
 
 	if e, g := 1, len(persisted.Collections()); e != g {

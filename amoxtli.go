@@ -119,6 +119,11 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	if opts.fileConverter != nil {
 		managerOpts = append(managerOpts, ingest.WithManagerFileConverter(opts.fileConverter))
 	}
+	if opts.reranking && opts.llmClient != nil {
+		managerOpts = append(managerOpts,
+			ingest.WithManagerReranker(retrieval.NewLLMReranker(opts.llmClient, store, opts.maxTotalWords)),
+		)
+	}
 
 	manager := ingest.NewManager(store, idx, taskRunner, managerOpts...)
 	manager.RegisterHandlers(taskRunner)
@@ -168,7 +173,11 @@ func newOrchestrator(opts *options, manager *ingest.Manager, evaluator retrieval
 		if len(collections) > 0 {
 			ingestOpts = append(ingestOpts, ingest.WithSearchCollections(collections...))
 		}
-		return manager.Search(ctx, query, ingestOpts...)
+		res, err := manager.Search(ctx, query, ingestOpts...)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return res.Results, nil
 	}
 
 	orchestratorOpts := []retrieval.OrchestratorOption{}
@@ -214,6 +223,9 @@ func (c *Codex) IndexFile(ctx context.Context, collectionID model.CollectionID, 
 	if opts.ETag != "" {
 		ingestOpts = append(ingestOpts, ingest.WithIndexFileETag(opts.ETag))
 	}
+	if len(opts.Metadata) > 0 {
+		ingestOpts = append(ingestOpts, ingest.WithIndexFileMetadata(opts.Metadata))
+	}
 
 	taskID, err := c.manager.IndexFile(ctx, filename, r, ingestOpts...)
 	if err != nil {
@@ -223,8 +235,41 @@ func (c *Codex) IndexFile(ctx context.Context, collectionID model.CollectionID, 
 	return taskID, nil
 }
 
-// Search performs a semantic search across the indexed documents.
+// searchCandidatePool is the fused candidate window fetched by SearchPage so
+// that cursor pagination works from the first page onward.
+const searchCandidatePool = 100
+
+// SearchPage is a page of search results together with the opaque cursor used
+// to fetch the next page (empty when the last page has been reached).
+type SearchPage struct {
+	Results    []*index.SearchResult
+	NextCursor string
+}
+
+// Search performs a semantic search across the indexed documents. It returns a
+// single page of results (metadata filtering via WithSearchFilter and reranking
+// via WithReranking still apply); use SearchPage when the pagination cursor is
+// needed.
 func (c *Codex) Search(ctx context.Context, query string, funcs ...SearchOption) ([]*index.SearchResult, error) {
+	// candidatePool 0: let the Manager size the pool (cheap for plain searches,
+	// larger automatically when a filter/reranker is active).
+	page, err := c.searchPage(ctx, query, 0, funcs...)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return page.Results, nil
+}
+
+// SearchPage performs a search and returns a page of results plus the cursor to
+// resume from (WithSearchCursor). It supports metadata filtering
+// (WithSearchFilter), reranking (WithReranking) and cursor pagination. Unlike
+// Search it always over-fetches a bounded candidate window so that a next
+// cursor can be produced from the first page.
+func (c *Codex) SearchPage(ctx context.Context, query string, funcs ...SearchOption) (*SearchPage, error) {
+	return c.searchPage(ctx, query, searchCandidatePool, funcs...)
+}
+
+func (c *Codex) searchPage(ctx context.Context, query string, candidatePool int, funcs ...SearchOption) (*SearchPage, error) {
 	opts := &SearchOptions{
 		MaxResults: 5,
 	}
@@ -238,11 +283,22 @@ func (c *Codex) Search(ctx context.Context, query string, funcs ...SearchOption)
 	if len(opts.Collections) > 0 {
 		ingestOpts = append(ingestOpts, ingest.WithSearchCollections(opts.Collections...))
 	}
+	if len(opts.Filter) > 0 {
+		ingestOpts = append(ingestOpts, ingest.WithSearchFilter(opts.Filter))
+	}
+	if opts.Cursor != "" {
+		ingestOpts = append(ingestOpts, ingest.WithSearchCursor(opts.Cursor))
+	}
+	if candidatePool > 0 {
+		ingestOpts = append(ingestOpts, ingest.WithSearchCandidatePoolSize(candidatePool))
+	}
 
-	results, err := c.manager.Search(ctx, query, ingestOpts...)
+	res, err := c.manager.Search(ctx, query, ingestOpts...)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+
+	results := res.Results
 
 	// When grounding is enabled the Judge is out of the pipeline; the evidence
 	// evaluator provides the relevance filtering here instead (its verdict is
@@ -254,14 +310,14 @@ func (c *Codex) Search(ctx context.Context, query string, funcs ...SearchOption)
 			// retrieved results unfiltered rather than failing the whole Search.
 			if c.groundingFailOpen {
 				slog.WarnContext(ctx, "amoxtli: grounding evaluation failed, returning unfiltered results (fail-open)", slog.Any("error", errors.WithStack(err)))
-				return results, nil
+				return &SearchPage{Results: results, NextCursor: res.NextCursor}, nil
 			}
 			return nil, errors.WithStack(err)
 		}
 		results = retrieval.FilterRelevant(results, evaluation.Relevant)
 	}
 
-	return results, nil
+	return &SearchPage{Results: results, NextCursor: res.NextCursor}, nil
 }
 
 // CheckGrounding evaluates whether the given search results support a reliable,

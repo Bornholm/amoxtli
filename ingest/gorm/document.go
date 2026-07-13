@@ -1,6 +1,8 @@
 package gorm
 
 import (
+	"encoding/json"
+	"log/slog"
 	"net/url"
 	"time"
 
@@ -18,6 +20,9 @@ type Document struct {
 	Sections    []*Section    `gorm:"constraint:OnDelete:CASCADE"`
 	Collections []*Collection `gorm:"many2many:documents_collections;"`
 	Content     []byte
+	// Metadata holds arbitrary document metadata serialized as JSON, used for
+	// metadata filtering at search time.
+	Metadata []byte
 }
 
 type wrappedDocument struct {
@@ -57,6 +62,19 @@ func (w *wrappedDocument) Content() ([]byte, error) {
 	return w.d.Content, nil
 }
 
+// Metadata implements model.WithMetadata.
+func (w *wrappedDocument) Metadata() map[string]any {
+	if len(w.d.Metadata) == 0 {
+		return nil
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(w.d.Metadata, &metadata); err != nil {
+		slog.Warn("could not unmarshal document metadata", slog.String("documentID", w.d.ID), slog.Any("error", errors.WithStack(err)))
+		return nil
+	}
+	return metadata
+}
+
 // Collections implements model.Document.
 func (w *wrappedDocument) Collections() []model.Collection {
 	collections := make([]model.Collection, 0, len(w.d.Collections))
@@ -91,12 +109,23 @@ func (w *wrappedDocument) Source() *url.URL {
 	return url
 }
 
-var _ model.PersistedDocument = &wrappedDocument{}
+var (
+	_ model.PersistedDocument = &wrappedDocument{}
+	_ model.WithMetadata      = &wrappedDocument{}
+)
 
 func fromDocument(d model.Document) (*Document, error) {
 	content, err := d.Content()
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+
+	var metadata []byte
+	if m := model.Metadata(d); len(m) > 0 {
+		metadata, err = json.Marshal(m)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
 	}
 
 	document := &Document{
@@ -106,6 +135,7 @@ func fromDocument(d model.Document) (*Document, error) {
 		Collections: make([]*Collection, 0, len(d.Collections())),
 		Sections:    make([]*Section, 0, len(d.Sections())),
 		Content:     content,
+		Metadata:    metadata,
 	}
 
 	for _, s := range d.Sections() {

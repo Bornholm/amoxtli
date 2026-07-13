@@ -39,6 +39,8 @@ type options struct {
 	iterativeMaxRounds         int
 	queryDecomposition         bool
 	decompositionMaxSubQueries int
+	// Reranking reorders fused results with an LLM before pagination.
+	reranking bool
 	// Indexers composing the search pipeline.
 	indexers []Indexer
 	// Explicit components.
@@ -188,6 +190,16 @@ func WithQueryDecomposition(maxSubQueries int) Option {
 	}
 }
 
+// WithReranking enables LLM-based reranking of the fused search results before
+// pagination: the retrieved candidates are reordered by relevance to the query,
+// reusing the WithMaxTotalWords budget to bound the prompt size. Requires an LLM
+// client (WithLLMClient). Disabled by default.
+func WithReranking() Option {
+	return func(o *options) {
+		o.reranking = true
+	}
+}
+
 // WithSnapshotBoundary overrides the multipart boundary used by Backup/Restore.
 func WithSnapshotBoundary(boundary string) Option {
 	return func(o *options) {
@@ -236,6 +248,8 @@ type IndexFileOptions struct {
 	Source      *url.URL
 	ETag        string
 	Collections []model.CollectionID
+	// Metadata is arbitrary document metadata used for filtering at search time.
+	Metadata map[string]any
 }
 
 // IndexFileOption configures an IndexFile call.
@@ -262,16 +276,31 @@ func WithIndexFileCollections(ids ...model.CollectionID) IndexFileOption {
 	}
 }
 
+// WithIndexFileMetadata attaches arbitrary metadata to the indexed document,
+// used for metadata filtering at search time (see WithSearchFilter).
+func WithIndexFileMetadata(metadata map[string]any) IndexFileOption {
+	return func(o *IndexFileOptions) {
+		o.Metadata = metadata
+	}
+}
+
 // SearchOptions holds options for Search calls.
 type SearchOptions struct {
+	// MaxResults is the page size (number of results per page).
 	MaxResults  int
 	Collections []model.CollectionID
+	// Filter restricts results to documents whose metadata matches every
+	// condition. Requires a store implementing ingest.MetadataProvider (the
+	// gorm stores do).
+	Filter index.Filter
+	// Cursor resumes pagination after a previous SearchPage (empty = first page).
+	Cursor string
 }
 
 // SearchOption configures a Search call.
 type SearchOption func(*SearchOptions)
 
-// WithSearchMaxResults sets the maximum number of search results.
+// WithSearchMaxResults sets the maximum number of search results (page size).
 func WithSearchMaxResults(n int) SearchOption {
 	return func(o *SearchOptions) {
 		o.MaxResults = n
@@ -282,5 +311,22 @@ func WithSearchMaxResults(n int) SearchOption {
 func WithSearchCollections(ids ...model.CollectionID) SearchOption {
 	return func(o *SearchOptions) {
 		o.Collections = ids
+	}
+}
+
+// WithSearchFilter restricts results to documents whose metadata satisfies the
+// given filter (see index.Eq/Ne/Gt/Gte/Lt/Lte/In). Requires a store
+// implementing ingest.MetadataProvider.
+func WithSearchFilter(conditions ...index.Condition) SearchOption {
+	return func(o *SearchOptions) {
+		o.Filter = index.Filter(conditions)
+	}
+}
+
+// WithSearchCursor resumes pagination after the given opaque cursor (the
+// NextCursor returned by a previous SearchPage).
+func WithSearchCursor(cursor string) SearchOption {
+	return func(o *SearchOptions) {
+		o.Cursor = cursor
 	}
 }

@@ -91,4 +91,5 @@ func (s *Store) Close() error {
 }
 
 var _ ingest.Store = &Store{}
+var _ ingest.MetadataProvider = &Store{}
 var _ io.Closer = &Store{}
