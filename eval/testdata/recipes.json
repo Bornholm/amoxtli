@@ -1,0 +1,35 @@
+{
+  "name": "recipes-golden",
+  "queries": [
+    {
+      "id": "air-fryer-temp",
+      "query": "What air fryer temperature for crispy vegetables?",
+      "relevant_sources": ["mem://recipes/air-fryer-mixed-vegetables"],
+      "tags": ["appliance-settings", "simple"]
+    },
+    {
+      "id": "bulgogi-marinate",
+      "query": "How long to marinate Korean bulgogi?",
+      "relevant_sources": ["mem://recipes/korean-beef-bulgogi"],
+      "tags": ["timing", "simple"]
+    },
+    {
+      "id": "gluten-free-bread",
+      "query": "Best gluten-free bread recipe?",
+      "relevant_sources": ["mem://recipes/gluten-free-artisan-bread"],
+      "tags": ["informational", "simple"]
+    },
+    {
+      "id": "buttermilk-substitute",
+      "query": "What can I substitute for buttermilk?",
+      "relevant_sources": ["mem://recipes/buttermilk-substitutes"],
+      "tags": ["ingredient-substitution", "medium"]
+    },
+    {
+      "id": "crispy-chicken-skin",
+      "query": "How to get crispy chicken skin?",
+      "relevant_sources": ["mem://recipes/crispy-roast-chicken"],
+      "tags": ["technique", "medium"]
+    }
+  ]
+}

@@ -11,7 +11,6 @@ import (
 	"github.com/bornholm/genai/llm"
 	"github.com/bornholm/genai/llm/provider"
 	"github.com/bornholm/genai/llm/provider/openai"
-	_ "github.com/bornholm/genai/llm/provider/openai"
 	"github.com/pkg/errors"
 	"github.com/testcontainers/testcontainers-go"
 	tcollama "github.com/testcontainers/testcontainers-go/modules/ollama"

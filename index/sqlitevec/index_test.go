@@ -10,7 +10,6 @@ import (
 	"github.com/bornholm/amoxtli/internal/ollamatest"
 	"github.com/bornholm/genai/llm/provider"
 	"github.com/bornholm/genai/llm/provider/openai"
-	_ "github.com/bornholm/genai/llm/provider/openai"
 	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
 	"github.com/testcontainers/testcontainers-go"

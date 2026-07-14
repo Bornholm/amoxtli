@@ -157,7 +157,7 @@ func (s *Section) Branch() []model.SectionID {
 
 // Level implements model.Section.
 func (s *Section) Level() uint {
-	return uint(s.level)
+	return s.level
 }
 
 // ID implements model.Section.

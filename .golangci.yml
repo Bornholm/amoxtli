@@ -1,0 +1,42 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - unconvert
+  settings:
+    errcheck:
+      # Conventionally-ignored return values: side-effecting registrations and
+      # best-effort cleanup whose error is not actionable.
+      exclude-functions:
+        - (github.com/jackc/pgx/v5.Tx).Rollback
+        - (*github.com/ncruces/go-sqlite3.Stmt).Reset
+        - (*strings.Replacer).WriteString
+        - os.RemoveAll
+        - github.com/blevesearch/bleve/v2/registry.RegisterCharFilter
+        - github.com/blevesearch/bleve/v2/registry.RegisterTokenFilter
+        - github.com/blevesearch/bleve/v2/registry.RegisterTokenizer
+        - github.com/blevesearch/bleve/v2/registry.RegisterAnalyzer
+  exclusions:
+    generated: lax
+    rules:
+      # Deferred/best-effort Close on concrete resource types (sqlite Conn/Stmt,
+      # bleve index, files, stores, writers). Their close error is not
+      # actionable at the call site; errors that matter are surfaced elsewhere.
+      - linters: [errcheck]
+        source: \.Close\(\)
+      # Tests routinely ignore errors on cleanup and fire-and-forget helpers.
+      - linters: [errcheck]
+        path: _test\.go
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

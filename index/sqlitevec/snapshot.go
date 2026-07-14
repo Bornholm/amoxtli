@@ -135,8 +135,6 @@ func (i *Index) RestoreSnapshot(ctx context.Context, r io.Reader) error {
 					if err := i.restoreRecords(ctx, batch...); err != nil {
 						return errors.WithStack(err)
 					}
-
-					batch = nil
 				}
 
 				return nil
@@ -161,7 +159,7 @@ func (i *Index) RestoreSnapshot(ctx context.Context, r io.Reader) error {
 func (i *Index) restoreRecords(ctx context.Context, records ...*SnapshottedRecord) error {
 	start := time.Now()
 	defer func() {
-		slog.DebugContext(ctx, "restored record batch", slog.Any("batchSize", len(records)), slog.Duration("duration", time.Now().Sub(start)))
+		slog.DebugContext(ctx, "restored record batch", slog.Any("batchSize", len(records)), slog.Duration("duration", time.Since(start)))
 	}()
 
 	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {

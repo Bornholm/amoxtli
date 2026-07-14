@@ -63,6 +63,15 @@ Exemples complets et exécutables : [`example/sqlite`](example/sqlite/main.go) (
 - [Backend PostgreSQL](docs/postgres.md) — déploiement entièrement PostgreSQL (FTS + pgvector, fusion RRF)
 - [Convertisseurs de fichiers](docs/converters.md) — pandoc, LibreOffice, OCR/LLM
 - [Tests](docs/testing.md) — tests unitaires et d'intégration (Docker, Ollama, PostgreSQL)
+- [Évaluation de la pertinence](docs/evaluation.md) — Recall@k / MRR / nDCG@k, benchmark multilingue sur jeux QA Hugging Face
+- [Stabilité de l'API](docs/stability.md) — politique de compatibilité (série `0.x`) et surface publique couverte
+- [CHANGELOG](CHANGELOG.md) — historique des versions
+
+L'évaluation de la pertinence (Recall@k, MRR, nDCG — avec un benchmark
+multilingue sur jeux QA Hugging Face) est fournie par le package [`eval`](eval)
+(voir [docs/evaluation.md](docs/evaluation.md)), et l'observabilité
+(OpenTelemetry) par le package [`telemetry`](telemetry) (activée via
+`amoxtli.WithObservability()`).
 
 ## Licence
 

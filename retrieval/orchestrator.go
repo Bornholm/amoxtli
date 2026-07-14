@@ -125,11 +125,7 @@ func (o *Orchestrator) Search(ctx context.Context, query string, maxResults int,
 	var grounding *GroundingResult
 	rounds := 0
 	if o.evaluator != nil {
-		for {
-			if len(results) == 0 {
-				break
-			}
-
+		for len(results) > 0 {
 			evaluation, err := o.evaluator.Evaluate(ctx, query, results)
 			if err != nil {
 				return nil, errors.WithStack(err)

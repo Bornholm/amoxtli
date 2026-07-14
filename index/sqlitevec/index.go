@@ -653,8 +653,6 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 			if err := stmt.BindBlob(bindIndex, jsonCollections); err != nil {
 				return errors.WithStack(err)
 			}
-
-			bindIndex++
 		}
 
 		mappedScores := map[string]float64{}

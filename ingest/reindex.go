@@ -127,7 +127,7 @@ func (h *ReindexHandler) Handle(ctx context.Context, tsk task.Task, events chan 
 	// Get all documents (optionally filtered by collection)
 	limit := 1
 	page := 1
-	var totalDocuments int64 = 0
+	var totalDocuments int64
 
 	var err error
 	var total int64
@@ -193,7 +193,6 @@ func (h *ReindexHandler) Handle(ctx context.Context, tsk task.Task, events chan 
 		}
 
 		if len(documents) == 0 || count == 0 {
-			allDocumentsProcessed = true
 			break
 		}
 
@@ -264,7 +263,6 @@ func (h *ReindexHandler) Handle(ctx context.Context, tsk task.Task, events chan 
 		}
 
 		if len(documents) == 0 || count == 0 {
-			allDocumentsProcessed = true
 			break
 		}
 

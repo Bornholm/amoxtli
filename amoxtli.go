@@ -14,14 +14,19 @@ import (
 	"github.com/bornholm/amoxtli/backup"
 	"github.com/bornholm/amoxtli/index/pipeline"
 	"github.com/bornholm/amoxtli/ingest"
+	"github.com/bornholm/amoxtli/llmx"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/task"
 	taskGorm "github.com/bornholm/amoxtli/task/gorm"
 	taskMemory "github.com/bornholm/amoxtli/task/memory"
+	"github.com/bornholm/amoxtli/telemetry"
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"gorm.io/gorm"
 )
 
@@ -68,6 +73,13 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	store := opts.store
 	if store == nil {
 		return nil, errors.New("amoxtli: WithStore is required")
+	}
+
+	// Wrap the LLM client with the OpenTelemetry decorator before it is handed to
+	// the pipeline transformers, evaluator and reranker, so all of their calls
+	// are instrumented.
+	if opts.observability && opts.llmClient != nil {
+		opts.llmClient = llmx.NewObservableClient(opts.llmClient)
 	}
 
 	idx := opts.index
@@ -300,7 +312,28 @@ func (c *Codex) SearchPage(ctx context.Context, query string, funcs ...SearchOpt
 	return c.searchPage(ctx, query, searchCandidatePool, funcs...)
 }
 
-func (c *Codex) searchPage(ctx context.Context, query string, candidatePool int, funcs ...SearchOption) (*SearchPage, error) {
+func (c *Codex) searchPage(ctx context.Context, query string, candidatePool int, funcs ...SearchOption) (page *SearchPage, err error) {
+	start := time.Now()
+	ctx, span := telemetry.Tracer().Start(ctx, "amoxtli.Search",
+		trace.WithAttributes(attribute.Int(telemetry.AttrQueryLength, len(query))),
+	)
+	defer func() {
+		instruments := telemetry.Metrics()
+		if instruments.SearchDuration != nil {
+			instruments.SearchDuration.Record(ctx, time.Since(start).Seconds())
+		}
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else if page != nil {
+			span.SetAttributes(attribute.Int(telemetry.AttrResultCount, len(page.Results)))
+			if instruments.SearchResults != nil {
+				instruments.SearchResults.Add(ctx, int64(len(page.Results)))
+			}
+		}
+		span.End()
+	}()
+
 	opts := &SearchOptions{
 		MaxResults: 5,
 	}

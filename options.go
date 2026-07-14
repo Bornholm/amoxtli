@@ -54,6 +54,9 @@ type options struct {
 	// from.
 	persistentTasks bool
 	stagingDir      string
+	// observability wraps the LLM client with the OpenTelemetry decorator so its
+	// calls emit spans and token/latency metrics.
+	observability bool
 }
 
 func defaultOptions() *options {
@@ -76,6 +79,19 @@ type Option func(*options)
 func WithLLMClient(client llm.Client) Option {
 	return func(o *options) {
 		o.llmClient = client
+	}
+}
+
+// WithObservability wraps the configured LLM client (WithLLMClient) with the
+// OpenTelemetry decorator so the HyDE, Judge, grounding and reranker LLM calls
+// emit spans and token/latency metrics under the amoxtli instrumentation scope.
+// Search latency is instrumented unconditionally. It has no effect unless an
+// LLM client is set. Embeddings issued by an index built by the caller
+// (sqlitevec/postgres) are not covered here — wrap that client yourself with
+// llmx.NewObservableClient if you want their metrics too.
+func WithObservability() Option {
+	return func(o *options) {
+		o.observability = true
 	}
 }
 

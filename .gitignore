@@ -5,3 +5,7 @@
 *.sqlite-wal
 /dist/
 .DS_Store
+/.eval-data/
+/.eval-venv/
+.env
+__pycache__

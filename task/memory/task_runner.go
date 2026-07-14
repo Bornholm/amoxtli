@@ -268,11 +268,6 @@ func (r *TaskRunner) RegisterTask(taskType task.Type, handler task.Handler) {
 func (r *TaskRunner) ScheduleTask(ctx context.Context, tsk task.Task) error {
 	taskID := tsk.ID()
 
-	ctx = slogx.WithAttrs(ctx,
-		slog.String("taskID", string(taskID)),
-		slog.String("taskType", string(tsk.Type())),
-	)
-
 	r.updateState(tsk, func(s *task.State) {
 		s.ID = taskID
 		s.ScheduledAt = time.Now()

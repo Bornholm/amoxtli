@@ -19,7 +19,6 @@ import (
 	_ "github.com/blevesearch/bleve/v2/analysis/lang/da"
 	_ "github.com/blevesearch/bleve/v2/analysis/lang/de"
 	_ "github.com/blevesearch/bleve/v2/analysis/lang/el"
-	_ "github.com/blevesearch/bleve/v2/analysis/lang/en"
 	_ "github.com/blevesearch/bleve/v2/analysis/lang/es"
 	_ "github.com/blevesearch/bleve/v2/analysis/lang/eu"
 	_ "github.com/blevesearch/bleve/v2/analysis/lang/fa"

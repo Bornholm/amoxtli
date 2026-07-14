@@ -17,6 +17,8 @@
 | `task` / `task/memory` / `task/gorm` | Exécution de tâches asynchrones : contrat `task.Runner`, runner en mémoire, runner persistant gorm (reprise au démarrage) |
 | `ingest` / `ingest/gorm` | Pipeline d'ingestion + magasin de documents (SQLite ou PostgreSQL) |
 | `backup` | Abstraction snapshot/restore |
+| `eval` / `eval/hfqa` | Harnais d'évaluation de la pertinence (Recall@k / MRR / nDCG@k, segmentation par langue) + loader de jeux QA Hugging Face (format SQuAD) |
+| `telemetry` | Intégration OpenTelemetry : tracer/meter partagés + instruments (latence recherche, coût LLM) |
 
 ## Indexeurs personnalisés
 
@@ -79,6 +81,50 @@ chemin **stable** (`WithManagerStagingDir`), non supprimé à l'arrêt, au lieu 
 répertoire temporaire éphémère par-process utilisé par défaut. Les handlers
 d'ingestion sont idempotents (suppression par source puis ré-écriture), une tâche
 reprise depuis le début est donc sûre.
+
+### Harnais d'évaluation (`eval`)
+
+Le package `eval` mesure objectivement la qualité de récupération. Ses fonctions
+de métriques sont pures et testables sans LLM : `RecallAtK` (fraction des
+documents pertinents dans le top-k, ensembliste — dégénère en binaire pour une
+cible unique), `ReciprocalRank` (moyenné en MRR) et `NDCGAtK` (nDCG à relevance
+binaire, sensible au rang exact contrairement au recall). Un jeu golden (`query
+→ sources pertinentes`) se charge depuis un JSON (`LoadDataset`) ; `Evaluate`
+le déroule à travers un `Retriever` et agrège Recall@k / MRR / nDCG@k par cut-off
+et par requête. Le contrat `Retriever` est découplé du `Codex` — n'importe quelle
+implémentation de récupération est notable — et `FromSearchResults` adapte
+`Codex.Search` (identifiant = `Source` du résultat). Les requêtes portent une
+langue (`Lang`) et des tags ; `Report.ByLang()` (et le plus général
+`BySegment`) ré-agrège les métriques par segment, pour l'analyse par langue ou
+type de requête.
+
+Pour l'évaluation **en conditions réelles**, le sous-package `eval/hfqa` charge
+un jeu QA extractif au **format JSON SQuAD** — partagé par des datasets Hugging
+Face multilingues sur de vrais documents (PIAF en français, SQuAD en anglais,
+squad_es en espagnol, MLQA, XQuAD) — et le transforme en benchmark de
+récupération de passages : chaque paragraphe unique devient un document, chaque
+question une requête dont la source pertinente est son paragraphe d'origine. Le
+test gated `TestEvaluateRealWorld` (activé par `AMOXTLI_EVAL`, piloté par
+variables d'environnement) indexe le corpus et logge le rapport global puis par
+langue ; il tourne en lexical pur (bleve, sans LLM) par défaut, ou en fusion
+hybride si un endpoint d'embeddings est configuré. Voir
+[docs/evaluation.md](evaluation.md).
+
+### Observabilité (`telemetry`)
+
+L'instrumentation OpenTelemetry est **toujours active mais gratuite** : sans
+provider installé, les providers no-op globaux d'OTel absorbent spans et mesures.
+Le package `telemetry` expose un tracer et un meter partagés sous un scope
+d'instrumentation unique, plus des instruments créés paresseusement : latence de
+recherche, nombre de résultats, et pour les appels LLM le nombre d'appels, la
+latence et les tokens (prompt/completion). `Codex.Search` ouvre un span (longueur
+de requête, nombre de résultats — jamais le texte de la requête). Le décorateur
+`llmx.ObservableClient` instrumente un `llm.Client` (spans + métriques, dérivant
+les tokens de complétion depuis `Usage()`) ; l'option `WithObservability()`
+l'applique automatiquement au client LLM du `Codex` (HyDE, Judge, grounding,
+reranker). Les embeddings émis par un index construit par l'appelant
+(sqlitevec/postgres) ne sont pas couverts par cette option — l'appelant peut
+envelopper lui-même son client avec `llmx.NewObservableClient`.
 
 ### Pagination par curseur
 

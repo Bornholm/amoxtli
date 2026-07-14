@@ -195,7 +195,7 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 
 	collections := make([]model.CollectionID, 0)
 	for _, c := range opts.Collections {
-		coll, err := m.Store.GetCollectionByID(ctx, c, false)
+		coll, err := m.GetCollectionByID(ctx, c, false)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}

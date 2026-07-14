@@ -39,6 +39,18 @@ import (
 var wasmBinary []byte
 
 func init() {
+	Install()
+}
+
+// Install points ncruces/go-sqlite3 at the embedded sqlite-vec WASM build. It
+// runs from init, but is exported so it can be re-applied explicitly: when the
+// process also imports a plain ncruces build (e.g. the gorm SQLite store pulls
+// github.com/ncruces/go-sqlite3/embed, which sets Binary to a vanilla SQLite in
+// its own init), the two providers race on the global sqlite3.Binary and init
+// order is undefined. Calling Install once, before the first connection is
+// opened, deterministically selects the vec0-enabled build (a superset that
+// serves the plain store just as well).
+func Install() {
 	sqlite3.RuntimeConfig = wazero.NewRuntimeConfig().WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesThreads)
 	sqlite3.Binary = wasmBinary
 }

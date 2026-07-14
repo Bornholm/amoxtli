@@ -25,7 +25,7 @@ func TestIndex(t *testing.T, factory func(t *testing.T) (index.Index, error)) {
 		Run  func(t *testing.T, ctx context.Context, idx index.Index) error
 	}
 
-	var testCases []testCase = []testCase{
+	testCases := []testCase{
 		{
 			// A freshly created index must be queryable and iterable without
 			// error, and must yield nothing.

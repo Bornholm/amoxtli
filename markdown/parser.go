@@ -202,7 +202,7 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 			current = &Section{
 				document: document,
 				id:       model.NewSectionID(),
-				level:    uint(current.level + 1),
+				level:    current.level + 1,
 				sections: make([]*Section, 0),
 				parent:   previous,
 				start:    current.end,
