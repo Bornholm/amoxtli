@@ -7,5 +7,14 @@
 .DS_Store
 /.eval-data/
 /.eval-venv/
+/.eval-cache/
+/.eval-workdir-full/
+/.eval-workdir-mistral/
+# Eval artifacts are also created under eval/ (go test runs with CWD=package dir),
+# so match these unanchored (any depth), not just at the repo root.
+.eval-cache/
+.eval-data/
+.eval-workdir-*/
 .env
 __pycache__
+docs/*.pdf

@@ -130,6 +130,93 @@ Comparer le rapport lexical et le rapport hybride sur le **même** jeu (mêmes
 > dont le passage a été écarté par la troncature sont automatiquement retirées
 > (`Dataset.KeepAnswerable`), pour ne pas fausser le recall.
 
+## Benchmarks BEIR (dont FEVER)
+
+En plus des jeux SQuAD-like, le harnais évalue les jeux au **format BEIR** (la
+référence en recherche d'information) via `eval.TestEvaluateBEIR` et le loader
+[`eval/beir`](../eval/beir). Un jeu BEIR = trois fichiers (`corpus.jsonl`,
+`queries.jsonl`, `qrels/test.tsv`). La cible `make eval-beir` télécharge le jeu
+et lance l'évaluation :
+
+```bash
+make eval-beir EVAL_BEIR=scifact          # lexical pur, sous-échantillon gold-aware
+make eval-beir EVAL_BEIR=nfcorpus EVAL_SAMPLE_DOCS=2000
+```
+
+Comme pour SQuAD, le backend vectoriel s'active en exportant `AMOXTLI_EVAL_EMBED_*`
+et le reranking avec `AMOXTLI_EVAL_RERANK=1`. Le sous-échantillonnage
+(`EVAL_SAMPLE_DOCS` / `EVAL_SAMPLE_QUERIES`) est **gold-aware** : il garde tous les
+documents pertinents des requêtes retenues, puis complète avec des distracteurs —
+chaque requête gardée reste donc répondable.
+
+### FEVER et les très gros corpus (chargement en streaming)
+
+Le corpus BEIR de **FEVER** (fact-checking sur Wikipédia) compte **~5,4 M de
+documents** — impossible à charger intégralement en mémoire avant de
+sous-échantillonner. Le loader dispose donc d'un mode **streaming, gold-aware**
+(`beir.LoadSubsample`, activé par `AMOXTLI_EVAL_BEIR_STREAM=1`) : il lit d'abord
+les requêtes/qrels, sélectionne un sous-ensemble déterministe, puis parcourt
+`corpus.jsonl` **une seule fois** en ne retenant que les documents pertinents plus
+un budget borné de distracteurs. Le pic mémoire est plafonné par
+`EVAL_SAMPLE_DOCS`, pas par la taille du corpus. La cible dédiée l'active
+d'office :
+
+```bash
+make eval-fever                                  # 5000 docs / 300 requêtes, streaming
+make eval-fever FEVER_DOCS=10000 FEVER_QUERIES=500
+```
+
+Le téléchargement (~1,2 Go compressé, ~5 Go décompressés) est mis en cache dans
+`.eval-data/fever/`. Pour un run **hybride** avec cache d'embeddings persistant :
+
+```bash
+AMOXTLI_EVAL_EMBED_BASE_URL=https://openrouter.ai/api/v1/ \
+AMOXTLI_EVAL_EMBED_MODEL=mistralai/mistral-embed-2312 \
+AMOXTLI_EVAL_EMBED_API_KEY=$OPENROUTER_KEY \
+AMOXTLI_EVAL_EMBED_DIM=1024 \
+AMOXTLI_EVAL_EMBED_CACHE_DIR=.eval-cache \
+AMOXTLI_EVAL_LLM_MAX_RETRIES=15 AMOXTLI_EVAL_LLM_RATE=6 \
+make eval-fever
+```
+
+> Le même mode streaming sert à tous les gros jeux BEIR (HotpotQA, DBPedia,
+> Climate-FEVER, NQ) : `make eval-beir EVAL_BEIR=<jeu> EVAL_BEIR_STREAM=1`.
+
+## Évaluation end-to-end : génération (reader)
+
+Amoxtli est une librairie de **récupération** — il ne génère pas de réponse. Mais
+pour mesurer une chaîne RAG complète (et se comparer aux benchmarks QA type
+HotpotQA/BeerQA), le harnais propose un **reader optionnel** : il branche le
+`llm.Client` déjà configuré (celui de HyDE/reranking/grounding) sur les passages
+retrouvés, génère une réponse courte, et la note en **EM / F1** (normalisation
+SQuAD, token-overlap) contre les réponses gold. Le code de la lib reste inchangé
+— la génération vit **dans le harnais d'éval uniquement**.
+
+Activé par `AMOXTLI_EVAL_GENERATE=1`, en plus des variables de récupération. Il
+faut des **réponses gold** : les fichiers BEIR n'en portent pas, donc pour
+HotpotQA on les joint depuis le jeu natif (par `_id`) via
+`AMOXTLI_EVAL_BEIR_ANSWERS`. La cible dédiée récupère les réponses (HuggingFace)
+et lance le tout :
+
+```bash
+# Reader HotpotQA au-dessus d'un index déjà construit (réutilisé via WORKDIR).
+AMOXTLI_EVAL_WORKDIR=.eval-workdir-hotpot100k \
+AMOXTLI_EVAL_EMBED_DIM=1024 AMOXTLI_EVAL_EMBED_CACHE_DIR=.eval-cache \
+scripts/eval_env.sh make eval-hotpotqa-gen \
+    EVAL_SAMPLE_DOCS=100000 EVAL_SAMPLE_QUERIES=100
+```
+
+Réglages : `AMOXTLI_EVAL_GEN_CONTEXT_K` (passages fournis au reader, défaut 5),
+`AMOXTLI_EVAL_GEN_MAX_WORDS` (troncature par passage, défaut 250),
+`AMOXTLI_EVAL_GEN_SUMMARY_FILE` (TSV `dataset / mode+gen / EM / F1`).
+
+> **Deux limites à garder en tête.** (1) L'EM/F1 **mélange** qualité de
+> récupération et qualité du reader : pour juger le *stack de récupération*, les
+> métriques nDCG@k / Recall@k restent la boussole ; la génération les complète.
+> (2) Un LLM génératif paraphrase → l'EM est fragile et **non superposable** aux
+> baselines extractives des leaderboards (IRRR & co) ; lire le F1 comme un
+> « RAG-reader F1 » légitime, pas comme un score de leaderboard.
+
 ## Évaluer par le code
 
 Le harnais s'utilise aussi directement, sur n'importe quelle implémentation de

@@ -49,6 +49,39 @@ func TestRecallAtK(t *testing.T) {
 	}
 }
 
+func TestPrecisionAtK(t *testing.T) {
+	cases := []struct {
+		name      string
+		retrieved []string
+		relevant  []string
+		k         int
+		want      float64
+	}{
+		// Single relevant at rank 1: P@1 = 1, P@5 = 1/5.
+		{"rank1@1", []string{"42", "18", "91", "3", "55"}, []string{"42"}, 1, 1},
+		{"rank1@5", []string{"42", "18", "91", "3", "55"}, []string{"42"}, 5, 1.0 / 5.0},
+		// All top-3 relevant: high precision.
+		{"pure@3", []string{"a", "b", "c", "z"}, []string{"a", "b", "c"}, 3, 1},
+		// Two of top-4 relevant.
+		{"mixed@4", []string{"a", "x", "c", "y"}, []string{"a", "c"}, 4, 2.0 / 4.0},
+		// Fewer results than k: denominator clamps to len(retrieved), no empty-slot penalty.
+		{"kbeyond", []string{"a", "b"}, []string{"a", "b"}, 10, 1},
+		// No relevant documents → 0.
+		{"norelevant", []string{"a"}, nil, 5, 0},
+		// Nothing retrieved → 0.
+		{"empty", nil, []string{"a"}, 5, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := PrecisionAtK(tc.retrieved, tc.relevant, tc.k)
+			if !almostEqual(got, tc.want) {
+				t.Errorf("PrecisionAtK = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFirstRelevantRankAndReciprocal(t *testing.T) {
 	cases := []struct {
 		name      string

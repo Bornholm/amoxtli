@@ -26,14 +26,31 @@ type Result struct {
 	Rounds    int
 }
 
+// GroundingMode selects what the evaluator's relevance signal does to the
+// evidence set.
+type GroundingMode int
+
+const (
+	// GroundingFilter drops the sections the evaluator judged irrelevant. It
+	// maximises precision of the returned evidence but truncates recall — the
+	// irrelevant-but-retrieved documents are gone. This is the default.
+	GroundingFilter GroundingMode = iota
+	// GroundingDemote keeps every retrieved document but re-orders the relevant
+	// ones ahead of the irrelevant ones (which are ranked last instead of
+	// removed). It preserves recall@k while still surfacing the grounded evidence
+	// first — the better choice when downstream metrics or consumers care about
+	// not losing documents.
+	GroundingDemote
+)
+
 // Orchestrator unifies retrieval with the MothRAG-derived mechanisms on top of a
 // plain SearchFunc:
 //
 //   - query decomposition: when a QueryDecomposer is configured, the original
 //     query and its sub-questions are searched and their evidence fused;
 //   - evidence evaluation: when an EvidenceEvaluator is configured, the fused
-//     evidence is relevance-filtered and a grounding verdict is produced in a
-//     single LLM call;
+//     evidence is relevance-filtered (or demoted, per GroundingMode) and a
+//     grounding verdict is produced in a single LLM call;
 //   - iterative re-retrieval: when a QueryReformulator is configured and the
 //     verdict is not confident, the query is reformulated and searched again
 //     (up to MaxRounds), enlarging the evidence set;
@@ -46,6 +63,7 @@ type Orchestrator struct {
 	decomposer   QueryDecomposer
 	minScore     float64
 	maxRounds    int
+	mode         GroundingMode
 }
 
 // OrchestratorOption configures an Orchestrator.
@@ -62,11 +80,22 @@ func WithEvidenceEvaluator(evaluator EvidenceEvaluator) OrchestratorOption {
 }
 
 // WithGroundingMinScore sets the grounding score threshold below which the
-// verdict is considered not confident (default 0.4). Only meaningful together
-// with WithEvidenceEvaluator.
+// verdict is considered not confident (default 0.4). This gates iterative
+// re-retrieval only (whether to reformulate and search again); it does not
+// affect the relevance filtering/demotion of the evidence itself. Only
+// meaningful together with WithEvidenceEvaluator.
 func WithGroundingMinScore(minScore float64) OrchestratorOption {
 	return func(o *Orchestrator) {
 		o.minScore = minScore
+	}
+}
+
+// WithGroundingMode selects how the evaluator's relevance signal is applied:
+// GroundingFilter (default, drop irrelevant evidence) or GroundingDemote (keep
+// it but rank it last). Only meaningful together with WithEvidenceEvaluator.
+func WithGroundingMode(mode GroundingMode) OrchestratorOption {
+	return func(o *Orchestrator) {
+		o.mode = mode
 	}
 }
 
@@ -131,10 +160,15 @@ func (o *Orchestrator) Search(ctx context.Context, query string, maxResults int,
 				return nil, errors.WithStack(err)
 			}
 
-			// Keep only the relevant evidence, then gate on its verdict. Note we
-			// do not stop when filtering empties the evidence: an empty, not
-			// confident verdict is exactly when re-retrieval is most useful.
-			results = FilterRelevant(results, evaluation.Relevant)
+			// Apply the relevance signal (filter out, or demote to the tail, per
+			// mode), then gate on the verdict. Note we do not stop when filtering
+			// empties the evidence: an empty, not confident verdict is exactly
+			// when re-retrieval is most useful.
+			if o.mode == GroundingDemote {
+				results = DemoteIrrelevant(results, evaluation.Relevant)
+			} else {
+				results = FilterRelevant(results, evaluation.Relevant)
+			}
 			verdict := evaluation.Grounding
 			grounding = &verdict
 

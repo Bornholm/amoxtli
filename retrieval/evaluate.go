@@ -293,6 +293,37 @@ func FilterRelevant(results []*index.SearchResult, relevant []model.SectionID) [
 	return out
 }
 
+// DemoteIrrelevant keeps every result but re-orders them so that results
+// containing at least one relevant section come first (in their original order)
+// and the fully-irrelevant ones are ranked last (also in their original order).
+// Unlike FilterRelevant it drops nothing, preserving recall while still
+// surfacing the grounded evidence first. Input slices are not mutated.
+func DemoteIrrelevant(results []*index.SearchResult, relevant []model.SectionID) []*index.SearchResult {
+	keep := make(map[model.SectionID]struct{}, len(relevant))
+	for _, id := range relevant {
+		keep[id] = struct{}{}
+	}
+
+	kept := make([]*index.SearchResult, 0, len(results))
+	demoted := make([]*index.SearchResult, 0, len(results))
+	for _, r := range results {
+		hasRelevant := false
+		for _, s := range r.Sections {
+			if _, ok := keep[s]; ok {
+				hasRelevant = true
+				break
+			}
+		}
+		if hasRelevant {
+			kept = append(kept, r)
+		} else {
+			demoted = append(demoted, r)
+		}
+	}
+
+	return append(kept, demoted...)
+}
+
 // filterSectionScores returns the subset of scores whose section is in keep,
 // preserving the per-section scores of a SearchResult after its section set has
 // been filtered. It returns nil when scores is nil.

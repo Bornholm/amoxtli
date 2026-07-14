@@ -58,6 +58,7 @@ type QueryReport struct {
 	ReciprocalRank float64
 	RecallAtK      map[int]float64
 	NDCGAtK        map[int]float64
+	PrecisionAtK   map[int]float64
 }
 
 // Report aggregates the metrics over a whole dataset run.
@@ -67,10 +68,12 @@ type Report struct {
 	Ks         []int
 	// MRR is the mean reciprocal rank across all queries.
 	MRR float64
-	// RecallAtK and NDCGAtK are the dataset-averaged metrics per cut-off.
-	RecallAtK map[int]float64
-	NDCGAtK   map[int]float64
-	PerQuery  []QueryReport
+	// RecallAtK, NDCGAtK and PrecisionAtK are the dataset-averaged metrics per
+	// cut-off.
+	RecallAtK    map[int]float64
+	NDCGAtK      map[int]float64
+	PrecisionAtK map[int]float64
+	PerQuery     []QueryReport
 }
 
 // Evaluate runs every query in the dataset through the retriever and returns the
@@ -103,10 +106,12 @@ func Evaluate(ctx context.Context, ds *Dataset, r Retriever, ks ...int) (*Report
 			ReciprocalRank: ReciprocalRank(retrieved, q.RelevantSources),
 			RecallAtK:      make(map[int]float64, len(ks)),
 			NDCGAtK:        make(map[int]float64, len(ks)),
+			PrecisionAtK:   make(map[int]float64, len(ks)),
 		}
 		for _, k := range ks {
 			qr.RecallAtK[k] = RecallAtK(retrieved, q.RelevantSources, k)
 			qr.NDCGAtK[k] = NDCGAtK(retrieved, q.RelevantSources, k)
+			qr.PrecisionAtK[k] = PrecisionAtK(retrieved, q.RelevantSources, k)
 		}
 
 		perQuery = append(perQuery, qr)
@@ -120,12 +125,13 @@ func Evaluate(ctx context.Context, ds *Dataset, r Retriever, ks ...int) (*Report
 // same way.
 func aggregate(name string, ks []int, perQuery []QueryReport) *Report {
 	report := &Report{
-		Dataset:    name,
-		NumQueries: len(perQuery),
-		Ks:         ks,
-		RecallAtK:  make(map[int]float64, len(ks)),
-		NDCGAtK:    make(map[int]float64, len(ks)),
-		PerQuery:   perQuery,
+		Dataset:      name,
+		NumQueries:   len(perQuery),
+		Ks:           ks,
+		RecallAtK:    make(map[int]float64, len(ks)),
+		NDCGAtK:      make(map[int]float64, len(ks)),
+		PrecisionAtK: make(map[int]float64, len(ks)),
+		PerQuery:     perQuery,
 	}
 	if len(perQuery) == 0 {
 		return report
@@ -134,11 +140,13 @@ func aggregate(name string, ks []int, perQuery []QueryReport) *Report {
 	var sumRR float64
 	sumRecall := make(map[int]float64, len(ks))
 	sumNDCG := make(map[int]float64, len(ks))
+	sumPrecision := make(map[int]float64, len(ks))
 	for _, qr := range perQuery {
 		sumRR += qr.ReciprocalRank
 		for _, k := range ks {
 			sumRecall[k] += qr.RecallAtK[k]
 			sumNDCG[k] += qr.NDCGAtK[k]
+			sumPrecision[k] += qr.PrecisionAtK[k]
 		}
 	}
 
@@ -147,6 +155,7 @@ func aggregate(name string, ks []int, perQuery []QueryReport) *Report {
 	for _, k := range ks {
 		report.RecallAtK[k] = sumRecall[k] / n
 		report.NDCGAtK[k] = sumNDCG[k] / n
+		report.PrecisionAtK[k] = sumPrecision[k] / n
 	}
 
 	return report
@@ -219,7 +228,8 @@ func (r *Report) String() string {
 	fmt.Fprintf(&b, "eval report — %s (%d queries)\n", name, r.NumQueries)
 	fmt.Fprintf(&b, "  MRR: %.3f\n", r.MRR)
 	for _, k := range r.Ks {
-		fmt.Fprintf(&b, "  Recall@%-2d: %.3f   nDCG@%-2d: %.3f\n", k, r.RecallAtK[k], k, r.NDCGAtK[k])
+		fmt.Fprintf(&b, "  Recall@%-2d: %.3f   nDCG@%-2d: %.3f   P@%-2d: %.3f\n",
+			k, r.RecallAtK[k], k, r.NDCGAtK[k], k, r.PrecisionAtK[k])
 	}
 	return b.String()
 }

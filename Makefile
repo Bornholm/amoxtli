@@ -74,6 +74,82 @@ eval-es: ## Evaluate on Spanish squad_es
 eval-fr: ## Evaluate on French PIAF (etalab-ia/piaf)
 	$(MAKE) eval EVAL_DATASET=etalab-ia/piaf EVAL_CONFIG= EVAL_SPLIT=train EVAL_LANG=fr
 
+# ---- BEIR evaluation ---------------------------------------------------------
+# Runs TestEvaluateBEIR on a BEIR dataset (gold-aware subsample). Lexical-only
+# by default; export AMOXTLI_EVAL_EMBED_* for hybrid, AMOXTLI_EVAL_RERANK=1 for
+# reranking, AMOXTLI_EVAL_EMBED_CACHE_DIR for the persistent embeddings cache.
+
+EVAL_BEIR           ?= scifact
+EVAL_BEIR_SETS      ?= scifact nfcorpus
+EVAL_SAMPLE_DOCS    ?= 1000
+EVAL_SAMPLE_QUERIES ?= 300
+EVAL_BEIR_STREAM    ?=
+EVAL_TIMEOUT        ?= 60m
+EVAL_SUMMARY        ?= $(EVAL_DATA_DIR)/summary.tsv
+EVAL_GOLDEN_NDCG10  ?= 0.78
+
+.PHONY: eval-beir-download
+eval-beir-download: ## Download the BEIR dataset (EVAL_BEIR=scifact|nfcorpus|fiqa|...)
+	scripts/download_beir.sh $(EVAL_BEIR) $(EVAL_DATA_DIR)
+
+.PHONY: eval-beir
+eval-beir: eval-beir-download ## Run the BEIR evaluation benchmark (EVAL_BEIR=...)
+	AMOXTLI_EVAL=1 \
+	AMOXTLI_EVAL_BEIR_CORPUS=$(abspath $(EVAL_DATA_DIR)/$(EVAL_BEIR)/corpus.jsonl) \
+	AMOXTLI_EVAL_BEIR_QUERIES=$(abspath $(EVAL_DATA_DIR)/$(EVAL_BEIR)/queries.jsonl) \
+	AMOXTLI_EVAL_BEIR_QRELS=$(abspath $(EVAL_DATA_DIR)/$(EVAL_BEIR)/qrels/test.tsv) \
+	AMOXTLI_EVAL_BEIR_NAME=$(EVAL_BEIR) \
+	AMOXTLI_EVAL_SAMPLE_DOCS=$(EVAL_SAMPLE_DOCS) \
+	AMOXTLI_EVAL_SAMPLE_QUERIES=$(EVAL_SAMPLE_QUERIES) \
+	AMOXTLI_EVAL_BEIR_STREAM=$(EVAL_BEIR_STREAM) \
+	AMOXTLI_EVAL_TOPK=$(EVAL_TOPK) \
+	AMOXTLI_EVAL_SUMMARY_FILE=$(abspath $(EVAL_SUMMARY)) \
+	go test ./eval/ -run TestEvaluateBEIR -v -timeout $(EVAL_TIMEOUT)
+
+.PHONY: eval-fever
+eval-fever: ## Fact-checking benchmark FEVER (streamed: ~5.4M-doc corpus, gold-aware subsample)
+	$(MAKE) eval-beir EVAL_BEIR=fever EVAL_BEIR_STREAM=1 \
+		EVAL_SAMPLE_DOCS=$(or $(FEVER_DOCS),5000) \
+		EVAL_SAMPLE_QUERIES=$(or $(FEVER_QUERIES),300) \
+		EVAL_TIMEOUT=$(or $(FEVER_TIMEOUT),90m)
+
+HOTPOT_ANSWERS := $(EVAL_DATA_DIR)/hotpot_answers.json
+
+# Gold answers for the HotpotQA generation (reader) evaluation, pulled from
+# Hugging Face (the CMU host in the HotpotQA README is often offline).
+$(HOTPOT_ANSWERS): $(EVAL_VENV)/.installed scripts/download_hotpot_answers.py
+	mkdir -p $(EVAL_DATA_DIR)
+	$(EVAL_VENV)/bin/python scripts/download_hotpot_answers.py \
+		--config fullwiki --split validation --out "$(HOTPOT_ANSWERS)"
+
+.PHONY: eval-hotpotqa-gen
+eval-hotpotqa-gen: $(HOTPOT_ANSWERS) ## HotpotQA end-to-end: retrieval + answer EM/F1 (reader). Export AMOXTLI_EVAL_EMBED_*/CHAT_* (or use scripts/eval_env.sh) and AMOXTLI_EVAL_WORKDIR to reuse a built index.
+	AMOXTLI_EVAL_GENERATE=1 \
+	AMOXTLI_EVAL_BEIR_ANSWERS=$(abspath $(HOTPOT_ANSWERS)) \
+	$(MAKE) --no-print-directory eval-beir EVAL_BEIR=hotpotqa EVAL_BEIR_STREAM=1
+
+.PHONY: eval-matrix
+eval-matrix: ## Run eval-beir over EVAL_BEIR_SETS, then print the consolidated table
+	@for ds in $(EVAL_BEIR_SETS); do \
+		$(MAKE) eval-beir EVAL_BEIR=$$ds || exit 1; \
+	done
+	@$(MAKE) --no-print-directory eval-summary
+
+.PHONY: eval-summary
+eval-summary: ## Print the consolidated results table (dataset x config x metrics)
+	@{ printf 'dataset\tmode\tqueries\tMRR\tRecall@k\tnDCG@k\n'; cat $(EVAL_SUMMARY); } | column -t -s "$$(printf '\t')"
+
+.PHONY: eval-summary-reset
+eval-summary-reset: ## Reset the consolidated results table
+	rm -f $(EVAL_SUMMARY)
+
+.PHONY: eval-golden
+eval-golden: ## Non-regression golden set: SciFact 1000 docs, lexical only, nDCG@10 floor
+	AMOXTLI_EVAL_EMBED_BASE_URL= AMOXTLI_EVAL_EMBED_MODEL= \
+	AMOXTLI_EVAL_RERANK= AMOXTLI_EVAL_ITERATIVE= AMOXTLI_EVAL_HYDE= \
+	AMOXTLI_EVAL_WORKDIR= AMOXTLI_EVAL_MIN_NDCG10=$(EVAL_GOLDEN_NDCG10) \
+	$(MAKE) --no-print-directory eval-beir EVAL_BEIR=scifact EVAL_TIMEOUT=20m
+
 .PHONY: eval-clean
 eval-clean: ## Remove the downloaded datasets and the eval virtualenv
 	rm -rf $(EVAL_DATA_DIR) $(EVAL_VENV)

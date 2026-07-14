@@ -3,6 +3,7 @@ package retrieval
 import (
 	"context"
 	"net/url"
+	"reflect"
 	"testing"
 
 	"github.com/bornholm/amoxtli/index"
@@ -95,6 +96,57 @@ func TestFuseResults_DedupsSectionsAndDropsEmpty(t *testing.T) {
 	}
 	if len(fused) != 2 {
 		t.Fatalf("expected 2 non-empty results, got %d", len(fused))
+	}
+}
+
+// --- relevance application (filter vs demote) -----------------------------
+
+// firstSections returns the first section of each result, in order, to assert
+// the ordering/selection produced by FilterRelevant and DemoteIrrelevant.
+func firstSections(results []*index.SearchResult) []model.SectionID {
+	out := make([]model.SectionID, 0, len(results))
+	for _, r := range results {
+		if len(r.Sections) > 0 {
+			out = append(out, r.Sections[0])
+		}
+	}
+	return out
+}
+
+func TestFilterRelevant_DropsIrrelevant(t *testing.T) {
+	results := []*index.SearchResult{resultWith("s1"), resultWith("s2"), resultWith("s3")}
+
+	got := FilterRelevant(results, []model.SectionID{"s1", "s3"})
+
+	if want := []model.SectionID{"s1", "s3"}; !reflect.DeepEqual(firstSections(got), want) {
+		t.Fatalf("FilterRelevant = %v, want %v (irrelevant s2 dropped)", firstSections(got), want)
+	}
+}
+
+func TestDemoteIrrelevant_KeepsAllAndRanksRelevantFirst(t *testing.T) {
+	// Retrieved order s1,s2,s3,s4; evaluator judges s3 and s1 relevant.
+	results := []*index.SearchResult{resultWith("s1"), resultWith("s2"), resultWith("s3"), resultWith("s4")}
+
+	got := DemoteIrrelevant(results, []model.SectionID{"s3", "s1"})
+
+	// Relevant kept in original order (s1 before s3), irrelevant demoted to the
+	// tail in original order (s2 before s4). Nothing dropped: recall preserved.
+	want := []model.SectionID{"s1", "s3", "s2", "s4"}
+	if !reflect.DeepEqual(firstSections(got), want) {
+		t.Fatalf("DemoteIrrelevant = %v, want %v", firstSections(got), want)
+	}
+	if len(got) != len(results) {
+		t.Fatalf("DemoteIrrelevant returned %d results, want %d (nothing dropped)", len(got), len(results))
+	}
+}
+
+func TestDemoteIrrelevant_NoneRelevantPreservesOrder(t *testing.T) {
+	results := []*index.SearchResult{resultWith("s1"), resultWith("s2")}
+
+	got := DemoteIrrelevant(results, nil)
+
+	if want := []model.SectionID{"s1", "s2"}; !reflect.DeepEqual(firstSections(got), want) {
+		t.Fatalf("DemoteIrrelevant = %v, want %v (order preserved when nothing relevant)", firstSections(got), want)
 	}
 }
 

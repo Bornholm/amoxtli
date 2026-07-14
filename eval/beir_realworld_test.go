@@ -52,17 +52,53 @@ func TestEvaluateBEIR(t *testing.T) {
 		name = "beir"
 	}
 
-	corpus, dataset, err := beir.Load(corpusPath, queriesPath, qrelsPath, name, os.Getenv("AMOXTLI_EVAL_BEIR_LANG"))
-	if err != nil {
-		t.Fatalf("load BEIR: %+v", errors.WithStack(err))
-	}
-	t.Logf("loaded BEIR %q: %d documents, %d queries (full)", name, len(corpus.Documents), len(dataset.Queries))
-
+	lang := os.Getenv("AMOXTLI_EVAL_BEIR_LANG")
 	sampleQueries := envInt(t, "AMOXTLI_EVAL_SAMPLE_QUERIES", 0)
 	sampleDocs := envInt(t, "AMOXTLI_EVAL_SAMPLE_DOCS", 0)
-	if sampleQueries > 0 || sampleDocs > 0 {
-		corpus, dataset = eval.Subsample(corpus, dataset, sampleQueries, sampleDocs)
-		t.Logf("subsampled to %d documents, %d queries", len(corpus.Documents), len(dataset.Queries))
+
+	var (
+		corpus  *eval.Corpus
+		dataset *eval.Dataset
+		err     error
+	)
+	// AMOXTLI_EVAL_BEIR_STREAM streams the (gold-aware) subsample straight from
+	// disk, for corpora too large to hold in memory (FEVER's ~5.4M docs). The
+	// default path loads the whole corpus then subsamples — fine for SciFact-sized
+	// sets and byte-identical to the validated runs.
+	if os.Getenv("AMOXTLI_EVAL_BEIR_STREAM") != "" {
+		corpus, dataset, err = beir.LoadSubsample(corpusPath, queriesPath, qrelsPath, name, lang, sampleQueries, sampleDocs)
+		if err != nil {
+			t.Fatalf("load BEIR (stream): %+v", errors.WithStack(err))
+		}
+		t.Logf("streamed BEIR %q subsample: %d documents, %d queries", name, len(corpus.Documents), len(dataset.Queries))
+	} else {
+		corpus, dataset, err = beir.Load(corpusPath, queriesPath, qrelsPath, name, lang)
+		if err != nil {
+			t.Fatalf("load BEIR: %+v", errors.WithStack(err))
+		}
+		t.Logf("loaded BEIR %q: %d documents, %d queries (full)", name, len(corpus.Documents), len(dataset.Queries))
+		if sampleQueries > 0 || sampleDocs > 0 {
+			corpus, dataset = eval.Subsample(corpus, dataset, sampleQueries, sampleDocs)
+			t.Logf("subsampled to %d documents, %d queries", len(corpus.Documents), len(dataset.Queries))
+		}
+	}
+
+	// Optionally attach gold answers (native HotpotQA file) so the generation
+	// (reader) evaluation can score EM/F1 — the BEIR files carry none. Joined by
+	// query id onto the (already subsampled) queries.
+	if ansPath := os.Getenv("AMOXTLI_EVAL_BEIR_ANSWERS"); ansPath != "" {
+		answers, err := beir.LoadHotpotAnswers(ansPath)
+		if err != nil {
+			t.Fatalf("load BEIR answers: %+v", errors.WithStack(err))
+		}
+		attached := 0
+		for i := range dataset.Queries {
+			if a, ok := answers[dataset.Queries[i].ID]; ok {
+				dataset.Queries[i].Answers = a
+				attached++
+			}
+		}
+		t.Logf("attached gold answers to %d/%d queries", attached, len(dataset.Queries))
 	}
 
 	topK := envInt(t, "AMOXTLI_EVAL_TOPK", 10)

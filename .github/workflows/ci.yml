@@ -30,6 +30,23 @@ jobs:
       - run: go vet ./...
       - run: go test -short ./...
 
+  # Retrieval-quality non-regression: the lexical golden set (SciFact gold-aware
+  # subsample, no LLM/embeddings service needed). Fails the build when nDCG@10
+  # drops below the configured floor (see eval-golden in the Makefile).
+  golden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - uses: actions/cache@v4
+        with:
+          path: .eval-data/scifact
+          key: beir-scifact
+      - run: make eval-golden
+
   # Container-backed integration tests (docker + model pull): manual trigger only.
   integration:
     runs-on: ubuntu-latest

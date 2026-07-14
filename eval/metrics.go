@@ -78,6 +78,38 @@ func ReciprocalRank(retrieved, relevant []string) float64 {
 	return 1 / float64(rank)
 }
 
+// PrecisionAtK is the fraction of the top-k retrieved results that are relevant:
+// |relevant ∩ top-k| / k'. It is the counterpart of Recall@k on the precision
+// axis — where recall asks "did we find the gold documents", precision asks "of
+// what we returned, how much is gold". It matters for pipelines that deliberately
+// return a small, high-purity evidence set (e.g. grounded iterative retrieval),
+// whose value recall@k understates. The denominator k' is min(k, len(retrieved)),
+// so a run that returns fewer than k results is not penalised for the empty
+// slots. It returns 0 when nothing was retrieved or there are no relevant
+// documents.
+func PrecisionAtK(retrieved, relevant []string, k int) float64 {
+	rel := toSet(relevant)
+	if len(rel) == 0 {
+		return 0
+	}
+	if k > len(retrieved) {
+		k = len(retrieved)
+	}
+	if k <= 0 {
+		return 0
+	}
+
+	found := 0
+	for _, id := range retrieved[:k] {
+		if _, ok := rel[id]; ok {
+			found++
+			delete(rel, id) // count each relevant document at most once
+		}
+	}
+
+	return float64(found) / float64(k)
+}
+
 // NDCGAtK is the normalised Discounted Cumulative Gain at cut-off k for binary
 // relevance: DCG@k / IDCG@k, where each relevant document contributes a gain of
 // 1 discounted by log2(position+1). It rewards placing relevant documents

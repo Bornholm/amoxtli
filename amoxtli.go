@@ -228,6 +228,7 @@ func newOrchestrator(opts *options, manager *ingest.Manager, evaluator retrieval
 		orchestratorOpts = append(orchestratorOpts,
 			retrieval.WithEvidenceEvaluator(evaluator),
 			retrieval.WithGroundingMinScore(opts.groundingMinScore),
+			retrieval.WithGroundingMode(opts.groundingMode),
 		)
 	}
 	if opts.iterativeRetrieval && opts.llmClient != nil {

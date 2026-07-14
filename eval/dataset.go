@@ -24,6 +24,11 @@ type Query struct {
 	Lang string `json:"lang,omitempty"`
 	// RelevantSources lists the source identifiers expected in the results.
 	RelevantSources []string `json:"relevant_sources"`
+	// Answers lists the acceptable gold answer strings for the query, used only by
+	// the optional generation (reader) evaluation to score answer EM/F1. Empty for
+	// pure retrieval datasets; a query may have several equally-correct answers
+	// (SQuAD) or a single one (HotpotQA).
+	Answers []string `json:"answers,omitempty"`
 	// Tags optionally categorise the query (intent, complexity, domain) for
 	// segmented reporting.
 	Tags []string `json:"tags,omitempty"`

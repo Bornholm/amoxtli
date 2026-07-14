@@ -8,6 +8,7 @@ import (
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/ingest"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/task"
 	"github.com/bornholm/genai/llm"
 )
@@ -35,6 +36,7 @@ type options struct {
 	groundingCheck             bool
 	groundingFailOpen          bool
 	groundingMinScore          float64
+	groundingMode              retrieval.GroundingMode
 	iterativeRetrieval         bool
 	iterativeMaxRounds         int
 	queryDecomposition         bool
@@ -177,11 +179,24 @@ func WithGroundingFailOpen() Option {
 }
 
 // WithGroundingMinScore sets the grounding score threshold below which the
-// verdict is considered not confident (default 0.4). Only meaningful together
-// with WithGroundingCheck.
+// verdict is considered not confident (default 0.4). This gates iterative
+// re-retrieval only — whether SearchIterative reformulates and searches again —
+// and does NOT control the relevance filtering/demotion of the evidence itself
+// (that is WithGroundingMode). Only meaningful together with WithGroundingCheck.
 func WithGroundingMinScore(minScore float64) Option {
 	return func(o *options) {
 		o.groundingMinScore = minScore
+	}
+}
+
+// WithGroundingMode selects what the evaluator's relevance signal does to the
+// evidence: retrieval.GroundingFilter (default) drops the sections judged
+// irrelevant — maximising precision but truncating recall; retrieval.GroundingDemote
+// keeps them but ranks them last — preserving recall@k while still surfacing the
+// grounded evidence first. Only meaningful together with WithGroundingCheck.
+func WithGroundingMode(mode retrieval.GroundingMode) Option {
+	return func(o *options) {
+		o.groundingMode = mode
 	}
 }
 

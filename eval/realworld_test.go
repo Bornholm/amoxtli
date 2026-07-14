@@ -57,6 +57,9 @@ import (
 //	AMOXTLI_EVAL_EMBED_MODEL=mxbai-embed-large:latest
 //	AMOXTLI_EVAL_EMBED_DIM=1024       (embedding dimension; default 768)
 //	AMOXTLI_EVAL_EMBED_API_KEY=...    (optional)
+//	AMOXTLI_EVAL_EMBED_CACHE_DIR=...  (optional persistent on-disk embeddings
+//	                                   cache, keyed by model — re-runs cost zero
+//	                                   remote calls)
 func TestEvaluateRealWorld(t *testing.T) {
 	if os.Getenv("AMOXTLI_EVAL") == "" {
 		t.Skip("set AMOXTLI_EVAL=1 to run the real-world evaluation benchmark")
@@ -121,6 +124,11 @@ func TestEvaluateRealWorld(t *testing.T) {
 // report globally and per language. Shared by the SQuAD and BEIR benchmarks.
 func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, dataset *eval.Dataset, topK int) *eval.Report {
 	t.Helper()
+
+	// In-memory OTel pipeline collecting amoxtli's LLM instrumentation, so the
+	// report states what each phase cost (calls, tokens, latency) next to the
+	// quality metrics. Must be installed before the first LLM call.
+	costReader := llmCostMeter()
 
 	// Working directory: a persistent one (AMOXTLI_EVAL_WORKDIR) lets several
 	// configurations (RRF weights, reranking) reuse a single ingested index
@@ -214,7 +222,14 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 			amoxtli.WithGroundingMinScore(envFloat(t, "AMOXTLI_EVAL_GROUNDING_MIN_SCORE", 0.4)),
 			amoxtli.WithIterativeRetrieval(rounds),
 		)
-		mode += fmt.Sprintf(" + grounding + iterative(%d rounds)", rounds)
+		// Relevance application: "demote" ranks irrelevant evidence last instead
+		// of dropping it (preserves recall@k); default "filter" removes it.
+		groundingMode := "filter"
+		if strings.EqualFold(os.Getenv("AMOXTLI_EVAL_GROUNDING_MODE"), "demote") {
+			codexOpts = append(codexOpts, amoxtli.WithGroundingMode(retrieval.GroundingDemote))
+			groundingMode = "demote"
+		}
+		mode += fmt.Sprintf(" + grounding(%s) + iterative(%d rounds)", groundingMode, rounds)
 	}
 
 	t.Logf("retrieval mode: %s", mode)
@@ -224,6 +239,8 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 		t.Fatalf("new codex: %+v", errors.WithStack(err))
 	}
 	defer codex.Close()
+
+	costBase := collectLLMCost(t, costReader)
 
 	if skipIngest {
 		t.Logf("reusing persisted index in %s (skipping ingestion)", dir)
@@ -252,6 +269,9 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 		}
 		waitAllTasks(t, ctx, codex, taskIDs)
 		t.Logf("indexed %d passages in %s", len(corpus.Documents), time.Since(ingestStart).Round(time.Millisecond))
+		costIngest := collectLLMCost(t, costReader)
+		logLLMCost(t, "ingestion", costIngest.sub(costBase), 0)
+		costBase = costIngest
 		if persistent {
 			if err := os.WriteFile(sentinel, []byte("ok\n"), 0o644); err != nil {
 				t.Fatalf("write sentinel: %+v", errors.WithStack(err))
@@ -303,10 +323,45 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 		t.Fatalf("evaluate: %+v", errors.WithStack(err))
 	}
 
+	logLLMCost(t, "evaluation", collectLLMCost(t, costReader).sub(costBase), totalQueries)
+
 	t.Logf("\n=== GLOBAL (%s) ===\n%s", mode, report.String())
 	segments := report.ByLang()
 	for _, code := range sortedKeys(segments) {
 		t.Logf("\n=== %s ===\n%s", strings.ToUpper(code), segments[code].String())
+	}
+
+	// Optional end-to-end generation (reader) evaluation: plug the already-wired
+	// chat client onto the retrieved passages, generate an answer per query and
+	// score it (EM/F1) against the gold answers. Gated by AMOXTLI_EVAL_GENERATE
+	// and only meaningful for datasets carrying gold answers (Query.Answers).
+	if os.Getenv("AMOXTLI_EVAL_GENERATE") != "" {
+		// A clean retrieval closure (no progress side effects) reusing the same
+		// retrieval config as the metrics pass above.
+		retrieveForGen := func(ctx context.Context, query string, k int) ([]string, error) {
+			var res []*index.SearchResult
+			var err error
+			if iterative {
+				var out *retrieval.Result
+				out, err = codex.SearchIterative(ctx, query, amoxtli.WithSearchMaxResults(k))
+				if out != nil {
+					res = out.Results
+				}
+			} else {
+				res, err = codex.Search(ctx, query, amoxtli.WithSearchMaxResults(k))
+			}
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			ids := make([]string, 0, len(res))
+			for _, r := range res {
+				if r != nil && r.Source != nil {
+					ids = append(ids, r.Source.String())
+				}
+			}
+			return ids, nil
+		}
+		evaluateGeneration(t, ctx, corpus, dataset, retrieveForGen, mode)
 	}
 
 	// Sanity floor: a working retriever ranks a fair share of gold passages
@@ -316,6 +371,34 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 	}
 	if report.MRR <= 0 {
 		t.Errorf("MRR = %.4f: retrieval returned no gold passage for any query", report.MRR)
+	}
+
+	// Non-regression floor (golden-set runs): fail when nDCG@10 drops below the
+	// configured threshold.
+	if floor := envFloat(t, "AMOXTLI_EVAL_MIN_NDCG10", 0); floor > 0 {
+		got, ok := report.NDCGAtK[10]
+		if !ok {
+			t.Errorf("AMOXTLI_EVAL_MIN_NDCG10 requires AMOXTLI_EVAL_TOPK >= 10")
+		} else if got < floor {
+			t.Errorf("nDCG@10 = %.4f is below the non-regression floor %.4f", got, floor)
+		} else {
+			t.Logf("nDCG@10 = %.4f >= non-regression floor %.4f", got, floor)
+		}
+	}
+
+	// One-line TSV summary appended per run, so a multi-dataset/multi-config
+	// sweep (make eval-matrix) consolidates into a single table.
+	if path := os.Getenv("AMOXTLI_EVAL_SUMMARY_FILE"); path != "" {
+		line := fmt.Sprintf("%s\t%s\t%d\t%.4f\t%.4f\t%.4f\n",
+			dataset.Name, mode, report.NumQueries, report.MRR, report.RecallAtK[topK], report.NDCGAtK[topK])
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatalf("open summary file: %+v", errors.WithStack(err))
+		}
+		defer f.Close()
+		if _, err := f.WriteString(line); err != nil {
+			t.Fatalf("append summary: %+v", errors.WithStack(err))
+		}
 	}
 
 	return report
@@ -353,7 +436,30 @@ func embeddingsClient(t *testing.T) (llm.Client, string) {
 	if err != nil {
 		t.Fatalf("create embeddings client: %+v", errors.WithStack(err))
 	}
-	return withRetry(t, client), model
+	// Observe inside the cache: only actual remote fetches (cache misses) are
+	// counted as LLM calls in the cost report.
+	return withEmbeddingsCache(t, llmx.NewObservableClient(withRetry(t, client)), model), model
+}
+
+// withEmbeddingsCache wraps client with a persistent on-disk embeddings cache
+// when AMOXTLI_EVAL_EMBED_CACHE_DIR is set, keyed by the model name. The cache
+// sits outside the retry/rate-limit layer so hits bypass throttling entirely —
+// re-runs against an already-embedded corpus cost zero remote calls.
+func withEmbeddingsCache(t *testing.T, client llm.Client, model string) llm.Client {
+	t.Helper()
+	dir := os.Getenv("AMOXTLI_EVAL_EMBED_CACHE_DIR")
+	if dir == "" {
+		return client
+	}
+	cache, err := llmx.NewCachingClient(client, dir, model)
+	if err != nil {
+		t.Fatalf("create embeddings cache: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() {
+		hits, misses := cache.Stats()
+		t.Logf("embeddings cache (%s): %d hits, %d misses", dir, hits, misses)
+	})
+	return cache
 }
 
 // withRetry wraps client with client-side rate limiting and retry/backoff so a
