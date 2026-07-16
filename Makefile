@@ -29,6 +29,16 @@ help: ## Show this help
 	@echo "Evaluation knobs (make eval VAR=value): EVAL_DATASET, EVAL_CONFIG,"
 	@echo "EVAL_SPLIT, EVAL_LANG, EVAL_MAX_ROWS, EVAL_MAX_DOCS, EVAL_MAX_QUERIES, EVAL_TOPK."
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
+.PHONY: build
+build: ## Build the amoxtli CLI into dist/amoxtli
+	CGO_ENABLED=0 go build \
+		-ldflags "-s -w \
+			-X github.com/bornholm/amoxtli/internal/build.Version=$(VERSION) \
+			-X github.com/bornholm/amoxtli/internal/build.LongVersion=$(VERSION)" \
+		-o dist/amoxtli ./cmd/amoxtli
+
 .PHONY: test
 test: ## Run the short unit test suite
 	go test -short ./...

@@ -1,0 +1,47 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: amoxtli
+    # sqlite runs as WASM (ncruces/go-sqlite3), so no cgo toolchains are needed
+    # and cross-compilation to every first-class target just works.
+    env:
+      - CGO_ENABLED=0
+    targets: [go_first_class]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    dir: ./cmd/amoxtli
+    binary: amoxtli
+    flags:
+      - -trimpath
+    ldflags:
+      - -w -s -X 'github.com/bornholm/amoxtli/internal/build.Version={{ .Version }}' -X 'github.com/bornholm/amoxtli/internal/build.LongVersion={{ .Version }} ({{ .Commit }})'
+
+archives:
+  - id: amoxtli
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - docs/cli.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  name_template: "v{{ .Version }}"

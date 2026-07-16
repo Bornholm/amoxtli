@@ -91,6 +91,7 @@ func (r *LLMReranker) Rerank(ctx context.Context, query string, results []*index
 			llm.NewMessage(llm.RoleSystem, systemPrompt),
 			llm.NewMessage(llm.RoleUser, userPrompt),
 		),
+		llm.WithSeed(seed),
 	)
 	if err != nil {
 		return nil, errors.WithStack(err)

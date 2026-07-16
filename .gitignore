@@ -4,6 +4,8 @@
 *.sqlite-shm
 *.sqlite-wal
 /dist/
+# Stray CLI binary from `go build ./cmd/amoxtli` at the repo root.
+/amoxtli
 .DS_Store
 /.eval-data/
 /.eval-venv/
@@ -18,3 +20,5 @@
 .env
 __pycache__
 docs/*.pdf
+
+/.amoxtli

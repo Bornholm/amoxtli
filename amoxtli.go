@@ -448,6 +448,25 @@ func (c *Codex) TaskState(ctx context.Context, id task.ID) (*task.State, error) 
 	return state, nil
 }
 
+// ListTasks returns the headers of every task known to the runner.
+func (c *Codex) ListTasks(ctx context.Context) ([]task.StateHeader, error) {
+	headers, err := c.taskRunner.ListTasks(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return headers, nil
+}
+
+// CancelTask cancels a scheduled or running task.
+func (c *Codex) CancelTask(ctx context.Context, id task.ID) error {
+	if err := c.taskRunner.CancelTask(ctx, id); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
+}
+
 // CreateCollection creates a new collection and returns its ID.
 func (c *Codex) CreateCollection(ctx context.Context, label string) (model.CollectionID, error) {
 	coll, err := c.store.CreateCollection(ctx, label)

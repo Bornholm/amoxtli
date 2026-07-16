@@ -93,6 +93,7 @@ func (t *JudgeResultsTransformer) TransformResults(ctx context.Context, query st
 			llm.NewMessage(llm.RoleSystem, systemPrompt),
 			llm.NewMessage(llm.RoleUser, userPrompt),
 		),
+		llm.WithSeed(seed),
 	)
 	if err != nil {
 		return nil, errors.WithStack(err)

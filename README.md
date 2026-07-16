@@ -56,8 +56,23 @@ results, _ := codex.Search(ctx, "comment faire…", amoxtli.WithSearchMaxResults
 
 Exemples complets et exécutables : [`example/sqlite`](example/sqlite/main.go) (SQLite + bleve, sans LLM), [`example/postgres`](example/postgres/main.go) (tout PostgreSQL) et [`example/convert`](example/convert/main.go) (conversion de fichier + suivi de tâche).
 
+## Ligne de commande
+
+Le binaire [`cmd/amoxtli`](cmd/amoxtli) expose la bibliothèque sous forme d'outil : il indexe des fichiers locaux dans un espace de travail par projet (`.amoxtli/`), effectue des recherches (dont une recherche itérative `--deep` pilotée par LLM) et sert un serveur MCP sur stdio pour les agents.
+
+```bash
+go install github.com/bornholm/amoxtli/cmd/amoxtli@latest   # ou : make build
+amoxtli init
+amoxtli add ./docs/*.md
+amoxtli search "modèle de concurrence"
+amoxtli mcp   # serveur Model Context Protocol (stdio)
+```
+
+Voir [docs/cli.md](docs/cli.md) pour la configuration (`config.yaml`, interpolation des secrets), les commandes CRUD et l'intégration MCP.
+
 ## Documentation
 
+- [Ligne de commande](docs/cli.md) — CLI `amoxtli` : espace de travail, configuration, commandes CRUD, serveur MCP
 - [Architecture](docs/architecture.md) — packages, indexeurs personnalisés et suite de conformité
 - [Grounding (récupération vérifiée)](docs/grounding.md) — `CheckGrounding`, `SearchIterative`, décomposition et re-retrieval itératif
 - [Backend PostgreSQL](docs/postgres.md) — déploiement entièrement PostgreSQL (FTS + pgvector, fusion RRF)
