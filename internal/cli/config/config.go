@@ -73,11 +73,18 @@ func isSupportedProvider(name string) bool {
 }
 
 type RetrievalConfig struct {
-	Reranking         bool                `yaml:"reranking"`
-	GroundingCheck    bool                `yaml:"grounding_check"`
-	GroundingFailOpen bool                `yaml:"grounding_fail_open"`
-	Iterative         IterativeConfig     `yaml:"iterative"`
-	Decomposition     DecompositionConfig `yaml:"decomposition"`
+	Reranking         bool `yaml:"reranking"`
+	GroundingCheck    bool `yaml:"grounding_check"`
+	GroundingFailOpen bool `yaml:"grounding_fail_open"`
+	// MaxTotalWords bounds the prompt size (in words) of the LLM retrieval
+	// stages (reranker, judge, evidence evaluator). Keep it low enough that the
+	// resulting prompt fits your chat endpoint's context window: words are only
+	// a coarse proxy for tokens (~1.8 tokens/word on mixed prose and code), so
+	// 18000 words already overflow a 32k-token limit. Zero defers to the
+	// library default (12000).
+	MaxTotalWords int                 `yaml:"max_total_words"`
+	Iterative     IterativeConfig     `yaml:"iterative"`
+	Decomposition DecompositionConfig `yaml:"decomposition"`
 }
 
 type IterativeConfig struct {

@@ -119,14 +119,10 @@ func newSearchCommand(opts *rootOptions) *cobra.Command {
 				output.NextCursor = page.NextCursor
 
 				// When grounding is enabled, surface the confidence verdict on a
-				// plain search too. This is an extra LLM evaluation over the
-				// returned evidence.
+				// plain search too. It was already computed during SearchPage, so
+				// reuse it rather than paying for a second LLM evaluation.
 				if cfg.Retrieval.GroundingCheck {
-					grounding, err := rt.Codex.CheckGrounding(ctx, query, page.Results)
-					if err != nil {
-						return errors.WithStack(err)
-					}
-					output.Grounding = grounding
+					output.Grounding = page.Grounding
 				}
 			}
 

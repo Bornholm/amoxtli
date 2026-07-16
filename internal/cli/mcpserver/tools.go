@@ -159,27 +159,24 @@ func (s *Server) handleSearch(hasChat, groundingEnabled bool) mcp.ToolHandlerFor
 			}
 			out.Rounds = result.Rounds
 		} else {
-			results, err := s.rt.Codex.Search(ctx, in.Query, opts...)
+			page, err := s.rt.Codex.SearchPage(ctx, in.Query, opts...)
 			if err != nil {
 				return nil, searchOutput{}, errors.WithStack(err)
 			}
 
-			out.Results, err = s.renderResults(ctx, results)
+			out.Results, err = s.renderResults(ctx, page.Results)
 			if err != nil {
 				return nil, searchOutput{}, err
 			}
 
 			// Surface the grounding confidence verdict when grounding is
-			// enabled (an extra LLM evaluation over the returned evidence).
-			if groundingEnabled {
-				grounding, err := s.rt.Codex.CheckGrounding(ctx, in.Query, results)
-				if err != nil {
-					return nil, searchOutput{}, errors.WithStack(err)
-				}
+			// enabled. It was already computed during SearchPage, so reuse it
+			// rather than paying for a second LLM evaluation.
+			if groundingEnabled && page.Grounding != nil {
 				out.Grounding = &groundingResult{
-					Status:      string(grounding.Status),
-					Score:       grounding.Score,
-					Explanation: grounding.Explanation,
+					Status:      string(page.Grounding.Status),
+					Score:       page.Grounding.Score,
+					Explanation: page.Grounding.Explanation,
 				}
 			}
 		}

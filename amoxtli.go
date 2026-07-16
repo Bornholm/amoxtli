@@ -291,6 +291,11 @@ const searchCandidatePool = 100
 type SearchPage struct {
 	Results    []*index.SearchResult
 	NextCursor string
+	// Grounding is the sufficiency verdict computed by the evidence evaluator
+	// during this search (nil when grounding is not configured or the evaluator
+	// failed under fail-open). It is the same verdict CheckGrounding would
+	// return, exposed here so callers need not re-run the evaluation.
+	Grounding *retrieval.GroundingResult
 }
 
 // Search performs a semantic search across the indexed documents. It returns a
@@ -369,8 +374,10 @@ func (c *Codex) searchPage(ctx context.Context, query string, candidatePool int,
 	results := res.Results
 
 	// When grounding is enabled the Judge is out of the pipeline; the evidence
-	// evaluator provides the relevance filtering here instead (its verdict is
-	// computed but not surfaced by Search — use CheckGrounding for that).
+	// evaluator provides the relevance filtering here instead. Its grounding
+	// verdict is surfaced on the returned page so callers get it without a
+	// second, redundant evaluation (see CheckGrounding for the standalone form).
+	var grounding *retrieval.GroundingResult
 	if c.evaluator != nil {
 		evaluation, err := c.evaluator.Evaluate(ctx, query, results)
 		if err != nil {
@@ -383,9 +390,11 @@ func (c *Codex) searchPage(ctx context.Context, query string, candidatePool int,
 			return nil, errors.WithStack(err)
 		}
 		results = retrieval.FilterRelevant(results, evaluation.Relevant)
+		g := evaluation.Grounding
+		grounding = &g
 	}
 
-	return &SearchPage{Results: results, NextCursor: res.NextCursor}, nil
+	return &SearchPage{Results: results, NextCursor: res.NextCursor, Grounding: grounding}, nil
 }
 
 // CheckGrounding evaluates whether the given search results support a reliable,

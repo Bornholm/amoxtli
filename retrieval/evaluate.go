@@ -203,7 +203,7 @@ func (e *LLMEvidenceEvaluator) getUserPrompt(ctx context.Context, query string, 
 
 	maxTotalWords := e.maxTotalWords
 	if maxTotalWords <= 0 {
-		maxTotalWords = 50000
+		maxTotalWords = 12000
 	}
 	totalWords := 0
 

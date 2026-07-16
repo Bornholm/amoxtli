@@ -50,6 +50,11 @@ retrieval:
   reranking: false
   grounding_check: false
   grounding_fail_open: true
+  # Prompt budget (in words) for the LLM retrieval stages (reranker, judge,
+  # evidence evaluator). Words are a coarse proxy for tokens (~1.4 tokens/word),
+  # so keep this well under your chat endpoint's context window. 0 uses the
+  # built-in default (12000, ~22k tokens). Lower it for smaller context windows.
+  max_total_words: 0
   iterative:
     enabled: false
     max_rounds: 2

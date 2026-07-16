@@ -170,6 +170,10 @@ func retrievalOptions(cfg *config.Config, client llm.Client) []amoxtli.Option {
 
 	opts := []amoxtli.Option{amoxtli.WithLLMClient(client)}
 
+	if cfg.Retrieval.MaxTotalWords > 0 {
+		opts = append(opts, amoxtli.WithMaxTotalWords(cfg.Retrieval.MaxTotalWords))
+	}
+
 	if cfg.Retrieval.Reranking {
 		opts = append(opts, amoxtli.WithReranking())
 	}

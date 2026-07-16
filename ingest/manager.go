@@ -234,7 +234,7 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 	}
 
 	if m.reranker != nil {
-		results, err = m.reranker.Rerank(ctx, query, results)
+		results, err = rerankTop(ctx, m.reranker, query, results, pageSize)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -246,6 +246,34 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 	}
 
 	return &SearchResults{Results: page, NextCursor: nextCursor}, nil
+}
+
+// rerankWindowFactor multiplies the page size to bound how many top fused
+// candidates are handed to the (LLM) reranker. Reranking is only meant to order
+// the head of the result set; feeding it the whole candidate pool (up to
+// defaultCandidatePool) inflates the prompt — and latency — for no benefit on
+// the returned page.
+const rerankWindowFactor = 4
+
+// minRerankWindow is the floor for the rerank window so small pages still give
+// the reranker enough context to promote a strong-but-lower-ranked candidate.
+const minRerankWindow = 20
+
+// rerankTop reranks only the top window of results (bounded relative to the page
+// size) and leaves the remaining candidates in their original fused order after
+// them. This keeps deep pagination working while capping the reranker's cost.
+func rerankTop(ctx context.Context, reranker Reranker, query string, results []*index.SearchResult, pageSize int) ([]*index.SearchResult, error) {
+	window := max(pageSize*rerankWindowFactor, minRerankWindow)
+	if len(results) <= window {
+		return reranker.Rerank(ctx, query, results)
+	}
+
+	head, err := reranker.Rerank(ctx, query, results[:window])
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return append(head, results[window:]...), nil
 }
 
 // applyMetadataFilter drops results whose document metadata does not satisfy the

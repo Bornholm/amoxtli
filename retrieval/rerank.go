@@ -189,7 +189,7 @@ func (r *LLMReranker) getUserPrompt(ctx context.Context, query string, results [
 
 	maxTotalWords := r.maxTotalWords
 	if maxTotalWords <= 0 {
-		maxTotalWords = 50000
+		maxTotalWords = 12000
 	}
 	totalWords := 0
 

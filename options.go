@@ -65,8 +65,13 @@ type options struct {
 
 func defaultOptions() *options {
 	return &options{
-		maxWordsPerSection:         250,
-		maxTotalWords:              50000,
+		maxWordsPerSection: 250,
+		// 12000 words map to roughly 22k tokens, leaving headroom below the
+		// common 32k-token context limit of chat endpoints once the system
+		// prompt, JSON schema and completion are accounted for. A word budget is
+		// only a coarse proxy for tokens — measured at ~1.8 tokens/word on mixed
+		// French prose and source code — so this stays deliberately conservative.
+		maxTotalWords:              12000,
 		taskParallelism:            5,
 		snapshotBoundary:           "amoxtli-snapshot-v1",
 		groundingMinScore:          0.4,
@@ -138,7 +143,10 @@ func WithMaxWordsPerSection(n int) Option {
 	}
 }
 
-// WithMaxTotalWords sets the maximum total words used by the Judge transformer.
+// WithMaxTotalWords bounds the prompt size (in words) shared by the LLM
+// retrieval stages: the Judge transformer, the LLM reranker and the grounding
+// evidence evaluator. Words are only a coarse proxy for tokens, so keep it low
+// enough that the resulting prompt fits the chat endpoint's context window.
 func WithMaxTotalWords(n int) Option {
 	return func(o *options) {
 		o.maxTotalWords = n
