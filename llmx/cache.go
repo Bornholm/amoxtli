@@ -130,7 +130,7 @@ func (c *CachingClient) path(input string, opts *llm.EmbeddingsOptions) string {
 	}
 
 	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00", c.namespace, dims)
+	_, _ = fmt.Fprintf(h, "%s\x00%s\x00", c.namespace, dims)
 	h.Write([]byte(input))
 	key := hex.EncodeToString(h.Sum(nil))
 
@@ -167,16 +167,16 @@ func (c *CachingClient) store(path string, vec []float64) error {
 		return errors.WithStack(err)
 	}
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
 		return errors.WithStack(err)
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name())
 		return errors.WithStack(err)
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
-		os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name())
 		return errors.WithStack(err)
 	}
 

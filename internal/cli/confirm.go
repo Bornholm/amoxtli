@@ -12,7 +12,7 @@ import (
 // confirm asks a yes/no question on stdin, defaulting to no. It reads from the
 // command's configured input so tests can drive it.
 func confirm(cmd *cobra.Command, prompt string) (bool, error) {
-	fmt.Fprintf(cmd.OutOrStdout(), "%s [y/N] ", prompt)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s [y/N] ", prompt)
 
 	reader := bufio.NewReader(cmd.InOrStdin())
 

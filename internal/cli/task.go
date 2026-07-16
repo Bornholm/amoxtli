@@ -43,11 +43,11 @@ func newTaskListCommand(opts *rootOptions) *cobra.Command {
 				}
 
 				tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-				fmt.Fprintln(tw, "ID\tTYPE\tSTATUS\tSCHEDULED")
+				_, _ = fmt.Fprintln(tw, "ID\tTYPE\tSTATUS\tSCHEDULED")
 				for _, h := range headers {
-					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", h.ID, h.Type, h.Status, h.ScheduledAt.Format("2006-01-02 15:04:05"))
+					_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", h.ID, h.Type, h.Status, h.ScheduledAt.Format("2006-01-02 15:04:05"))
 				}
-				tw.Flush()
+				_ = tw.Flush()
 
 				return nil
 			})
@@ -82,15 +82,15 @@ func newTaskShowCommand(opts *rootOptions) *cobra.Command {
 				}
 
 				out := cmd.OutOrStdout()
-				fmt.Fprintf(out, "ID:       %s\n", state.ID)
-				fmt.Fprintf(out, "Type:     %s\n", state.Type)
-				fmt.Fprintf(out, "Status:   %s\n", state.Status)
-				fmt.Fprintf(out, "Progress: %.0f%%\n", state.Progress*100)
+				_, _ = fmt.Fprintf(out, "ID:       %s\n", state.ID)
+				_, _ = fmt.Fprintf(out, "Type:     %s\n", state.Type)
+				_, _ = fmt.Fprintf(out, "Status:   %s\n", state.Status)
+				_, _ = fmt.Fprintf(out, "Progress: %.0f%%\n", state.Progress*100)
 				if state.Message != "" {
-					fmt.Fprintf(out, "Message:  %s\n", state.Message)
+					_, _ = fmt.Fprintf(out, "Message:  %s\n", state.Message)
 				}
 				if state.Error != nil {
-					fmt.Fprintf(out, "Error:    %s\n", state.Error)
+					_, _ = fmt.Fprintf(out, "Error:    %s\n", state.Error)
 				}
 
 				return nil
@@ -110,7 +110,7 @@ func newTaskCancelCommand(opts *rootOptions) *cobra.Command {
 					return errors.WithStack(err)
 				}
 
-				fmt.Fprintf(cmd.OutOrStdout(), "Cancelled task %s\n", args[0])
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Cancelled task %s\n", args[0])
 
 				return nil
 			})

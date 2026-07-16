@@ -78,7 +78,7 @@ func newCollectionCreateCommand(opts *rootOptions) *cobra.Command {
 					return printJSON(cmd.OutOrStdout(), collectionInfo{ID: string(id), Label: args[0]})
 				}
 
-				fmt.Fprintf(cmd.OutOrStdout(), "Created collection %s (%s)\n", args[0], id)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Created collection %s (%s)\n", args[0], id)
 
 				return nil
 			})
@@ -108,11 +108,11 @@ func newCollectionListCommand(opts *rootOptions) *cobra.Command {
 				}
 
 				tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-				fmt.Fprintln(tw, "ID\tLABEL\tDESCRIPTION")
+				_, _ = fmt.Fprintln(tw, "ID\tLABEL\tDESCRIPTION")
 				for _, info := range infos {
-					fmt.Fprintf(tw, "%s\t%s\t%s\n", info.ID, info.Label, info.Description)
+					_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", info.ID, info.Label, info.Description)
 				}
-				tw.Flush()
+				_ = tw.Flush()
 
 				return nil
 			})
@@ -142,9 +142,9 @@ func newCollectionShowCommand(opts *rootOptions) *cobra.Command {
 				}
 
 				out := cmd.OutOrStdout()
-				fmt.Fprintf(out, "ID:          %s\n", coll.ID())
-				fmt.Fprintf(out, "Label:       %s\n", coll.Label())
-				fmt.Fprintf(out, "Description: %s\n", coll.Description())
+				_, _ = fmt.Fprintf(out, "ID:          %s\n", coll.ID())
+				_, _ = fmt.Fprintf(out, "Label:       %s\n", coll.Label())
+				_, _ = fmt.Fprintf(out, "Description: %s\n", coll.Description())
 
 				return nil
 			})
@@ -169,7 +169,7 @@ func newCollectionRenameCommand(opts *rootOptions) *cobra.Command {
 					return errors.WithStack(err)
 				}
 
-				fmt.Fprintf(cmd.OutOrStdout(), "Renamed collection %s to %q\n", id, label)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Renamed collection %s to %q\n", id, label)
 
 				return nil
 			})
@@ -194,7 +194,7 @@ func newCollectionDescribeCommand(opts *rootOptions) *cobra.Command {
 					return errors.WithStack(err)
 				}
 
-				fmt.Fprintf(cmd.OutOrStdout(), "Updated description of collection %s\n", id)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated description of collection %s\n", id)
 
 				return nil
 			})
@@ -223,7 +223,7 @@ func newCollectionStatsCommand(opts *rootOptions) *cobra.Command {
 					return printJSON(cmd.OutOrStdout(), map[string]any{"id": id, "total_documents": stats.TotalDocuments})
 				}
 
-				fmt.Fprintf(cmd.OutOrStdout(), "Collection %s: %d document(s)\n", id, stats.TotalDocuments)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Collection %s: %d document(s)\n", id, stats.TotalDocuments)
 
 				return nil
 			})
@@ -251,7 +251,7 @@ func newCollectionDeleteCommand(opts *rootOptions) *cobra.Command {
 						return err
 					}
 					if !confirmed {
-						fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
+						_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
 						return nil
 					}
 				}
@@ -260,7 +260,7 @@ func newCollectionDeleteCommand(opts *rootOptions) *cobra.Command {
 					return errors.WithStack(err)
 				}
 
-				fmt.Fprintf(cmd.OutOrStdout(), "Deleted collection %s. Run \"amoxtli cleanup\" to prune orphaned documents.\n", id)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Deleted collection %s. Run \"amoxtli cleanup\" to prune orphaned documents.\n", id)
 
 				return nil
 			})

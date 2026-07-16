@@ -144,12 +144,12 @@ func newDocListCommand(opts *rootOptions) *cobra.Command {
 			}
 
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tSOURCE\tCREATED")
+			_, _ = fmt.Fprintln(tw, "ID\tSOURCE\tCREATED")
 			for _, info := range infos {
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", info.ID, info.Source, info.CreatedAt)
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", info.ID, info.Source, info.CreatedAt)
 			}
-			tw.Flush()
-			fmt.Fprintf(cmd.OutOrStdout(), "\n%d of %d document(s).\n", len(infos), total)
+			_ = tw.Flush()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\n%d of %d document(s).\n", len(infos), total)
 
 			return nil
 		},
@@ -198,17 +198,17 @@ func newDocShowCommand(opts *rootOptions) *cobra.Command {
 			}
 
 			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "ID:          %s\n", info.ID)
-			fmt.Fprintf(out, "Source:      %s\n", info.Source)
-			fmt.Fprintf(out, "ETag:        %s\n", info.ETag)
-			fmt.Fprintf(out, "Created:     %s\n", info.CreatedAt)
+			_, _ = fmt.Fprintf(out, "ID:          %s\n", info.ID)
+			_, _ = fmt.Fprintf(out, "Source:      %s\n", info.Source)
+			_, _ = fmt.Fprintf(out, "ETag:        %s\n", info.ETag)
+			_, _ = fmt.Fprintf(out, "Created:     %s\n", info.CreatedAt)
 			if len(info.Collections) > 0 {
-				fmt.Fprintf(out, "Collections: %v\n", info.Collections)
+				_, _ = fmt.Fprintf(out, "Collections: %v\n", info.Collections)
 			}
 			if len(info.Metadata) > 0 {
-				fmt.Fprintf(out, "Metadata:    %v\n", info.Metadata)
+				_, _ = fmt.Fprintf(out, "Metadata:    %v\n", info.Metadata)
 			}
-			fmt.Fprintf(out, "Sections:    %d\n", model.CountSections(doc))
+			_, _ = fmt.Fprintf(out, "Sections:    %d\n", model.CountSections(doc))
 
 			return nil
 		},
@@ -256,14 +256,14 @@ func newDocDeleteCommand(opts *rootOptions) *cobra.Command {
 			}
 
 			if len(sources) == 0 {
-				fmt.Fprintln(cmd.OutOrStdout(), "No matching document.")
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No matching document.")
 				return nil
 			}
 
 			if dryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "Would delete %d document(s):\n", len(sources))
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Would delete %d document(s):\n", len(sources))
 				for _, s := range sources {
-					fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", s)
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", s)
 				}
 				return nil
 			}
@@ -274,7 +274,7 @@ func newDocDeleteCommand(opts *rootOptions) *cobra.Command {
 					return err
 				}
 				if !confirmed {
-					fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
 					return nil
 				}
 			}
@@ -293,7 +293,7 @@ func newDocDeleteCommand(opts *rootOptions) *cobra.Command {
 				deleted++
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Deleted %d document(s).\n", deleted)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Deleted %d document(s).\n", deleted)
 
 			return nil
 		},

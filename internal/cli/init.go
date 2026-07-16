@@ -56,8 +56,8 @@ func newInitCommand(opts *rootOptions) *cobra.Command {
 				}
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Initialized amoxtli workspace in %s\n", ws.Dir)
-			fmt.Fprintf(cmd.OutOrStdout(), "Edit %s to configure indexes and LLM providers.\n", ws.ConfigPath())
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Initialized amoxtli workspace in %s\n", ws.Dir)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Edit %s to configure indexes and LLM providers.\n", ws.ConfigPath())
 
 			return nil
 		},

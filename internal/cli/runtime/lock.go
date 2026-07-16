@@ -33,7 +33,7 @@ func acquireLock(path string, command string) (*Lock, error) {
 				writeErr = closeErr
 			}
 			if writeErr != nil {
-				os.Remove(path)
+				_ = os.Remove(path)
 				return nil, errors.WithStack(writeErr)
 			}
 

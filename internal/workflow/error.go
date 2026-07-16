@@ -24,7 +24,7 @@ func (e *CompensationError) Error() string {
 
 	sb.WriteString("compensation error: ")
 	sb.WriteString("execution error '")
-	sb.WriteString(fmt.Sprintf("%+v", e.ExecutionError()))
+	_, _ = fmt.Fprintf(&sb, "%+v", e.ExecutionError())
 	sb.WriteString("' resulted in following compensation errors: ")
 
 	for idx, err := range e.CompensationErrors() {
@@ -35,7 +35,7 @@ func (e *CompensationError) Error() string {
 		sb.WriteString("[")
 		sb.WriteString(strconv.FormatInt(int64(idx), 10))
 		sb.WriteString("] ")
-		sb.WriteString(fmt.Sprintf("%+v", err))
+		_, _ = fmt.Fprintf(&sb, "%+v", err)
 	}
 
 	return sb.String()

@@ -68,7 +68,7 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 
 			for _, path := range args {
 				result := addFile(cmd, rt, collID, path, supported, metadata, !noWait, timeout)
-				if result.Status != string(task.StatusSucceeded) && !(noWait && result.Status == string(task.StatusPending)) {
+				if result.Status != string(task.StatusSucceeded) && (!noWait || result.Status != string(task.StatusPending)) {
 					failures++
 				}
 
@@ -77,7 +77,7 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 					if result.Error != "" {
 						line += " (" + result.Error + ")"
 					}
-					fmt.Fprintln(cmd.OutOrStdout(), line)
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), line)
 				}
 
 				results = append(results, result)

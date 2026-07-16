@@ -204,30 +204,30 @@ func printSearchOutput(cmd *cobra.Command, output *searchOutput) {
 	p := newPalette(out)
 
 	if len(output.Results) == 0 {
-		fmt.Fprintln(out, "No results.")
+		_, _ = fmt.Fprintln(out, "No results.")
 		return
 	}
 
 	for i, r := range output.Results {
 		if i > 0 {
-			fmt.Fprintln(out)
+			_, _ = fmt.Fprintln(out)
 		}
 
 		title, path := formatSource(r.Source)
 
-		fmt.Fprintf(out, "%s%d.%s %s%s%s  %s%.3f%s\n",
+		_, _ = fmt.Fprintf(out, "%s%d.%s %s%s%s  %s%.3f%s\n",
 			p.dim, i+1, p.reset,
 			p.bold, title, p.reset,
 			p.green, r.Score, p.reset,
 		)
 
 		if path != "" {
-			fmt.Fprintf(out, "   %s%s%s\n", p.dim, path, p.reset)
+			_, _ = fmt.Fprintf(out, "   %s%s%s\n", p.dim, path, p.reset)
 		}
 
 		for _, s := range r.Sections {
 			if s.Content != "" {
-				fmt.Fprintf(out, "   %s•%s %s\n", p.cyan, p.reset, excerpt(s.Content, 200))
+				_, _ = fmt.Fprintf(out, "   %s•%s %s\n", p.cyan, p.reset, excerpt(s.Content, 200))
 			}
 		}
 	}
@@ -237,14 +237,14 @@ func printSearchOutput(cmd *cobra.Command, output *searchOutput) {
 		if output.Rounds > 0 {
 			rounds = fmt.Sprintf(", %d extra round(s)", output.Rounds)
 		}
-		fmt.Fprintf(out, "\n%sGrounding:%s %s (confidence %.2f%s)\n",
+		_, _ = fmt.Fprintf(out, "\n%sGrounding:%s %s (confidence %.2f%s)\n",
 			p.bold, p.reset, output.Grounding.Status, output.Grounding.Score, rounds)
 		if output.Grounding.Explanation != "" {
-			fmt.Fprintf(out, "  %s%s%s\n", p.dim, output.Grounding.Explanation, p.reset)
+			_, _ = fmt.Fprintf(out, "  %s%s%s\n", p.dim, output.Grounding.Explanation, p.reset)
 		}
 	}
 
 	if output.NextCursor != "" {
-		fmt.Fprintf(out, "\n%sMore results:%s --cursor %q\n", p.dim, p.reset, output.NextCursor)
+		_, _ = fmt.Fprintf(out, "\n%sMore results:%s --cursor %q\n", p.dim, p.reset, output.NextCursor)
 	}
 }

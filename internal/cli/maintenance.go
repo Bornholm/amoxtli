@@ -112,7 +112,7 @@ func newBackupCommand(opts *rootOptions) *cobra.Command {
 				}
 				defer reader.Close()
 
-				var dst io.Writer = cmd.OutOrStdout()
+				dst := cmd.OutOrStdout()
 				if output != "" && output != "-" {
 					file, err := os.Create(output)
 					if err != nil {
@@ -127,7 +127,7 @@ func newBackupCommand(opts *rootOptions) *cobra.Command {
 				}
 
 				if output != "" && output != "-" {
-					fmt.Fprintf(cmd.ErrOrStderr(), "Wrote backup to %s\n", output)
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Wrote backup to %s\n", output)
 				}
 
 				return nil
@@ -155,12 +155,12 @@ func newRestoreCommand(opts *rootOptions) *cobra.Command {
 						return err
 					}
 					if !confirmed {
-						fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
+						_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
 						return nil
 					}
 				}
 
-				var src io.Reader = cmd.InOrStdin()
+				src := cmd.InOrStdin()
 				if args[0] != "-" {
 					file, err := os.Open(args[0])
 					if err != nil {
@@ -174,7 +174,7 @@ func newRestoreCommand(opts *rootOptions) *cobra.Command {
 					return errors.WithStack(err)
 				}
 
-				fmt.Fprintln(cmd.OutOrStdout(), "Restore complete.")
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Restore complete.")
 
 				return nil
 			})
@@ -200,7 +200,7 @@ func awaitMaintenanceTask(cmd *cobra.Command, rt *runtime.Runtime, taskID task.I
 		return errors.Errorf("%s failed", label)
 	}
 
-	fmt.Fprintf(cmd.OutOrStdout(), "%s complete.\n", label)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s complete.\n", label)
 
 	return nil
 }
