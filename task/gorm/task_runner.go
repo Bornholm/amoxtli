@@ -121,7 +121,7 @@ func (r *TaskRunner) Run(ctx context.Context) error {
 	// of this process has claimed anything yet), so it is safe to reset it to
 	// pending. Doing this after workers start would risk clobbering a task this
 	// process is actively running.
-	if err := r.recoverOrphans(ctx); err != nil {
+	if err := r.recoverOrphans(ctx); err != nil && ctx.Err() == nil {
 		slog.ErrorContext(ctx, "could not recover orphaned tasks", slog.Any("error", errors.WithStack(err)))
 	}
 
@@ -148,7 +148,7 @@ func (r *TaskRunner) Run(ctx context.Context) error {
 	// backlog cannot stall on the buffer). Duplicate enqueues — a task both
 	// scheduled by this process and picked up here — are made harmless by the
 	// claim guard in executeTask.
-	if err := r.enqueuePending(ctx); err != nil {
+	if err := r.enqueuePending(ctx); err != nil && ctx.Err() == nil {
 		slog.ErrorContext(ctx, "could not enqueue pending tasks", slog.Any("error", errors.WithStack(err)))
 	}
 
