@@ -16,6 +16,7 @@ import (
 	"github.com/bornholm/amoxtli/internal/cli/config"
 	"github.com/bornholm/amoxtli/internal/cli/workspace"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/genai/llm"
 	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
@@ -119,6 +120,21 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 	}
 	if converter != nil {
 		opts = append(opts, amoxtli.WithFileConverter(converter))
+	}
+
+	if cfg.CodeEnabled() {
+		registry := sourcecode.DefaultRegistry()
+
+		for ext, name := range cfg.Indexing.Code.Extensions {
+			lang, exists := sourcecode.ByName(name)
+			if !exists {
+				return nil, errors.Errorf("indexing.code.extensions: unknown language %q for extension %q", name, ext)
+			}
+
+			registry.Register(ext, lang)
+		}
+
+		opts = append(opts, amoxtli.WithSourceCode(registry))
 	}
 
 	if cfg.Indexing.MaxWordsPerSection > 0 {

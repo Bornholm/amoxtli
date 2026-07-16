@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v3"
 )
@@ -120,9 +121,22 @@ type GenAIConverterConfig struct {
 }
 
 type IndexingConfig struct {
-	MaxWordsPerSection int  `yaml:"max_words_per_section"`
-	TaskParallelism    int  `yaml:"task_parallelism"`
-	PersistentTasks    bool `yaml:"persistent_tasks"`
+	MaxWordsPerSection int                `yaml:"max_words_per_section"`
+	TaskParallelism    int                `yaml:"task_parallelism"`
+	PersistentTasks    bool               `yaml:"persistent_tasks"`
+	Code               CodeIndexingConfig `yaml:"code"`
+}
+
+type CodeIndexingConfig struct {
+	// Enabled accepts true, false or "auto"; auto (the default) enables
+	// source-code indexing (it is pure Go and needs no external tool). Source
+	// files are split into declaration-level sections and tagged with
+	// `type=code` and `language=<name>` metadata, filterable at search time.
+	Enabled Toggle `yaml:"enabled"`
+	// Extensions extends or overrides the built-in extension→language mapping,
+	// e.g. {".phtml": "php"}. Languages: go, javascript, typescript, tsx,
+	// python, php.
+	Extensions map[string]string `yaml:"extensions"`
 }
 
 // Default returns the configuration used when a field is absent from the
@@ -165,6 +179,9 @@ func Default() *Config {
 		},
 		Indexing: IndexingConfig{
 			PersistentTasks: true,
+			Code: CodeIndexingConfig{
+				Enabled: ToggleAuto,
+			},
 		},
 	}
 }
@@ -183,6 +200,12 @@ func (c *Config) HasEmbeddings() bool {
 // embeddings client.
 func (c *Config) VectorEnabled() bool {
 	return c.Index.Vector.Enabled.Resolve(c.HasEmbeddings())
+}
+
+// CodeEnabled resolves the source-code indexing toggle; it defaults to
+// enabled (pure Go, no external dependency).
+func (c *Config) CodeEnabled() bool {
+	return c.Indexing.Code.Enabled.Resolve(true)
 }
 
 // Validate checks cross-field constraints and rejects combinations that
@@ -224,6 +247,15 @@ func (c *Config) Validate() error {
 		}
 		if len(needsChat) > 0 {
 			return errors.Errorf("%s requires llm.chat to be configured", strings.Join(needsChat, ", "))
+		}
+	}
+
+	for ext, name := range c.Indexing.Code.Extensions {
+		if !strings.HasPrefix(ext, ".") {
+			return errors.Errorf("indexing.code.extensions: extension %q must start with a dot", ext)
+		}
+		if _, exists := sourcecode.ByName(name); !exists {
+			return errors.Errorf("indexing.code.extensions: unknown language %q for extension %q (supported: %v)", name, ext, sourcecode.Names())
 		}
 	}
 

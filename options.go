@@ -9,6 +9,7 @@ import (
 	"github.com/bornholm/amoxtli/ingest"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
+	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/amoxtli/task"
 	"github.com/bornholm/genai/llm"
 )
@@ -26,6 +27,7 @@ type Indexer struct {
 type options struct {
 	llmClient          llm.Client
 	fileConverter      convert.Converter
+	sourceCode         *sourcecode.Registry
 	maxWordsPerSection int
 	maxTotalWords      int
 	taskParallelism    int
@@ -101,6 +103,17 @@ func WithObservability() Option {
 func WithFileConverter(fc convert.Converter) Option {
 	return func(o *options) {
 		o.fileConverter = fc
+	}
+}
+
+// WithSourceCode enables source-code indexing for the file extensions
+// registered in the registry (see sourcecode.DefaultRegistry). Source files
+// are parsed with tree-sitter into declaration-level sections and tagged with
+// `type=code` and `language=<name>` metadata, filterable at search time with
+// WithSearchFilter.
+func WithSourceCode(registry *sourcecode.Registry) Option {
+	return func(o *options) {
+		o.sourceCode = registry
 	}
 }
 

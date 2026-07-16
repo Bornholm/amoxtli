@@ -186,6 +186,8 @@ github.com/ncruces/go-sqlite3/gormlite v0.20.3 h1:bpnLMMhWFoiY6EHF52pc3Czl8tJCSw
 github.com/ncruces/go-sqlite3/gormlite v0.20.3/go.mod h1:wxYIO+HouPGhQ9SmnxsStnrMLs8xk6vVkVTwfG9coHo=
 github.com/ncruces/julianday v1.0.0 h1:fH0OKwa7NWvniGQtxdJRxAgkBMolni2BjDHaWTxqt7M=
 github.com/ncruces/julianday v1.0.0/go.mod h1:Dusn2KvZrrovOMJuOt0TNXL6tB7U2E8kvza5fFc9G7g=
+github.com/odvcencio/gotreesitter v0.38.0 h1:6UkjeVOeihIqSilBw3ezUH6UK9korS5TfCmhXF9sFHc=
+github.com/odvcencio/gotreesitter v0.38.0/go.mod h1:hBVkghd0paaYAVwd2087vfwdeU984bQbMo9LvpE0moo=
 github.com/openai/openai-go v0.1.0-beta.10 h1:CknhGXe8aXQMRuqg255PFnWzgRY9nEryMxoNIBBM9tU=
 github.com/openai/openai-go v0.1.0-beta.10/go.mod h1:g461MYGXEXBVdV5SaR/5tNzNbSfwTBBefwc+LlDCK0Y=
 github.com/opencontainers/go-digest v1.0.0 h1:apOUWs51W5PlhuyGyz9FCeeBIOUDA/6nW8Oi/yOhh5U=

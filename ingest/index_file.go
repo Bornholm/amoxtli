@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/bornholm/amoxtli/internal/workflow"
 	"github.com/bornholm/amoxtli/markdown"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/amoxtli/task"
 	"github.com/pkg/errors"
 )
@@ -130,17 +132,55 @@ const indexFileTaskTimeout = 2 * time.Hour
 type IndexFileHandler struct {
 	store             Store
 	fileConverter     convert.Converter
+	sourceCode        *sourcecode.Registry
 	index             index.Index
 	maxWordPerSection int
 }
 
-func NewIndexFileHandler(store Store, fileConverter convert.Converter, idx index.Index, maxWordPerSection int) *IndexFileHandler {
-	return &IndexFileHandler{
+type IndexFileHandlerOptionFunc func(h *IndexFileHandler)
+
+// WithIndexFileHandlerSourceCode enables source-code parsing for the file
+// extensions registered in the registry. A nil registry disables it.
+func WithIndexFileHandlerSourceCode(registry *sourcecode.Registry) IndexFileHandlerOptionFunc {
+	return func(h *IndexFileHandler) {
+		h.sourceCode = registry
+	}
+}
+
+func NewIndexFileHandler(store Store, fileConverter convert.Converter, idx index.Index, maxWordPerSection int, funcs ...IndexFileHandlerOptionFunc) *IndexFileHandler {
+	handler := &IndexFileHandler{
 		store:             store,
 		fileConverter:     fileConverter,
 		index:             idx,
 		maxWordPerSection: maxWordPerSection,
 	}
+
+	for _, fn := range funcs {
+		fn(handler)
+	}
+
+	return handler
+}
+
+// parsedDocument is the mutable document produced by the parsing step, common
+// to markdown and source-code documents.
+type parsedDocument interface {
+	model.Document
+	SetSource(source *url.URL)
+	SetETag(etag string)
+	SetMetadata(metadata map[string]any)
+	AddCollection(coll model.Collection)
+}
+
+// isSourceCode returns true when the file must be parsed as source code.
+func (h *IndexFileHandler) isSourceCode(ext string) bool {
+	if h.sourceCode == nil {
+		return false
+	}
+
+	_, exists := h.sourceCode.Lookup(ext)
+
+	return exists
 }
 
 // Handle implements [task.Handler].
@@ -173,7 +213,7 @@ func (h *IndexFileHandler) Handle(ctx context.Context, tsk task.Task, events cha
 				}
 
 				ext := filepath.Ext(indexFileTask.originalName)
-				if ext == ".md" || h.fileConverter == nil {
+				if ext == ".md" || h.isSourceCode(ext) || h.fileConverter == nil {
 					reader = file
 					events <- task.NewEvent(task.WithProgress(0.05))
 					return nil
@@ -211,10 +251,21 @@ func (h *IndexFileHandler) Handle(ctx context.Context, tsk task.Task, events cha
 
 				events <- task.NewEvent(task.WithMessage("parsing document"))
 
-				doc, err := markdown.Parse(
-					data,
-					markdown.WithMaxWordPerSection(h.maxWordPerSection),
-				)
+				var doc parsedDocument
+
+				if ext := filepath.Ext(indexFileTask.originalName); h.isSourceCode(ext) {
+					doc, err = sourcecode.Parse(
+						indexFileTask.originalName,
+						data,
+						sourcecode.WithMaxWordPerSection(h.maxWordPerSection),
+						sourcecode.WithRegistry(h.sourceCode),
+					)
+				} else {
+					doc, err = markdown.Parse(
+						data,
+						markdown.WithMaxWordPerSection(h.maxWordPerSection),
+					)
+				}
 				if err != nil {
 					return errors.Wrap(err, "could not parse document")
 				}
@@ -233,8 +284,17 @@ func (h *IndexFileHandler) Handle(ctx context.Context, tsk task.Task, events cha
 					doc.SetETag(indexFileTask.etag)
 				}
 
+				// Merge user-supplied metadata over the parser-injected base
+				// (e.g. type/language for source code); user values win.
 				if len(indexFileTask.metadata) > 0 {
-					doc.SetMetadata(indexFileTask.metadata)
+					metadata := model.Metadata(doc)
+					if metadata == nil {
+						metadata = map[string]any{}
+					}
+
+					maps.Copy(metadata, indexFileTask.metadata)
+
+					doc.SetMetadata(metadata)
 				}
 
 				if len(indexFileTask.collections) == 0 {

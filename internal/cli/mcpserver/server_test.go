@@ -27,7 +27,16 @@ Go is a statically typed, compiled language designed at Google.
 Go's concurrency model is built around goroutines and channels.
 `
 
-// setupWorkspace creates a bleve-only workspace with one indexed document.
+const sourceFile = `package greeting
+
+// ParseGreetingMessage parses a greeting message and returns its recipient.
+func ParseGreetingMessage(message string) string {
+	return message
+}
+`
+
+// setupWorkspace creates a bleve-only workspace with one indexed markdown
+// document and one indexed source file.
 func setupWorkspace(t *testing.T) (*workspace.Workspace, *config.Config) {
 	t.Helper()
 
@@ -54,6 +63,14 @@ func setupWorkspace(t *testing.T) (*workspace.Workspace, *config.Config) {
 
 	source := &url.URL{Scheme: "mem", Path: "/go-intro"}
 	taskID, err := rt.Codex.IndexFile(ctx, collID, "go-intro.md", strings.NewReader(doc), amoxtli.WithIndexFileSource(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitTask(t, ctx, rt.Codex, taskID)
+
+	codeSource := &url.URL{Scheme: "mem", Path: "/greeting.go"}
+	taskID, err = rt.Codex.IndexFile(ctx, collID, "greeting.go", strings.NewReader(sourceFile), amoxtli.WithIndexFileSource(codeSource))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +174,52 @@ func TestMCPSearch(t *testing.T) {
 		t.Error("expected deep search without a chat model to be an error")
 	}
 
-	// list_documents must expose the single document.
+	// a type=code filter must return the source file only.
+	coded, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "search",
+		Arguments: map[string]any{"query": "parse greeting message", "filters": []string{"type=code"}},
+	})
+	if err != nil {
+		t.Fatalf("call filtered search: %+v", err)
+	}
+	if coded.IsError {
+		t.Fatalf("filtered search returned an error: %+v", coded.Content)
+	}
+
+	decodeStructured(t, coded.StructuredContent, &out)
+	if len(out.Results) == 0 || !strings.Contains(out.Results[0].Source, "greeting.go") {
+		t.Fatalf("expected a type=code hit on greeting.go, got: %+v", out)
+	}
+
+	// a type!=code filter must exclude the source file.
+	docsOnly, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "search",
+		Arguments: map[string]any{"query": "parse greeting message", "filters": []string{"type!=code"}},
+	})
+	if err != nil {
+		t.Fatalf("call filtered search: %+v", err)
+	}
+
+	decodeStructured(t, docsOnly.StructuredContent, &out)
+	for _, result := range out.Results {
+		if strings.Contains(result.Source, "greeting.go") {
+			t.Errorf("type!=code returned the code file: %+v", result)
+		}
+	}
+
+	// an invalid filter expression must be reported as a tool error.
+	invalid, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "search",
+		Arguments: map[string]any{"query": "x", "filters": []string{"no-operator"}},
+	})
+	if err != nil {
+		t.Fatalf("call invalid filtered search: %+v", err)
+	}
+	if !invalid.IsError {
+		t.Error("expected an invalid filter expression to be an error")
+	}
+
+	// list_documents must expose both documents.
 	listed, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "list_documents"})
 	if err != nil {
 		t.Fatalf("call list_documents: %+v", err)
@@ -165,8 +227,8 @@ func TestMCPSearch(t *testing.T) {
 
 	var docs listDocumentsOutput
 	decodeStructured(t, listed.StructuredContent, &docs)
-	if docs.Total != 1 {
-		t.Errorf("expected one document, got %d", docs.Total)
+	if docs.Total != 2 {
+		t.Errorf("expected two documents, got %d", docs.Total)
 	}
 }
 

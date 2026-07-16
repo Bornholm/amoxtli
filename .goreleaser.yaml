@@ -6,14 +6,26 @@ before:
 
 builds:
   - id: amoxtli
-    # sqlite runs as WASM (ncruces/go-sqlite3), so no cgo toolchains are needed
-    # and cross-compilation to every first-class target just works.
+    # sqlite runs as WASM (ncruces/go-sqlite3) and tree-sitter is pure Go
+    # (odvcencio/gotreesitter), so no cgo toolchains are needed and
+    # cross-compilation to every first-class target just works.
     env:
       - CGO_ENABLED=0
     targets: [go_first_class]
     mod_timestamp: "{{ .CommitTimestamp }}"
     dir: ./cmd/amoxtli
     binary: amoxtli
+    # Embed only the tree-sitter grammars amoxtli routes (see
+    # sourcecode.DefaultRegistry); without these tags the gotreesitter
+    # registry embeds all ~206 grammars (~23MB extra in the binary).
+    tags:
+      - grammar_subset
+      - grammar_subset_go
+      - grammar_subset_javascript
+      - grammar_subset_typescript
+      - grammar_subset_tsx
+      - grammar_subset_python
+      - grammar_subset_php
     flags:
       - -trimpath
     ldflags:

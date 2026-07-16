@@ -13,6 +13,7 @@
 | `llmx` | Décorateurs `llm.Client` : `RetryClient` (retries à backoff + rate-limit optionnel) |
 | `index/testsuite` | Suite de conformité pour les implémentations de `index.Index` |
 | `markdown` | Parsing/chunking markdown en sections |
+| `sourcecode` | Parsing/chunking de code source en sections par déclaration (tree-sitter pur Go, métadonnées `type=code` / `language=<nom>`) |
 | `convert` | Conversion de fichiers vers markdown (`pandoc`, `libreoffice`, `genai`) |
 | `task` / `task/memory` / `task/gorm` | Exécution de tâches asynchrones : contrat `task.Runner`, runner en mémoire, runner persistant gorm (reprise au démarrage) |
 | `ingest` / `ingest/gorm` | Pipeline d'ingestion + magasin de documents (SQLite ou PostgreSQL) |

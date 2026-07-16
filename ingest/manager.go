@@ -9,12 +9,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/bornholm/amoxtli/convert"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/amoxtli/task"
 	"github.com/bornholm/go-x/slogx"
 	"github.com/pkg/errors"
@@ -25,6 +27,9 @@ type ManagerOptions struct {
 	MaxWordPerSection int
 	FileConverter     convert.Converter
 	Reranker          Reranker
+	// SourceCode, when set, enables source-code indexing for the file
+	// extensions registered in the registry.
+	SourceCode *sourcecode.Registry
 	// StagingDir, when set, pins the directory where files awaiting indexing are
 	// staged to a stable location instead of a per-process temporary directory.
 	// It is required for a persistent task runner: a resumed IndexFile task must
@@ -65,6 +70,15 @@ func WithManagerMaxWordPerSection(maxWordPerSection int) ManagerOptionFunc {
 	}
 }
 
+// WithManagerSourceCode enables source-code indexing: files whose extension is
+// registered in the registry are parsed into declaration-level sections
+// instead of going through the converter and markdown pipeline.
+func WithManagerSourceCode(registry *sourcecode.Registry) ManagerOptionFunc {
+	return func(opts *ManagerOptions) {
+		opts.SourceCode = registry
+	}
+}
+
 func NewManagerOptions(funcs ...ManagerOptionFunc) *ManagerOptions {
 	opts := &ManagerOptions{
 		MaxWordPerSection: 250,
@@ -82,6 +96,7 @@ type Manager struct {
 
 	maxWordPerSection int
 	fileConverter     convert.Converter
+	sourceCode        *sourcecode.Registry
 	index             index.Index
 	taskRunner        task.Runner
 	reranker          Reranker
@@ -353,10 +368,19 @@ func paginate(results []*index.SearchResult, cursor string, pageSize int) ([]*in
 }
 
 func (m *Manager) SupportedExtensions() []string {
-	if m.fileConverter == nil {
-		return []string{".md"}
+	exts := []string{".md"}
+
+	if m.fileConverter != nil {
+		exts = append(exts, m.fileConverter.SupportedExtensions()...)
 	}
-	return m.fileConverter.SupportedExtensions()
+
+	if m.sourceCode != nil {
+		exts = append(exts, m.sourceCode.SupportedExtensions()...)
+	}
+
+	slices.Sort(exts)
+
+	return slices.Compact(exts)
 }
 
 type IndexFileOptions struct {
@@ -469,7 +493,7 @@ func (m *Manager) Reindex(ctx context.Context) (task.ID, error) {
 // factories are registered too so pending tasks can be rebuilt and resumed
 // after a restart.
 func (m *Manager) RegisterHandlers(runner task.Runner) {
-	runner.RegisterTask(TaskTypeIndexFile, NewIndexFileHandler(m.Store, m.fileConverter, m.index, m.maxWordPerSection))
+	runner.RegisterTask(TaskTypeIndexFile, NewIndexFileHandler(m.Store, m.fileConverter, m.index, m.maxWordPerSection, WithIndexFileHandlerSourceCode(m.sourceCode)))
 	runner.RegisterTask(TaskTypeCleanup, NewCleanupHandler(m.index, m.Store))
 	runner.RegisterTask(TaskTypeReindex, NewReindexHandler(m.Store, m.index, m.maxWordPerSection))
 
@@ -498,6 +522,7 @@ func NewManager(store Store, idx index.Index, taskRunner task.Runner, funcs ...M
 		taskRunner:         taskRunner,
 		index:              idx,
 		fileConverter:      opts.FileConverter,
+		sourceCode:         opts.SourceCode,
 		reranker:           opts.Reranker,
 		stagingDirOverride: opts.StagingDir,
 	}

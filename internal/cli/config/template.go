@@ -81,4 +81,15 @@ indexing:
   max_words_per_section: 0
   task_parallelism: 0
   persistent_tasks: true
+  # Source-code indexing (tree-sitter, pure Go). Code files are split into
+  # declaration-level sections and tagged with type=code and language=<name>
+  # metadata, filterable at search time (e.g. --filter language=go, or
+  # --filter "type!=code" to search documentation only).
+  code:
+    # true, false or auto (auto enables it; no external tool required).
+    enabled: auto
+    # Extend or override the extension→language mapping. Built-in languages:
+    # go, javascript, typescript, tsx, python, php.
+    # extensions:
+    #   .phtml: php
 `

@@ -53,6 +53,14 @@ Communicating Sequential Processes (CSP). A goroutine is a lightweight thread
 managed by the Go runtime.
 `
 
+const testSourceFile = `package greeting
+
+// ParseGreetingMessage parses a greeting message and returns its recipient.
+func ParseGreetingMessage(message string) string {
+	return message
+}
+`
+
 // TestCLILifecycle drives the full local (bleve-only, no LLM) workflow:
 // init, add, search, doc management, collection stats and deletion.
 func TestCLILifecycle(t *testing.T) {
@@ -206,6 +214,41 @@ func TestCLILifecycle(t *testing.T) {
 	}
 	if listed.Total != 0 {
 		t.Errorf("expected no document after delete, got total %d", listed.Total)
+	}
+
+	// add a source-code file: it must be indexed with type=code and
+	// language=go metadata, filterable at search time
+	codePath := filepath.Join(root, "greeting.go")
+	if err := os.WriteFile(codePath, []byte(testSourceFile), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mustRunCLI(t, "-C", root, "--json", "add", codePath)
+
+	output = mustRunCLI(t, "-C", root, "--json", "search", "--filter", "type=code", "parse greeting message")
+	if err := json.Unmarshal([]byte(output), &searched); err != nil {
+		t.Fatal(err)
+	}
+	if len(searched.Results) == 0 || !strings.Contains(searched.Results[0].Source, "greeting.go") {
+		t.Fatalf("expected a type=code hit on greeting.go, got: %+v", searched.Results)
+	}
+
+	output = mustRunCLI(t, "-C", root, "--json", "search", "--filter", "language=go", "parse greeting message")
+	if err := json.Unmarshal([]byte(output), &searched); err != nil {
+		t.Fatal(err)
+	}
+	if len(searched.Results) == 0 || !strings.Contains(searched.Results[0].Source, "greeting.go") {
+		t.Fatalf("expected a language=go hit on greeting.go, got: %+v", searched.Results)
+	}
+
+	// documentation-only filter must exclude the code file
+	output = mustRunCLI(t, "-C", root, "--json", "search", "--filter", "type!=code", "parse greeting message")
+	if err := json.Unmarshal([]byte(output), &searched); err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range searched.Results {
+		if strings.Contains(result.Source, "greeting.go") {
+			t.Errorf("type!=code returned the code file: %+v", result)
+		}
 	}
 }
 

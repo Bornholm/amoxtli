@@ -1,4 +1,4 @@
-package cli
+package filterexpr
 
 import (
 	"strconv"
@@ -8,10 +8,10 @@ import (
 	"github.com/pkg/errors"
 )
 
-// parseScalar interprets a raw flag value as bool, then number, then string,
+// ParseScalar interprets a raw flag value as bool, then number, then string,
 // so that "amoxtli add --meta year=2024" and "amoxtli search --filter
 // year>2020" agree on the stored type.
-func parseScalar(raw string) any {
+func ParseScalar(raw string) any {
 	if b, err := strconv.ParseBool(raw); err == nil {
 		return b
 	}
@@ -23,8 +23,8 @@ func parseScalar(raw string) any {
 	return raw
 }
 
-// parseMetadata parses repeated key=value flags into a metadata map.
-func parseMetadata(pairs []string) (map[string]any, error) {
+// ParseMetadata parses repeated key=value flags into a metadata map.
+func ParseMetadata(pairs []string) (map[string]any, error) {
 	if len(pairs) == 0 {
 		return nil, nil
 	}
@@ -37,7 +37,7 @@ func parseMetadata(pairs []string) (map[string]any, error) {
 			return nil, errors.Errorf("invalid metadata %q (expected key=value)", pair)
 		}
 
-		metadata[key] = parseScalar(value)
+		metadata[key] = ParseScalar(value)
 	}
 
 	return metadata, nil
@@ -57,9 +57,9 @@ var filterOperators = []struct {
 	{token: "<", build: func(k string, v any) index.Condition { return index.Lt(k, v) }},
 }
 
-// parseFilters parses repeated key<op>value flags (=, !=, >, >=, <, <=) into
+// ParseFilters parses repeated key<op>value flags (=, !=, >, >=, <, <=) into
 // metadata filter conditions.
-func parseFilters(exprs []string) ([]index.Condition, error) {
+func ParseFilters(exprs []string) ([]index.Condition, error) {
 	conditions := make([]index.Condition, 0, len(exprs))
 
 	for _, expr := range exprs {
@@ -71,7 +71,7 @@ func parseFilters(exprs []string) ([]index.Condition, error) {
 				continue
 			}
 
-			conditions = append(conditions, op.build(key, parseScalar(value)))
+			conditions = append(conditions, op.build(key, ParseScalar(value)))
 			matched = true
 
 			break

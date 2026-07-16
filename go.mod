@@ -18,6 +18,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.3.0
 	github.com/ncruces/go-sqlite3 v0.23.0
 	github.com/ncruces/go-sqlite3/gormlite v0.20.3
+	github.com/odvcencio/gotreesitter v0.38.0
 	github.com/pkg/errors v0.9.1
 	github.com/rs/xid v1.6.0
 	github.com/spf13/cobra v1.10.2

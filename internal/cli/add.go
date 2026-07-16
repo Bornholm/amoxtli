@@ -11,6 +11,7 @@ import (
 
 	"github.com/bornholm/amoxtli"
 	"github.com/bornholm/amoxtli/internal/cli/runtime"
+	"github.com/bornholm/amoxtli/internal/filterexpr"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/task"
 	"github.com/pkg/errors"
@@ -40,7 +41,7 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
-			metadata, err := parseMetadata(metaPairs)
+			metadata, err := filterexpr.ParseMetadata(metaPairs)
 			if err != nil {
 				return err
 			}

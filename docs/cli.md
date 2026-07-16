@@ -62,6 +62,25 @@ Le convertisseur `genai` utilise un DSN d'extraction distinct du client chat :
 `mistral://?apiKey=${MISTRAL_API_KEY}` ou `marker://host:port`. Ses extensions
 sont prioritaires sur pandoc/libreoffice en cas de recouvrement.
 
+### Code source
+
+L'indexation de code source est active par défaut (`indexing.code.enabled:
+auto`, tree-sitter en pur Go, aucun outil externe). Les fichiers `.go`, `.js
+.mjs .cjs .jsx`, `.ts .mts .cts`, `.tsx`, `.py .pyi` et `.php` sont découpés en
+sections au niveau des déclarations (fonctions, méthodes, types/classes, avec
+leurs commentaires de documentation) et reçoivent automatiquement les
+métadonnées `type=code` et `language=<nom>`, filtrables à la recherche :
+
+```bash
+amoxtli add -c code $(git ls-files '*.go')     # indexer le code d'un dépôt
+amoxtli search "parse configuration" --filter language=go   # code Go seul
+amoxtli search "parse configuration" --filter "type!=code"  # documentation seule
+```
+
+La table `indexing.code.extensions` étend ou remplace le routage
+extension→langage (ex. `.phtml: php`). Langages intégrés : `go`, `javascript`,
+`typescript`, `tsx`, `python`, `php`.
+
 ## Commandes
 
 | Commande | Rôle |
@@ -96,7 +115,8 @@ amoxtli search --deep "comment fonctionne le grounding ?"   # nécessite llm.cha
 
 `amoxtli mcp` sert le protocole sur stdin/stdout ; **tous les diagnostics vont
 sur stderr**. Il expose quatre outils en lecture seule : `search` (contenu des
-sections inline, option `deep`), `fetch_sections`, `list_collections` et
+sections inline, options `deep` et `filters` — mêmes expressions que `--filter`,
+ex. `["type=code", "language=go"]`), `fetch_sections`, `list_collections` et
 `list_documents`.
 
 Exemple d'entrée dans la configuration d'un client MCP :

@@ -2,7 +2,7 @@
 
 > *Amoxtli* — « livre, codex » en nahuatl.
 
-Bibliothèque Go d'indexation documentaire multi-backend et d'ingestion de fichiers : recherche plein-texte ([bleve](https://github.com/blevesearch/bleve)), recherche vectorielle ([sqlite-vec](https://github.com/asg017/sqlite-vec)), recherche hybride PostgreSQL ([pgvector](https://github.com/pgvector/pgvector) + FTS natif), fusion des résultats par Reciprocal Rank Fusion (pondérée par index), découpage markdown en sections, conversion de fichiers (pandoc, LibreOffice, OCR/LLM), grounding (récupération vérifiée) et sauvegarde/restauration des index.
+Bibliothèque Go d'indexation documentaire multi-backend et d'ingestion de fichiers : recherche plein-texte ([bleve](https://github.com/blevesearch/bleve)), recherche vectorielle ([sqlite-vec](https://github.com/asg017/sqlite-vec)), recherche hybride PostgreSQL ([pgvector](https://github.com/pgvector/pgvector) + FTS natif), fusion des résultats par Reciprocal Rank Fusion (pondérée par index), découpage markdown en sections, indexation de code source par déclaration ([tree-sitter](https://github.com/tree-sitter/tree-sitter) en pur Go : Go, JS/TS, Python, PHP…), conversion de fichiers (pandoc, LibreOffice, OCR/LLM), grounding (récupération vérifiée) et sauvegarde/restauration des index.
 
 Extraite du projet [bornholm/corpus](https://github.com/Bornholm/corpus), dont elle constitue le cœur, mais indépendante de celui-ci.
 
@@ -54,7 +54,7 @@ taskID, _ := codex.IndexFile(ctx, collID, "guide.md", file)
 results, _ := codex.Search(ctx, "comment faire…", amoxtli.WithSearchMaxResults(5))
 ```
 
-Exemples complets et exécutables : [`example/sqlite`](example/sqlite/main.go) (SQLite + bleve, sans LLM), [`example/postgres`](example/postgres/main.go) (tout PostgreSQL) et [`example/convert`](example/convert/main.go) (conversion de fichier + suivi de tâche).
+Exemples complets et exécutables : [`example/sqlite`](example/sqlite/main.go) (SQLite + bleve, sans LLM), [`example/postgres`](example/postgres/main.go) (tout PostgreSQL), [`example/convert`](example/convert/main.go) (conversion de fichier + suivi de tâche) et [`example/sourcecode`](example/sourcecode/main.go) (indexation de code + recherche croisée doc ↔ code).
 
 ## Ligne de commande
 
@@ -63,8 +63,10 @@ Le binaire [`cmd/amoxtli`](cmd/amoxtli) expose la bibliothèque sous forme d'out
 ```bash
 go install github.com/bornholm/amoxtli/cmd/amoxtli@latest   # ou : make build
 amoxtli init
-amoxtli add ./docs/*.md
-amoxtli search "modèle de concurrence"
+amoxtli add ./docs/*.md                              # documentation
+amoxtli add $(git ls-files '*.go')                   # code source (type=code, language=go)
+amoxtli search "modèle de concurrence"               # doc ET code
+amoxtli search "modèle de concurrence" --filter "type!=code"   # documentation seule
 amoxtli mcp   # serveur Model Context Protocol (stdio)
 ```
 
@@ -77,6 +79,7 @@ Voir [docs/cli.md](docs/cli.md) pour la configuration (`config.yaml`, interpolat
 - [Grounding (récupération vérifiée)](docs/grounding.md) — `CheckGrounding`, `SearchIterative`, décomposition et re-retrieval itératif
 - [Backend PostgreSQL](docs/postgres.md) — déploiement entièrement PostgreSQL (FTS + pgvector, fusion RRF)
 - [Convertisseurs de fichiers](docs/converters.md) — pandoc, LibreOffice, OCR/LLM
+- [Indexation de code source](docs/source-code.md) — tree-sitter pur Go, `WithSourceCode`, recherche croisée doc ↔ code, build tags
 - [Tests](docs/testing.md) — tests unitaires et d'intégration (Docker, Ollama, PostgreSQL)
 - [Évaluation de la pertinence](docs/evaluation.md) — Recall@k / MRR / nDCG@k, benchmark multilingue sur jeux QA Hugging Face
 - [Stabilité de l'API](docs/stability.md) — politique de compatibilité (série `0.x`) et surface publique couverte

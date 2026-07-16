@@ -6,6 +6,7 @@ import (
 	"github.com/bornholm/amoxtli"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/ingest"
+	"github.com/bornholm/amoxtli/internal/filterexpr"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/pkg/errors"
@@ -18,6 +19,7 @@ type searchInput struct {
 	MaxResults  int      `json:"max_results,omitempty" jsonschema:"maximum number of results (default 5)"`
 	Collections []string `json:"collections,omitempty" jsonschema:"restrict to these collection labels or IDs"`
 	Deep        bool     `json:"deep,omitempty" jsonschema:"run iterative LLM-driven retrieval (requires a configured chat model)"`
+	Filters     []string `json:"filters,omitempty" jsonschema:"metadata filter expressions (key=value, key!=value, key>=value...), e.g. type=code, language=go, or type!=code for documentation only"`
 }
 
 type sectionResult struct {
@@ -84,7 +86,7 @@ type documentHeader struct {
 func (s *Server) registerTools(hasChat, groundingEnabled bool) {
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name:        "search",
-		Description: "Search the local document corpus. Returns matching documents with their most relevant sections inline.",
+		Description: "Search the local document corpus. Returns matching documents with their most relevant sections inline. Indexed source code carries type=code and language=<name> metadata: use filters like [\"type=code\"] to search code only, or [\"type!=code\"] for documentation only.",
 	}, s.handleSearch(hasChat, groundingEnabled))
 
 	mcp.AddTool(s.mcp, &mcp.Tool{
@@ -125,6 +127,15 @@ func (s *Server) handleSearch(hasChat, groundingEnabled bool) mcp.ToolHandlerFor
 		opts := []amoxtli.SearchOption{amoxtli.WithSearchMaxResults(maxResults)}
 		if len(collections) > 0 {
 			opts = append(opts, amoxtli.WithSearchCollections(collections...))
+		}
+
+		if len(in.Filters) > 0 {
+			conditions, err := filterexpr.ParseFilters(in.Filters)
+			if err != nil {
+				return nil, searchOutput{}, err
+			}
+
+			opts = append(opts, amoxtli.WithSearchFilter(conditions...))
 		}
 
 		out := searchOutput{}

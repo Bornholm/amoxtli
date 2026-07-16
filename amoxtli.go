@@ -162,6 +162,9 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	if opts.fileConverter != nil {
 		managerOpts = append(managerOpts, ingest.WithManagerFileConverter(opts.fileConverter))
 	}
+	if opts.sourceCode != nil {
+		managerOpts = append(managerOpts, ingest.WithManagerSourceCode(opts.sourceCode))
+	}
 	if opts.reranking && opts.llmClient != nil {
 		managerOpts = append(managerOpts,
 			ingest.WithManagerReranker(retrieval.NewLLMReranker(opts.llmClient, store, opts.maxTotalWords)),

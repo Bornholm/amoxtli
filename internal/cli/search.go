@@ -7,6 +7,7 @@ import (
 	"github.com/bornholm/amoxtli"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/internal/cli/runtime"
+	"github.com/bornholm/amoxtli/internal/filterexpr"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/pkg/errors"
@@ -50,7 +51,7 @@ func newSearchCommand(opts *rootOptions) *cobra.Command {
 			ctx := cmd.Context()
 			query := args[0]
 
-			conditions, err := parseFilters(filters)
+			conditions, err := filterexpr.ParseFilters(filters)
 			if err != nil {
 				return err
 			}
