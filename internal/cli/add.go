@@ -13,6 +13,7 @@ import (
 	"github.com/bornholm/amoxtli"
 	"github.com/bornholm/amoxtli/internal/cli/runtime"
 	"github.com/bornholm/amoxtli/internal/filterexpr"
+	"github.com/bornholm/amoxtli/internal/ignore"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/task"
 	"github.com/pkg/errors"
@@ -32,6 +33,7 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 		collection string
 		metaPairs  []string
 		noWait     bool
+		noIgnore   bool
 		timeout    time.Duration
 	)
 
@@ -65,11 +67,24 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 
 			supported := rt.Codex.Manager().SupportedExtensions()
 
+			// .amoxtlignore rules are anchored at the workspace root and applied
+			// to every explicit file argument unless --no-ignore is set.
+			var ign *ignore.Matcher
+			if !noIgnore {
+				ign = ignore.New(ws.Root)
+			}
+
 			// Phase 1: schedule every file up front so the task runner can index
 			// them concurrently (up to indexing.task_parallelism) instead of one
 			// at a time. Scheduling is non-blocking; the waiting happens below.
 			scheduled := make([]scheduledFile, len(args))
 			for i, path := range args {
+				if ign != nil {
+					if ok, src, err := ign.Ignored(path); err == nil && ok {
+						scheduled[i] = ignoredFile(path, src)
+						continue
+					}
+				}
 				scheduled[i] = scheduleFile(cmd, rt, collID, path, supported, metadata)
 			}
 
@@ -81,7 +96,9 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 
 			for i := range scheduled {
 				result := resolveScheduled(ctx, rt, &scheduled[i], !noWait, timeout)
-				if result.Status != string(task.StatusSucceeded) && (!noWait || result.Status != string(task.StatusPending)) {
+				if result.Status != string(task.StatusSucceeded) &&
+					result.Status != statusIgnored &&
+					(!noWait || result.Status != string(task.StatusPending)) {
 					failures++
 				}
 
@@ -114,6 +131,7 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 	flags.StringVarP(&collection, "collection", "c", "default", "target collection (label or ID, created if missing)")
 	flags.StringArrayVar(&metaPairs, "meta", nil, "attach metadata to the documents (key=value, repeatable)")
 	flags.BoolVar(&noWait, "no-wait", false, "schedule indexing without waiting for completion")
+	flags.BoolVar(&noIgnore, "no-ignore", false, "index files even if they match a .amoxtlignore rule")
 	flags.DurationVar(&timeout, "timeout", 5*time.Minute, "maximum time to wait per file (0 = no timeout)")
 
 	return cmd
@@ -127,6 +145,24 @@ type scheduledFile struct {
 	result  addResult
 	taskID  task.ID
 	started time.Time
+}
+
+// statusIgnored marks a file skipped because it matched a .amoxtlignore rule.
+// It is a terminal, non-failing status: excluded from the failure tally.
+const statusIgnored = "ignored"
+
+// ignoredFile builds a terminal scheduledFile for a path excluded by a
+// .amoxtlignore rule. Like an early scheduling failure it carries no taskID, so
+// resolveScheduled passes it through unchanged; source is the matching
+// .amoxtlignore, surfaced to the user as the result "error" line.
+func ignoredFile(path, source string) scheduledFile {
+	return scheduledFile{
+		result: addResult{
+			File:   path,
+			Status: statusIgnored,
+			Error:  source,
+		},
+	}
 }
 
 // scheduleFile validates a path and schedules its indexing task without waiting

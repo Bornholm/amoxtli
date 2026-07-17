@@ -15,6 +15,7 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 	github.com/dustin/go-humanize v1.0.1
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/moby/patternmatcher v0.6.0
 	github.com/modelcontextprotocol/go-sdk v1.3.0
 	github.com/ncruces/go-sqlite3 v0.23.0
 	github.com/ncruces/go-sqlite3/gormlite v0.20.3
@@ -98,7 +99,6 @@ require (
 	github.com/magiconair/properties v1.8.10 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
-	github.com/moby/patternmatcher v0.6.0 // indirect
 	github.com/moby/sys/sequential v0.5.0 // indirect
 	github.com/moby/sys/user v0.1.0 // indirect
 	github.com/moby/sys/userns v0.1.0 // indirect

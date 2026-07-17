@@ -86,7 +86,7 @@ extension→langage (ex. `.phtml: php`). Langages intégrés : `go`, `javascript
 | Commande | Rôle |
 |----------|------|
 | `init [--force]` | Initialise l'espace de travail |
-| `add <fichier>... [-c collection] [--meta k=v] [--no-wait] [--timeout d]` | Indexe des fichiers |
+| `add <fichier>... [-c collection] [--meta k=v] [--no-wait] [--no-ignore] [--timeout d]` | Indexe des fichiers |
 | `search <requête> [-n N] [-c coll] [--filter k=v] [--cursor c] [--deep] [--no-content]` | Recherche (—`--deep` = itérative LLM) |
 | `doc list\|show\|delete` | Inspecte et supprime des documents (suppression par lot via filtres) |
 | `collection create\|list\|show\|rename\|describe\|stats\|delete` | Gère les collections |
@@ -101,6 +101,31 @@ Options globales : `--json` (sortie machine), `-C <dir>`, `--config <fichier>`,
 Les filtres de métadonnées de `search --filter` et `doc` acceptent les
 opérateurs `=`, `!=`, `>`, `>=`, `<`, `<=` (ex. `--filter year>=2020`). Les
 valeurs sont typées automatiquement (booléen, nombre, sinon chaîne).
+
+### Ignorer des fichiers (`.amoxtlignore`)
+
+`add` écarte les fichiers correspondant à un fichier `.amoxtlignore`, sur le
+modèle de `.gitignore`. Les fichiers écartés apparaissent avec le statut
+`ignored` (ce n'est pas une erreur, ils ne comptent pas comme des échecs).
+
+- **Emplacement** : un `.amoxtlignore` par répertoire, appliqués en cascade
+  depuis la racine de l'espace de travail (le dossier contenant `.amoxtli`)
+  jusqu'au répertoire du fichier considéré.
+- **Syntaxe** : façon gitignore — un pattern sans `/` (ex. `*.log`, `build/`)
+  s'applique à n'importe quelle profondeur ; un pattern contenant un `/` est
+  ancré au répertoire du `.amoxtlignore` ; `#` introduit un commentaire ; `!`
+  ré-inclut un fichier.
+- **Limitation** : une négation `!` ne peut ré-inclure que dans le même
+  `.amoxtlignore` ; elle ne peut pas annuler une règle héritée d'un répertoire
+  parent.
+- `--no-ignore` indexe les fichiers même s'ils correspondent à une règle.
+
+```gitignore
+# .amoxtlignore
+*.log
+build/
+!important.log
+```
 
 ### Exemple
 
