@@ -42,6 +42,29 @@ archives:
       - README.md
       - docs/cli.md
 
+nfpms:
+  - id: amoxtli
+    package_name: amoxtli
+    # deb -> Debian/Ubuntu, archlinux -> paquet .pkg.tar.zst installable
+    # avec pacman (Arch/Manjaro). nfpm construit les deux depuis la meme
+    # source, aucun toolchain natif requis (CGO_ENABLED=0).
+    formats:
+      - deb
+      - archlinux
+    vendor: bornholm
+    homepage: https://github.com/bornholm/amoxtli
+    maintainer: William Petit <will.arcanadelirium@gmail.com>
+    description: Amoxtli - indexation et recherche de documents et de code source.
+    license: MIT
+    bindir: /usr/bin
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/amoxtli/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/amoxtli/README.md
+      - src: docs/cli.md
+        dst: /usr/share/doc/amoxtli/cli.md
+
 checksum:
   name_template: "checksums.txt"
 
