@@ -50,6 +50,13 @@ type VectorIndexConfig struct {
 	Weight     float64 `yaml:"weight"`
 	VectorSize int     `yaml:"vector_size"`
 	MaxWords   int     `yaml:"max_words"`
+	// EmbeddingsConcurrency bounds how many embedding batches are computed in
+	// parallel for a single document. It is the main lever for large-file
+	// indexing latency (one big file is a single task, so cross-file parallelism
+	// does not help it). Raise it if your embeddings endpoint tolerates more
+	// concurrent requests; lower it to avoid rate limiting (429). 0 defers to the
+	// library default.
+	EmbeddingsConcurrency int `yaml:"embeddings_concurrency"`
 }
 
 type LLMConfig struct {

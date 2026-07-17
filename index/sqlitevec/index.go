@@ -17,16 +17,18 @@ import (
 	"github.com/bornholm/genai/llm"
 	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 
 	sqlite_vec "github.com/bornholm/amoxtli/index/sqlitevec/internal/vec"
 )
 
 type Index struct {
-	maxWords   int
-	vectorSize int
-	getConn    func(ctx context.Context) (*sqlite3.Conn, error)
-	llm        llm.Client
-	model      string
+	maxWords              int
+	vectorSize            int
+	embeddingsConcurrency int
+	getConn               func(ctx context.Context) (*sqlite3.Conn, error)
+	llm                   llm.Client
+	model                 string
 	// rwLock allows concurrent Search operations while serializing Index/Delete
 	rwLock sync.RWMutex
 }
@@ -34,6 +36,13 @@ type Index struct {
 // DefaultMaxWords bounds, by default, the number of words per chunk sent to the
 // embeddings model.
 const DefaultMaxWords int = 500
+
+// DefaultEmbeddingsConcurrency bounds, by default, how many embedding batches
+// are computed in parallel for a single document. 8 gives most of the speedup
+// on large documents while staying modest enough to avoid overwhelming the
+// embeddings endpoint (rate limiting / 429s); lower it via config for stricter
+// endpoints.
+const DefaultEmbeddingsConcurrency int = 8
 
 // Options configures a sqlite-vec Index.
 type Options struct {
@@ -47,6 +56,12 @@ type Options struct {
 	VectorSize int
 	// MaxWords bounds the size of the chunks sent to the embeddings model.
 	MaxWords int
+	// EmbeddingsConcurrency bounds how many embedding batches are computed in
+	// parallel for a single document. Large documents split into many batches;
+	// computing them concurrently cuts indexing latency at the cost of more
+	// simultaneous requests to the embeddings endpoint. Defaults to
+	// DefaultEmbeddingsConcurrency when <= 0.
+	EmbeddingsConcurrency int
 }
 
 type OptionFunc func(opts *Options)
@@ -72,10 +87,19 @@ func WithMaxWords(maxWords int) OptionFunc {
 	}
 }
 
+// WithEmbeddingsConcurrency bounds how many embedding batches are computed in
+// parallel for a single document (see Options.EmbeddingsConcurrency).
+func WithEmbeddingsConcurrency(n int) OptionFunc {
+	return func(opts *Options) {
+		opts.EmbeddingsConcurrency = n
+	}
+}
+
 func NewOptions(funcs ...OptionFunc) *Options {
 	opts := &Options{
-		VectorSize: DefaultVectorSize,
-		MaxWords:   DefaultMaxWords,
+		VectorSize:            DefaultVectorSize,
+		MaxWords:              DefaultMaxWords,
+		EmbeddingsConcurrency: DefaultEmbeddingsConcurrency,
 	}
 	for _, fn := range funcs {
 		fn(opts)
@@ -466,39 +490,26 @@ func (i *Index) collectChunks(document model.Document) ([]*indexableChunk, error
 func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk) ([][]byte, error) {
 	vectors := make([][]byte, len(chunks))
 
+	// First, partition the chunks into batches bounded by item count and token
+	// budget (same policy as before, just materialized up front).
+	type embeddingsBatch struct {
+		idx   []int
+		texts []string
+	}
+
 	var (
+		batches     []embeddingsBatch
 		batchIdx    []int
 		batchTexts  []string
 		batchTokens int
 	)
 
-	flush := func() error {
+	seal := func() {
 		if len(batchTexts) == 0 {
-			return nil
+			return
 		}
-
-		res, err := i.llm.Embeddings(ctx, batchTexts)
-		if err != nil {
-			return errors.Wrap(err, "generation failed")
-		}
-
-		embeddings := res.Embeddings()
-		if len(embeddings) != len(batchTexts) {
-			return errors.New("vector count mismatch")
-		}
-
-		for j, chunkIdx := range batchIdx {
-			blob, err := sqlite_vec.SerializeFloat32(toFloat32(embeddings[j]))
-			if err != nil {
-				return errors.WithStack(err)
-			}
-			vectors[chunkIdx] = blob
-		}
-
-		batchIdx = batchIdx[:0]
-		batchTexts = batchTexts[:0]
-		batchTokens = 0
-		return nil
+		batches = append(batches, embeddingsBatch{idx: batchIdx, texts: batchTexts})
+		batchIdx, batchTexts, batchTokens = nil, nil, 0
 	}
 
 	for idx, chunk := range chunks {
@@ -508,17 +519,58 @@ func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk)
 			(batchTokens+tokenEst >= targetBatchTokens)
 
 		if isBatchFull {
-			if err := flush(); err != nil {
-				return nil, errors.WithStack(err)
-			}
+			seal()
 		}
 
 		batchIdx = append(batchIdx, idx)
 		batchTexts = append(batchTexts, chunk.Text)
 		batchTokens += tokenEst
 	}
+	seal()
 
-	if err := flush(); err != nil {
+	if len(batches) == 0 {
+		return vectors, nil
+	}
+
+	// Compute the batches concurrently: the embedding round-trips dominate
+	// indexing time for large documents (many batches), and parallelizing across
+	// files does not help a single big file — it is one task. Each batch writes
+	// to disjoint indices of vectors, so no synchronization is required on the
+	// result slice. errgroup cancels the remaining batches on the first error.
+	concurrency := i.embeddingsConcurrency
+	if concurrency <= 0 {
+		concurrency = DefaultEmbeddingsConcurrency
+	}
+	concurrency = min(concurrency, len(batches))
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+
+	for _, b := range batches {
+		g.Go(func() error {
+			res, err := i.llm.Embeddings(ctx, b.texts)
+			if err != nil {
+				return errors.Wrap(err, "generation failed")
+			}
+
+			embeddings := res.Embeddings()
+			if len(embeddings) != len(b.texts) {
+				return errors.New("vector count mismatch")
+			}
+
+			for j, chunkIdx := range b.idx {
+				blob, err := sqlite_vec.SerializeFloat32(toFloat32(embeddings[j]))
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				vectors[chunkIdx] = blob
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -785,11 +837,12 @@ func (i *Index) withRetry(ctx context.Context, fn func(ctx context.Context, conn
 func NewIndex(conn *sqlite3.Conn, client llm.Client, funcs ...OptionFunc) *Index {
 	opts := NewOptions(funcs...)
 	return &Index{
-		maxWords:   opts.MaxWords,
-		vectorSize: opts.VectorSize,
-		llm:        client,
-		model:      opts.EmbeddingsModel,
-		getConn:    createGetConn(conn, opts.EmbeddingsModel, opts.VectorSize),
+		maxWords:              opts.MaxWords,
+		vectorSize:            opts.VectorSize,
+		embeddingsConcurrency: opts.EmbeddingsConcurrency,
+		llm:                   client,
+		model:                 opts.EmbeddingsModel,
+		getConn:               createGetConn(conn, opts.EmbeddingsModel, opts.VectorSize),
 	}
 }
 

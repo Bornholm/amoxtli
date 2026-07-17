@@ -29,6 +29,10 @@ index:
     # 0 defers to the library defaults.
     vector_size: 0
     max_words: 0
+    # Number of embedding batches computed in parallel per document. Main lever
+    # for large-file indexing speed. Raise if your embeddings endpoint tolerates
+    # more concurrency; lower to avoid rate limiting (429). 0 = default (8).
+    embeddings_concurrency: 0
 
 # LLM clients (optional). Supported providers: openai, openrouter, mistral.
 # "openai" also covers any OpenAI-compatible endpoint (Ollama, vLLM...) via

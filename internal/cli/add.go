@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
@@ -64,11 +65,22 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 
 			supported := rt.Codex.Manager().SupportedExtensions()
 
+			// Phase 1: schedule every file up front so the task runner can index
+			// them concurrently (up to indexing.task_parallelism) instead of one
+			// at a time. Scheduling is non-blocking; the waiting happens below.
+			scheduled := make([]scheduledFile, len(args))
+			for i, path := range args {
+				scheduled[i] = scheduleFile(cmd, rt, collID, path, supported, metadata)
+			}
+
+			// Phase 2: resolve results in input order. Because the tasks are
+			// already running in parallel, waiting sequentially still streams the
+			// output in order while overall wall time tracks the slowest wave.
 			results := make([]addResult, 0, len(args))
 			failures := 0
 
-			for _, path := range args {
-				result := addFile(cmd, rt, collID, path, supported, metadata, !noWait, timeout)
+			for i := range scheduled {
+				result := resolveScheduled(ctx, rt, &scheduled[i], !noWait, timeout)
 				if result.Status != string(task.StatusSucceeded) && (!noWait || result.Status != string(task.StatusPending)) {
 					failures++
 				}
@@ -107,17 +119,29 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 	return cmd
 }
 
-func addFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.CollectionID, path string, supported []string, metadata map[string]any, wait bool, timeout time.Duration) addResult {
-	started := time.Now()
+// scheduledFile carries the outcome of scheduling a single file for indexing:
+// either an early failure (taskID empty, result already terminal) or a queued
+// task to wait on. It is produced by scheduleFile and consumed by
+// resolveScheduled.
+type scheduledFile struct {
+	result  addResult
+	taskID  task.ID
+	started time.Time
+}
 
-	result := addResult{File: path}
+// scheduleFile validates a path and schedules its indexing task without waiting
+// for completion, so a batch of files can be indexed concurrently by the task
+// runner. IndexFile copies the file synchronously before returning, so the
+// handle can be closed here even though indexing continues asynchronously.
+func scheduleFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.CollectionID, path string, supported []string, metadata map[string]any) scheduledFile {
+	sf := scheduledFile{started: time.Now(), result: addResult{File: path}}
 
-	fail := func(err error) addResult {
-		result.Status = string(task.StatusFailed)
-		result.Error = err.Error()
-		result.Duration = float64(time.Since(started).Milliseconds())
+	fail := func(err error) scheduledFile {
+		sf.result.Status = string(task.StatusFailed)
+		sf.result.Error = err.Error()
+		sf.result.Duration = float64(time.Since(sf.started).Milliseconds())
 
-		return result
+		return sf
 	}
 
 	abs, err := filepath.Abs(path)
@@ -156,32 +180,48 @@ func addFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.CollectionID,
 		indexOpts = append(indexOpts, amoxtli.WithIndexFileMetadata(metadata))
 	}
 
-	ctx := cmd.Context()
-
-	taskID, err := rt.Codex.IndexFile(ctx, collID, filepath.Base(abs), file, indexOpts...)
+	taskID, err := rt.Codex.IndexFile(cmd.Context(), collID, filepath.Base(abs), file, indexOpts...)
 	if err != nil {
 		return fail(err)
 	}
 
-	result.TaskID = string(taskID)
+	sf.taskID = taskID
+	sf.result.TaskID = string(taskID)
+
+	return sf
+}
+
+// resolveScheduled turns a scheduled file into its final result: an early
+// scheduling failure passes through unchanged, --no-wait reports the pending
+// task, otherwise it blocks on the task's completion. The elapsed duration is
+// measured from scheduling time.
+func resolveScheduled(ctx context.Context, rt *runtime.Runtime, sf *scheduledFile, wait bool, timeout time.Duration) addResult {
+	if sf.taskID == "" {
+		// Scheduling failed early; result is already terminal.
+		return sf.result
+	}
 
 	if !wait {
-		result.Status = string(task.StatusPending)
-		result.Duration = float64(time.Since(started).Milliseconds())
+		sf.result.Status = string(task.StatusPending)
+		sf.result.Duration = float64(time.Since(sf.started).Milliseconds())
 
-		return result
+		return sf.result
 	}
 
-	state, err := waitTask(ctx, rt.Codex, taskID, timeout, nil)
+	state, err := waitTask(ctx, rt.Codex, sf.taskID, timeout, nil)
 	if err != nil {
-		return fail(err)
+		sf.result.Status = string(task.StatusFailed)
+		sf.result.Error = err.Error()
+		sf.result.Duration = float64(time.Since(sf.started).Milliseconds())
+
+		return sf.result
 	}
 
-	result.Status = string(state.Status)
+	sf.result.Status = string(state.Status)
 	if state.Error != nil {
-		result.Error = state.Error.Error()
+		sf.result.Error = state.Error.Error()
 	}
-	result.Duration = float64(time.Since(started).Milliseconds())
+	sf.result.Duration = float64(time.Since(sf.started).Milliseconds())
 
-	return result
+	return sf.result
 }

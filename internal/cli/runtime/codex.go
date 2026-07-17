@@ -99,6 +99,9 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 		if cfg.Index.Vector.MaxWords > 0 {
 			vecOpts = append(vecOpts, sqlitevecIndex.WithMaxWords(cfg.Index.Vector.MaxWords))
 		}
+		if cfg.Index.Vector.EmbeddingsConcurrency > 0 {
+			vecOpts = append(vecOpts, sqlitevecIndex.WithEmbeddingsConcurrency(cfg.Index.Vector.EmbeddingsConcurrency))
+		}
 
 		indexers = append(indexers, amoxtli.Indexer{
 			ID:     "vector",
