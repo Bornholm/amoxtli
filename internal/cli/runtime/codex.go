@@ -67,6 +67,15 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 		return nil, err
 	}
 
+	// Both the gorm SQLite store and the sqlite-vec index hand a WASM build to
+	// ncruces/go-sqlite3, and the first connection opened locks in the build for
+	// the whole process. Force the vec0-enabled one here, before openStore opens
+	// any SQLite connection — otherwise the store's vanilla build wins and vec0
+	// virtual tables fail with "no such module: vec0".
+	if cfg.VectorEnabled() {
+		sqlitevecIndex.EnsureVecWASM()
+	}
+
 	store, err := openStore(ctx, ws, cfg)
 	if err != nil {
 		return nil, err
@@ -204,13 +213,8 @@ func (rt *Runtime) openPostgresIndexer(ctx context.Context, cfg *config.Config, 
 // openLocalIndexers wires the file-based bleve full-text and sqlite-vec vector
 // indexes.
 func (rt *Runtime) openLocalIndexers(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, client llm.Client) ([]amoxtli.Indexer, error) {
-	// Both the gorm store and the sqlite-vec index hand a WASM build to
-	// ncruces/go-sqlite3; force the vec0-enabled one before any connection
-	// opens.
-	if cfg.VectorEnabled() {
-		sqlitevecIndex.EnsureVecWASM()
-	}
-
+	// EnsureVecWASM is called in Open, before the store's first connection; by
+	// the time we reach here the vec0-enabled build is already locked in.
 	var indexers []amoxtli.Indexer
 
 	if cfg.Index.Fulltext.Enabled {
