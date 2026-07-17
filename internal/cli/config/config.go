@@ -24,16 +24,46 @@ type Config struct {
 }
 
 type StoreConfig struct {
-	// Driver selects the document store backend; only "sqlite" is supported
-	// for now ("postgres" is planned).
+	// Driver selects the document store backend: "sqlite" (file-based) or
+	// "postgres" (client-server, for a shared/concurrent deployment).
 	Driver string `yaml:"driver"`
-	// DSN is the store location, relative to the .amoxtli directory.
+	// DSN is the store location. For sqlite it is a path relative to the
+	// .amoxtli directory; for postgres it is a connection string
+	// (postgres://user:pass@host:5432/db?sslmode=disable).
 	DSN string `yaml:"dsn"`
 }
 
 type IndexConfig struct {
+	// Driver selects the index backend. "local" (the default) uses the
+	// file-based bleve full-text index and the sqlite-vec vector index,
+	// configured through the fulltext/vector sections below. "postgres" uses a
+	// single hybrid PostgreSQL index (native full-text + pgvector), suitable
+	// for a shared deployment where several processes query the same database
+	// concurrently.
+	Driver   string              `yaml:"driver"`
 	Fulltext FulltextIndexConfig `yaml:"fulltext"`
 	Vector   VectorIndexConfig   `yaml:"vector"`
+	Postgres PostgresIndexConfig `yaml:"postgres"`
+}
+
+// PostgresIndexConfig configures the hybrid PostgreSQL index (index.driver:
+// postgres). The vector leg is active only when llm.embeddings is configured;
+// otherwise the index degrades to full-text search only.
+type PostgresIndexConfig struct {
+	// DSN is the PostgreSQL connection string. When empty it defaults to
+	// store.dsn (only valid when the store is also postgres), letting the index
+	// and the document store share a single database.
+	DSN    string  `yaml:"dsn"`
+	Weight float64 `yaml:"weight"`
+	// VectorSize is the pgvector column dimension; 0 defers to the library
+	// default.
+	VectorSize int `yaml:"vector_size"`
+	// MaxWords bounds the chunk size sent to the embeddings model; 0 defers to
+	// the library default.
+	MaxWords int `yaml:"max_words"`
+	// TextSearchConfig is the regconfig used when language detection is
+	// inconclusive; empty defers to the library default ("simple").
+	TextSearchConfig string `yaml:"text_search_config"`
 }
 
 type FulltextIndexConfig struct {
@@ -77,6 +107,13 @@ var SupportedProviders = []string{"openai", "openrouter", "mistral"}
 
 func isSupportedProvider(name string) bool {
 	return slices.Contains(SupportedProviders, name)
+}
+
+// looksLikePostgresDSN reports whether dsn is a PostgreSQL connection URL. It
+// guards against a postgres backend accidentally inheriting the default sqlite
+// path from Default().
+func looksLikePostgresDSN(dsn string) bool {
+	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")
 }
 
 type RetrievalConfig struct {
@@ -163,6 +200,7 @@ func Default() *Config {
 			DSN:    "data/store.sqlite",
 		},
 		Index: IndexConfig{
+			Driver: "local",
 			Fulltext: FulltextIndexConfig{
 				Enabled: true,
 				Path:    "data/index.bleve",
@@ -211,9 +249,40 @@ func (c *Config) HasEmbeddings() bool {
 }
 
 // VectorEnabled resolves the vector index toggle against the presence of an
-// embeddings client.
+// embeddings client. It only governs the local sqlite-vec index; the postgres
+// index manages its vector leg internally.
 func (c *Config) VectorEnabled() bool {
-	return c.Index.Vector.Enabled.Resolve(c.HasEmbeddings())
+	return c.IndexDriver() == "local" && c.Index.Vector.Enabled.Resolve(c.HasEmbeddings())
+}
+
+// IndexDriver returns the normalized index backend ("local" when unset).
+func (c *Config) IndexDriver() string {
+	if c.Index.Driver == "" {
+		return "local"
+	}
+	return c.Index.Driver
+}
+
+// PostgresIndexDSN returns the DSN the postgres index should connect to,
+// falling back to the store DSN when the index DSN is left empty and the store
+// is itself postgres.
+func (c *Config) PostgresIndexDSN() string {
+	if c.Index.Postgres.DSN != "" {
+		return c.Index.Postgres.DSN
+	}
+	if c.Store.Driver == "postgres" {
+		return c.Store.DSN
+	}
+	return ""
+}
+
+// HasLocalState reports whether the workspace opens any file-based backend
+// that a single process must hold exclusively (bleve, sqlite-vec or the sqlite
+// store). When false, the workspace is fully backed by a client-server
+// database and several processes may run against it concurrently, so the
+// exclusive workspace lock is skipped.
+func (c *Config) HasLocalState() bool {
+	return c.Store.Driver != "postgres" || c.IndexDriver() != "postgres"
 }
 
 // CodeEnabled resolves the source-code indexing toggle; it defaults to
@@ -232,17 +301,32 @@ func (c *Config) Validate() error {
 	switch c.Store.Driver {
 	case "sqlite":
 	case "postgres":
-		return errors.New("store driver \"postgres\" is not supported yet")
+		if !looksLikePostgresDSN(c.Store.DSN) {
+			return errors.New("store.dsn must be a postgres connection string (postgres://...) when store.driver is \"postgres\"")
+		}
 	default:
 		return errors.Errorf("unknown store driver %q", c.Store.Driver)
 	}
 
-	if !c.Index.Fulltext.Enabled && !c.VectorEnabled() {
-		return errors.New("no index enabled: enable index.fulltext or configure llm.embeddings")
-	}
+	switch c.IndexDriver() {
+	case "local":
+		if !c.Index.Fulltext.Enabled && !c.VectorEnabled() {
+			return errors.New("no index enabled: enable index.fulltext or configure llm.embeddings")
+		}
 
-	if c.Index.Vector.Enabled == ToggleTrue && !c.HasEmbeddings() {
-		return errors.New("index.vector.enabled is true but llm.embeddings is not configured")
+		if c.Index.Vector.Enabled == ToggleTrue && !c.HasEmbeddings() {
+			return errors.New("index.vector.enabled is true but llm.embeddings is not configured")
+		}
+	case "postgres":
+		dsn := c.PostgresIndexDSN()
+		if dsn == "" {
+			return errors.New("index.driver is \"postgres\" but no DSN is available: set index.postgres.dsn or use the postgres store driver")
+		}
+		if !looksLikePostgresDSN(dsn) {
+			return errors.New("index.postgres.dsn must be a postgres connection string (postgres://...)")
+		}
+	default:
+		return errors.Errorf("unknown index driver %q (expected \"local\" or \"postgres\")", c.Index.Driver)
 	}
 
 	if !c.HasChat() {

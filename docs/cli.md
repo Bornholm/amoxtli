@@ -138,20 +138,27 @@ amoxtli search --deep "comment fonctionne le grounding ?"   # nécessite llm.cha
 
 ## Serveur MCP
 
-`amoxtli mcp` sert le protocole sur stdin/stdout ; **tous les diagnostics vont
-sur stderr**. Il expose quatre outils en lecture seule : `search` (contenu des
+Le serveur MCP expose quatre outils en lecture seule : `search` (contenu des
 sections inline, options `deep` et `filters` — mêmes expressions que `--filter`,
 ex. `["type=code", "language=go"]`), `fetch_sections`, `list_collections` et
-`list_documents`.
+`list_documents`. Deux transports sont disponibles :
 
-Exemple d'entrée dans la configuration d'un client MCP :
+- `amoxtli mcp stdio` (ou simplement `amoxtli mcp`) sert le protocole sur
+  stdin/stdout ; **tous les diagnostics vont sur stderr**. C'est le mode
+  « un processus par client », lancé par le client MCP lui-même.
+- `amoxtli mcp http --addr :8080` sert le transport HTTP streamable depuis un
+  **processus unique et durable** qui gère plusieurs sessions client
+  concurrentes. C'est la brique d'une utilisation mutualisée (front de chat
+  multi-utilisateurs).
+
+Exemple d'entrée dans la configuration d'un client MCP (transport stdio) :
 
 ```json
 {
   "mcpServers": {
     "amoxtli": {
       "command": "amoxtli",
-      "args": ["mcp"],
+      "args": ["mcp", "stdio"],
       "env": { "AMOXTLI_DIR": "/chemin/vers/mon-projet/.amoxtli" }
     }
   }
@@ -160,8 +167,28 @@ Exemple d'entrée dans la configuration d'un client MCP :
 
 ## Concurrence
 
-L'index bleve prend un verrou exclusif : **un seul processus amoxtli peut
-utiliser un espace de travail à la fois**. Un fichier de verrou
-(`.amoxtli/data/lock`) est pris par toute commande ouvrant l'index et produit un
-message clair si l'espace est déjà occupé (par exemple un `amoxtli mcp` en
-cours). Pour indexer pendant qu'un serveur MCP tourne, arrêtez-le d'abord.
+Les backends **par fichier** (bleve full-text, sqlite-vec, store sqlite) prennent
+un verrou exclusif : **un seul processus amoxtli peut utiliser un tel espace de
+travail à la fois**. Un fichier de verrou (`.amoxtli/data/lock`) est pris par
+toute commande ouvrant ces index et produit un message clair si l'espace est
+déjà occupé (par exemple un `amoxtli mcp` en cours). Pour indexer pendant qu'un
+serveur MCP tourne, arrêtez-le d'abord.
+
+Pour un déploiement **mutualisé** (plusieurs processus, ou un serveur
+`mcp http` partagé par plusieurs utilisateurs), basculez sur un backend
+client-serveur PostgreSQL :
+
+```yaml
+store:
+  driver: postgres
+  dsn: postgres://user:pass@host:5432/kb?sslmode=disable
+index:
+  driver: postgres   # index hybride full-text + pgvector
+```
+
+La base PostgreSQL doit disposer des extensions `vector` et `unaccent` (p. ex.
+image Docker `pgvector/pgvector`). Dans ce mode, aucun état exclusif n'est posé
+sur le disque : le verrou de workspace est ignoré et **plusieurs instances
+`amoxtli mcp http` peuvent servir la même base simultanément**. L'index et le
+store peuvent partager le même DSN (`index.postgres.dsn` par défaut = `store.dsn`
+lorsque le store est postgres).

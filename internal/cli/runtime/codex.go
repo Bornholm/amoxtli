@@ -10,6 +10,7 @@ import (
 
 	"github.com/bornholm/amoxtli"
 	bleveIndex "github.com/bornholm/amoxtli/index/bleve"
+	postgresIndex "github.com/bornholm/amoxtli/index/postgres"
 	sqlitevecIndex "github.com/bornholm/amoxtli/index/sqlitevec"
 	"github.com/bornholm/amoxtli/ingest"
 	gormStore "github.com/bornholm/amoxtli/ingest/gorm"
@@ -18,6 +19,7 @@ import (
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/genai/llm"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
 )
@@ -33,13 +35,22 @@ type Runtime struct {
 
 // Open acquires the workspace lock and wires the configuration into a Codex.
 // command names the caller in the lock file for diagnostics.
-func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, command string) (rt *Runtime, err error) {
-	lock, err := acquireLock(ws.LockPath(), command)
-	if err != nil {
-		return nil, err
-	}
+func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, command string) (_ *Runtime, err error) {
+	// rt is the runtime under construction; on any error the deferred cleanup
+	// releases whatever it already holds. It must not be the named return value
+	// (returning nil on error would otherwise nil it out before cleanup).
+	rt := &Runtime{}
 
-	rt = &Runtime{lock: lock}
+	// A client-server workspace (postgres store + index) has no exclusive
+	// on-disk state, so several processes may share it; the lock is only taken
+	// for file-based backends (bleve, sqlite-vec, sqlite store).
+	if cfg.HasLocalState() {
+		lock, err := acquireLock(ws.LockPath(), command)
+		if err != nil {
+			return nil, err
+		}
+		rt.lock = lock
+	}
 
 	defer func() {
 		if err != nil {
@@ -56,58 +67,16 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 		return nil, err
 	}
 
-	// Both the gorm store and the sqlite-vec index hand a WASM build to
-	// ncruces/go-sqlite3; force the vec0-enabled one before any connection
-	// opens.
-	if cfg.VectorEnabled() {
-		sqlitevecIndex.EnsureVecWASM()
-	}
-
-	store, err := gormStore.NewSQLiteStore(ws.Resolve(cfg.Store.DSN))
+	store, err := openStore(ctx, ws, cfg)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not open document store")
+		return nil, err
 	}
 
 	rt.Store = store
 
-	var indexers []amoxtli.Indexer
-
-	if cfg.Index.Fulltext.Enabled {
-		idx, err := bleveIndex.OpenOrCreate(ctx, ws.Resolve(cfg.Index.Fulltext.Path))
-		if err != nil {
-			return nil, errors.Wrap(err, "could not open full-text index")
-		}
-
-		rt.closers = append(rt.closers, idx)
-		indexers = append(indexers, amoxtli.Indexer{ID: "fulltext", Index: idx, Weight: cfg.Index.Fulltext.Weight})
-	}
-
-	if cfg.VectorEnabled() {
-		conn, err := sqlite3.Open(ws.Resolve(cfg.Index.Vector.Path))
-		if err != nil {
-			return nil, errors.Wrap(err, "could not open vector index")
-		}
-
-		rt.closers = append(rt.closers, conn)
-
-		vecOpts := []sqlitevecIndex.OptionFunc{
-			sqlitevecIndex.WithEmbeddingsModel(cfg.LLM.Embeddings.Model),
-		}
-		if cfg.Index.Vector.VectorSize > 0 {
-			vecOpts = append(vecOpts, sqlitevecIndex.WithVectorSize(cfg.Index.Vector.VectorSize))
-		}
-		if cfg.Index.Vector.MaxWords > 0 {
-			vecOpts = append(vecOpts, sqlitevecIndex.WithMaxWords(cfg.Index.Vector.MaxWords))
-		}
-		if cfg.Index.Vector.EmbeddingsConcurrency > 0 {
-			vecOpts = append(vecOpts, sqlitevecIndex.WithEmbeddingsConcurrency(cfg.Index.Vector.EmbeddingsConcurrency))
-		}
-
-		indexers = append(indexers, amoxtli.Indexer{
-			ID:     "vector",
-			Index:  sqlitevecIndex.NewIndex(conn, client, vecOpts...),
-			Weight: cfg.Index.Vector.Weight,
-		})
+	indexers, err := rt.openIndexers(ctx, ws, cfg, client)
+	if err != nil {
+		return nil, err
 	}
 
 	opts := []amoxtli.Option{
@@ -160,6 +129,137 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 	return rt, nil
 }
 
+// openStore opens the document store selected by cfg.Store.Driver.
+func openStore(ctx context.Context, ws *workspace.Workspace, cfg *config.Config) (*gormStore.Store, error) {
+	switch cfg.Store.Driver {
+	case "postgres":
+		store, err := gormStore.NewPostgresStore(ctx, cfg.Store.DSN)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not open document store")
+		}
+		return store, nil
+	default:
+		store, err := gormStore.NewSQLiteStore(ws.Resolve(cfg.Store.DSN))
+		if err != nil {
+			return nil, errors.Wrap(err, "could not open document store")
+		}
+		return store, nil
+	}
+}
+
+// openIndexers builds the index backends selected by cfg.Index.Driver,
+// registering their closers on rt. client may be nil (full-text-only mode).
+func (rt *Runtime) openIndexers(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, client llm.Client) ([]amoxtli.Indexer, error) {
+	if cfg.IndexDriver() == "postgres" {
+		return rt.openPostgresIndexer(ctx, cfg, client)
+	}
+
+	return rt.openLocalIndexers(ctx, ws, cfg, client)
+}
+
+// openPostgresIndexer wires the hybrid PostgreSQL index (full-text + pgvector).
+// The vector leg is active only when an embeddings client is configured.
+func (rt *Runtime) openPostgresIndexer(ctx context.Context, cfg *config.Config, client llm.Client) ([]amoxtli.Indexer, error) {
+	pool, err := pgxpool.New(ctx, cfg.PostgresIndexDSN())
+	if err != nil {
+		return nil, errors.Wrap(err, "could not open postgres index pool")
+	}
+
+	rt.closers = append(rt.closers, closerFunc(func() error {
+		pool.Close()
+		return nil
+	}))
+
+	var vecClient llm.Client
+	if cfg.HasEmbeddings() {
+		vecClient = client
+	}
+
+	pgOpts := []postgresIndex.OptionFunc{}
+	if cfg.HasEmbeddings() {
+		pgOpts = append(pgOpts, postgresIndex.WithEmbeddingsModel(cfg.LLM.Embeddings.Model))
+	}
+	if cfg.Index.Postgres.VectorSize > 0 {
+		pgOpts = append(pgOpts, postgresIndex.WithVectorSize(cfg.Index.Postgres.VectorSize))
+	}
+	if cfg.Index.Postgres.MaxWords > 0 {
+		pgOpts = append(pgOpts, postgresIndex.WithMaxWords(cfg.Index.Postgres.MaxWords))
+	}
+	if cfg.Index.Postgres.TextSearchConfig != "" {
+		pgOpts = append(pgOpts, postgresIndex.WithTextSearchConfig(cfg.Index.Postgres.TextSearchConfig))
+	}
+
+	weight := cfg.Index.Postgres.Weight
+	if weight == 0 {
+		weight = 1.0
+	}
+
+	return []amoxtli.Indexer{{
+		ID:     "postgres",
+		Index:  postgresIndex.NewIndex(pool, vecClient, pgOpts...),
+		Weight: weight,
+	}}, nil
+}
+
+// openLocalIndexers wires the file-based bleve full-text and sqlite-vec vector
+// indexes.
+func (rt *Runtime) openLocalIndexers(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, client llm.Client) ([]amoxtli.Indexer, error) {
+	// Both the gorm store and the sqlite-vec index hand a WASM build to
+	// ncruces/go-sqlite3; force the vec0-enabled one before any connection
+	// opens.
+	if cfg.VectorEnabled() {
+		sqlitevecIndex.EnsureVecWASM()
+	}
+
+	var indexers []amoxtli.Indexer
+
+	if cfg.Index.Fulltext.Enabled {
+		idx, err := bleveIndex.OpenOrCreate(ctx, ws.Resolve(cfg.Index.Fulltext.Path))
+		if err != nil {
+			return nil, errors.Wrap(err, "could not open full-text index")
+		}
+
+		rt.closers = append(rt.closers, idx)
+		indexers = append(indexers, amoxtli.Indexer{ID: "fulltext", Index: idx, Weight: cfg.Index.Fulltext.Weight})
+	}
+
+	if cfg.VectorEnabled() {
+		conn, err := sqlite3.Open(ws.Resolve(cfg.Index.Vector.Path))
+		if err != nil {
+			return nil, errors.Wrap(err, "could not open vector index")
+		}
+
+		rt.closers = append(rt.closers, conn)
+
+		vecOpts := []sqlitevecIndex.OptionFunc{
+			sqlitevecIndex.WithEmbeddingsModel(cfg.LLM.Embeddings.Model),
+		}
+		if cfg.Index.Vector.VectorSize > 0 {
+			vecOpts = append(vecOpts, sqlitevecIndex.WithVectorSize(cfg.Index.Vector.VectorSize))
+		}
+		if cfg.Index.Vector.MaxWords > 0 {
+			vecOpts = append(vecOpts, sqlitevecIndex.WithMaxWords(cfg.Index.Vector.MaxWords))
+		}
+		if cfg.Index.Vector.EmbeddingsConcurrency > 0 {
+			vecOpts = append(vecOpts, sqlitevecIndex.WithEmbeddingsConcurrency(cfg.Index.Vector.EmbeddingsConcurrency))
+		}
+
+		indexers = append(indexers, amoxtli.Indexer{
+			ID:     "vector",
+			Index:  sqlitevecIndex.NewIndex(conn, client, vecOpts...),
+			Weight: cfg.Index.Vector.Weight,
+		})
+	}
+
+	return indexers, nil
+}
+
+// closerFunc adapts a plain func to io.Closer (e.g. pgxpool.Pool.Close, which
+// returns no error).
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
 // retrievalOptions maps the llm and retrieval configuration sections to Codex
 // options. Without a chat client the LLM-driven pipeline stages are disabled
 // (the config validation already rejected combinations requiring one).
@@ -202,6 +302,10 @@ func retrievalOptions(cfg *config.Config, client llm.Client) []amoxtli.Option {
 // Close releases everything in reverse dependency order: the Codex first
 // (drains the task runner), then the indexes, the store and the lock.
 func (r *Runtime) Close() error {
+	if r == nil {
+		return nil
+	}
+
 	var firstErr error
 
 	keep := func(err error) {

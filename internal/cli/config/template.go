@@ -10,18 +10,24 @@ const Template = `# amoxtli workspace configuration.
 version: 1
 
 store:
-  # Only sqlite is supported for now; paths are relative to this directory.
+  # "sqlite" (file-based, dsn relative to this directory) or "postgres"
+  # (client-server, dsn is a connection string) for a shared deployment.
   driver: sqlite
   dsn: data/store.sqlite
 
 index:
-  # Full-text (BM25) index; works fully offline.
+  # Index backend: "local" (bleve full-text + sqlite-vec vector, configured
+  # below) or "postgres" (single hybrid index, see the postgres section). Use
+  # postgres together with a postgres store to let several processes query the
+  # same database concurrently (e.g. multiple "amoxtli mcp http" instances).
+  driver: local
+  # Full-text (BM25) index; works fully offline. (local driver)
   fulltext:
     enabled: true
     path: data/index.bleve
     weight: 1.0
   # Vector (semantic) index. "auto" enables it when llm.embeddings is
-  # configured; results of both indexes are fused by weighted RRF.
+  # configured; results of both indexes are fused by weighted RRF. (local driver)
   vector:
     enabled: auto
     path: data/vectors.sqlite
@@ -33,6 +39,17 @@ index:
     # for large-file indexing speed. Raise if your embeddings endpoint tolerates
     # more concurrency; lower to avoid rate limiting (429). 0 = default (8).
     embeddings_concurrency: 0
+  # Hybrid PostgreSQL index (index.driver: postgres). Requires the "vector" and
+  # "unaccent" extensions. The vector leg activates when llm.embeddings is set.
+  #
+  # postgres:
+  #   # Defaults to store.dsn when the store is also postgres.
+  #   dsn: postgres://user:pass@localhost:5432/kb?sslmode=disable
+  #   weight: 1.0
+  #   # 0 defers to the library defaults.
+  #   vector_size: 0
+  #   max_words: 0
+  #   text_search_config: simple
 
 # LLM clients (optional). Supported providers: openai, openrouter, mistral.
 # "openai" also covers any OpenAI-compatible endpoint (Ollama, vLLM...) via

@@ -92,6 +92,37 @@ retrieval:
 	}
 }
 
+func TestParsePostgres(t *testing.T) {
+	raw := `
+version: 1
+store:
+  driver: postgres
+  dsn: postgres://user:pass@localhost:5432/kb?sslmode=disable
+index:
+  driver: postgres
+`
+	cfg, err := Parse(raw, noEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	if cfg.IndexDriver() != "postgres" {
+		t.Errorf("expected postgres index driver, got %q", cfg.IndexDriver())
+	}
+	// The index DSN falls back to the postgres store DSN.
+	if cfg.PostgresIndexDSN() != cfg.Store.DSN {
+		t.Errorf("expected index DSN to fall back to store DSN, got %q", cfg.PostgresIndexDSN())
+	}
+	// A fully client-server workspace holds no exclusive on-disk state.
+	if cfg.HasLocalState() {
+		t.Error("expected HasLocalState to be false for a full postgres workspace")
+	}
+	// The local sqlite-vec index must stay off under the postgres driver.
+	if cfg.VectorEnabled() {
+		t.Error("expected VectorEnabled to be false under the postgres index driver")
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -109,9 +140,19 @@ func TestParseErrors(t *testing.T) {
 			wantErr: "unsupported config version",
 		},
 		{
-			name:    "postgres not supported",
+			name:    "postgres store with non-postgres dsn",
 			raw:     "store:\n  driver: postgres",
-			wantErr: "not supported yet",
+			wantErr: "must be a postgres connection string",
+		},
+		{
+			name:    "postgres index without dsn",
+			raw:     "index:\n  driver: postgres",
+			wantErr: "no DSN is available",
+		},
+		{
+			name:    "unknown index driver",
+			raw:     "index:\n  driver: elastic",
+			wantErr: "unknown index driver",
 		},
 		{
 			name:    "vector true without embeddings",

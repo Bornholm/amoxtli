@@ -58,7 +58,7 @@ Exemples complets et exécutables : [`example/sqlite`](example/sqlite/main.go) (
 
 ## Ligne de commande
 
-Le binaire [`cmd/amoxtli`](cmd/amoxtli) expose la bibliothèque sous forme d'outil : il indexe des fichiers locaux dans un espace de travail par projet (`.amoxtli/`), effectue des recherches (dont une recherche itérative `--deep` pilotée par LLM) et sert un serveur MCP sur stdio pour les agents.
+Le binaire [`cmd/amoxtli`](cmd/amoxtli) expose la bibliothèque sous forme d'outil : il indexe des fichiers locaux dans un espace de travail par projet (`.amoxtli/`), effectue des recherches (dont une recherche itérative `--deep` pilotée par LLM) et sert un serveur MCP (stdio ou HTTP) pour les agents.
 
 ```bash
 go install github.com/bornholm/amoxtli/cmd/amoxtli@latest   # ou : make build
@@ -67,7 +67,8 @@ amoxtli add ./docs/*.md                              # documentation
 amoxtli add $(git ls-files '*.go')                   # code source (type=code, language=go)
 amoxtli search "modèle de concurrence"               # doc ET code
 amoxtli search "modèle de concurrence" --filter "type!=code"   # documentation seule
-amoxtli mcp   # serveur Model Context Protocol (stdio)
+amoxtli mcp stdio             # serveur MCP sur stdio (un processus par client)
+amoxtli mcp http --addr :8080 # serveur MCP HTTP (processus partagé, multi-sessions)
 ```
 
 Voir [docs/cli.md](docs/cli.md) pour la configuration (`config.yaml`, interpolation des secrets), les commandes CRUD et l'intégration MCP.
