@@ -3,6 +3,12 @@ version: 2
 before:
   hooks:
     - go mod tidy
+    # Genere les scripts de completion shell empaquetes plus bas (nfpms).
+    # La completion ne depend pas des grammar tags, un `go run` suffit.
+    - mkdir -p completions
+    - sh -c "go run ./cmd/amoxtli completion bash > completions/amoxtli.bash"
+    - sh -c "go run ./cmd/amoxtli completion zsh > completions/amoxtli.zsh"
+    - sh -c "go run ./cmd/amoxtli completion fish > completions/amoxtli.fish"
 
 builds:
   - id: amoxtli
@@ -64,6 +70,17 @@ nfpms:
         dst: /usr/share/doc/amoxtli/README.md
       - src: docs/cli.md
         dst: /usr/share/doc/amoxtli/cli.md
+      # Completions chargees automatiquement par bash/zsh/fish a
+      # l'installation du paquet (chemins standards Debian et Arch).
+      - src: completions/amoxtli.bash
+        dst: /usr/share/bash-completion/completions/amoxtli
+        file_info: { mode: 0644 }
+      - src: completions/amoxtli.zsh
+        dst: /usr/share/zsh/site-functions/_amoxtli
+        file_info: { mode: 0644 }
+      - src: completions/amoxtli.fish
+        dst: /usr/share/fish/vendor_completions.d/amoxtli.fish
+        file_info: { mode: 0644 }
 
 checksum:
   name_template: "checksums.txt"

@@ -4,6 +4,8 @@
 *.sqlite-shm
 *.sqlite-wal
 /dist/
+# Scripts de completion generes par le hook goreleaser (before.hooks).
+/completions/
 # Stray CLI binary from `go build ./cmd/amoxtli` at the repo root.
 /amoxtli
 .DS_Store
