@@ -162,7 +162,7 @@ func (t *JudgeResultsTransformer) getUserPrompt(ctx context.Context, query strin
 
 	maxTotalWords := t.maxTotalWords
 	if maxTotalWords <= 0 {
-		maxTotalWords = 12000
+		maxTotalWords = 8000
 	}
 	totalWords := 0
 

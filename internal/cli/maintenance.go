@@ -186,6 +186,40 @@ func newRestoreCommand(opts *rootOptions) *cobra.Command {
 	return cmd
 }
 
+func newCacheCommand(opts *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "cache",
+		Short: "Manage the embeddings cache",
+	}
+
+	cmd.AddCommand(newCachePurgeCommand(opts))
+
+	return cmd
+}
+
+func newCachePurgeCommand(opts *rootOptions) *cobra.Command {
+	return &cobra.Command{
+		Use:   "purge",
+		Short: "Delete the on-disk embeddings cache",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ws, cfg, err := opts.loadConfig()
+			if err != nil {
+				return err
+			}
+
+			dir := ws.Resolve(cfg.EmbeddingsCachePath())
+			if err := os.RemoveAll(dir); err != nil {
+				return errors.WithStack(err)
+			}
+
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Purged embeddings cache at %s\n", dir)
+
+			return nil
+		},
+	}
+}
+
 // awaitMaintenanceTask waits for a maintenance task and reports its outcome.
 func awaitMaintenanceTask(cmd *cobra.Command, rt *runtime.Runtime, taskID task.ID, timeout time.Duration, label string) error {
 	state, err := waitTask(cmd.Context(), rt.Codex, taskID, timeout, nil)

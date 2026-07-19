@@ -90,8 +90,8 @@ type VectorIndexConfig struct {
 }
 
 type LLMConfig struct {
-	Chat       *ClientConfig `yaml:"chat"`
-	Embeddings *ClientConfig `yaml:"embeddings"`
+	Chat       *ClientConfig           `yaml:"chat"`
+	Embeddings *EmbeddingsClientConfig `yaml:"embeddings"`
 }
 
 type ClientConfig struct {
@@ -100,6 +100,31 @@ type ClientConfig struct {
 	Model    string `yaml:"model"`
 	APIKey   string `yaml:"api_key"`
 }
+
+// EmbeddingsClientConfig is the embeddings endpoint configuration: the client
+// itself plus the on-disk cache for computed vectors.
+type EmbeddingsClientConfig struct {
+	ClientConfig `yaml:",inline"`
+	Cache        EmbeddingsCacheConfig `yaml:"cache"`
+}
+
+// EmbeddingsCacheConfig configures the persistent embeddings cache. Embedding
+// a text is deterministic for a given model, so vectors are reused across
+// runs: re-indexing unchanged content and repeated queries become cache hits
+// instead of billable, rate-limited calls.
+type EmbeddingsCacheConfig struct {
+	// Enabled accepts true, false or "auto"; auto (the default) enables the
+	// cache whenever an embeddings client is configured.
+	Enabled Toggle `yaml:"enabled"`
+	// Path is the cache directory, relative to the .amoxtli directory (default
+	// "cache/embeddings"). Entries are keyed by embeddings model, so switching
+	// model never serves vectors from the wrong space.
+	Path string `yaml:"path"`
+}
+
+// DefaultEmbeddingsCachePath is the embeddings cache location used when
+// llm.embeddings.cache.path is left empty, relative to the .amoxtli directory.
+const DefaultEmbeddingsCachePath = "cache/embeddings"
 
 // SupportedProviders lists the llm.chat / llm.embeddings providers the CLI
 // can wire. All share provider.CommonOptions (model, base_url, api_key).
@@ -125,7 +150,7 @@ type RetrievalConfig struct {
 	// resulting prompt fits your chat endpoint's context window: words are only
 	// a coarse proxy for tokens (~1.8 tokens/word on mixed prose and code), so
 	// 18000 words already overflow a 32k-token limit. Zero defers to the
-	// library default (12000).
+	// library default (8000).
 	MaxTotalWords int                 `yaml:"max_total_words"`
 	Iterative     IterativeConfig     `yaml:"iterative"`
 	Decomposition DecompositionConfig `yaml:"decomposition"`
@@ -248,6 +273,22 @@ func (c *Config) HasEmbeddings() bool {
 	return c.LLM.Embeddings != nil && c.LLM.Embeddings.Model != ""
 }
 
+// EmbeddingsCacheEnabled resolves the embeddings cache toggle: enabled by
+// default as soon as an embeddings client is configured.
+func (c *Config) EmbeddingsCacheEnabled() bool {
+	return c.HasEmbeddings() && c.LLM.Embeddings.Cache.Enabled.Resolve(true)
+}
+
+// EmbeddingsCachePath returns the configured embeddings cache directory,
+// falling back to DefaultEmbeddingsCachePath. The path may be relative to the
+// .amoxtli directory (resolve it with workspace.Resolve).
+func (c *Config) EmbeddingsCachePath() string {
+	if c.LLM.Embeddings != nil && c.LLM.Embeddings.Cache.Path != "" {
+		return c.LLM.Embeddings.Cache.Path
+	}
+	return DefaultEmbeddingsCachePath
+}
+
 // VectorEnabled resolves the vector index toggle against the presence of an
 // embeddings client. It only governs the local sqlite-vec index; the postgres
 // index manages its vector leg internally.
@@ -366,12 +407,17 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	var embeddingsClient *ClientConfig
+	if c.LLM.Embeddings != nil {
+		embeddingsClient = &c.LLM.Embeddings.ClientConfig
+	}
+
 	for _, client := range []struct {
 		name string
 		cfg  *ClientConfig
 	}{
 		{"llm.chat", c.LLM.Chat},
-		{"llm.embeddings", c.LLM.Embeddings},
+		{"llm.embeddings", embeddingsClient},
 	} {
 		if client.cfg == nil {
 			continue

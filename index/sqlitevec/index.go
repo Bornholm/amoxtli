@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -296,7 +297,11 @@ func estimateTokens(text string) int {
 }
 
 const (
-	charsPerToken = 4
+	// charsPerToken is the chars-per-token ratio used to budget embedding
+	// batches. 3 is deliberately conservative: French prose sits around 3
+	// chars/token (English closer to 4), and underestimating tokens would
+	// overflow targetBatchTokens.
+	charsPerToken = 3
 
 	maxBatchItemCount = 100
 
@@ -424,7 +429,11 @@ func (i *Index) collectChunks(document model.Document) ([]*indexableChunk, error
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		textStr := string(content)
+		// Trim surrounding whitespace: it carries no meaning for the embedding
+		// and it keeps the chunk text — and thus any embeddings-cache key —
+		// stable between a fresh parse and the store round-trip (the persisted
+		// content is trimmed, the parsed one may keep a trailing newline).
+		textStr := strings.TrimSpace(string(content))
 		textLen := len(textStr)
 
 		if textLen <= limitChars {
@@ -623,16 +632,30 @@ func (i *Index) insertCollection(ctx context.Context, conn *sqlite3.Conn, embedd
 
 // Search implements index.Index.
 func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	// Embed the query BEFORE taking the read lock and outside the retry loop:
+	// a SQLITE_BUSY/LOCKED retry must repeat only the SQL, never the billable
+	// network round-trip, and the call must not extend the lock's critical
+	// section.
+	res, err := i.llm.Embeddings(ctx, []string{query})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	vectors := res.Embeddings()
+	if len(vectors) == 0 {
+		return nil, errors.New("embeddings response is empty")
+	}
+
+	queryVec, err := sqlite_vec.SerializeFloat32(toFloat32(vectors[0]))
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	i.rwLock.RLock()
 	defer i.rwLock.RUnlock()
 
 	var searchResults []*index.SearchResult
-	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
-		res, err := i.llm.Embeddings(ctx, []string{query})
-		if err != nil {
-			return errors.WithStack(err)
-		}
-
+	err = i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 		// Use vec0 virtual table with HNSW index for fast KNN search
 		// IMPORTANT: vec0 uses <column> match <vector> syntax, not <column>.match
 		// Also requires k = <number> to specify number of nearest neighbors
@@ -671,15 +694,10 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 
 		defer stmt.Close()
 
-		embeddings, err := sqlite_vec.SerializeFloat32(toFloat32(res.Embeddings()[0]))
-		if err != nil {
-			return errors.WithStack(err)
-		}
-
 		bindIndex := 1
 
 		// Bind the query vector for knn_query (always first)
-		if err := stmt.BindBlob(bindIndex, embeddings); err != nil {
+		if err := stmt.BindBlob(bindIndex, queryVec); err != nil {
 			return errors.WithStack(err)
 		}
 

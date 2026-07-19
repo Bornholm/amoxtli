@@ -7,6 +7,7 @@ import (
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 // SearchFunc performs a single retrieval step. It is the seam through which the
@@ -207,6 +208,12 @@ func (o *Orchestrator) Search(ctx context.Context, query string, maxResults int,
 	return result, nil
 }
 
+// retrieveConcurrency bounds how many decomposed sub-queries are searched in
+// parallel. Each leg typically ends in an embeddings (and possibly HyDE) call,
+// so a small bound keeps the latency win without hammering rate-limited
+// endpoints.
+const retrieveConcurrency = 4
+
 // retrieve performs a single retrieval step. When a QueryDecomposer is
 // configured, it searches the original query plus each sub-question and fuses
 // the evidence; otherwise it is a plain SearchFunc call.
@@ -234,16 +241,32 @@ func (o *Orchestrator) retrieve(ctx context.Context, query string, maxResults in
 		queries = append(queries, sq)
 	}
 
-	fused := make([]*index.SearchResult, 0)
-	for _, q := range queries {
-		r, err := o.search(ctx, q, maxResults, collections)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		fused = fuseResults(fused, r)
+	// Search the legs concurrently: they are independent index round-trips, so
+	// the retrieval latency drops to that of the slowest leg. Each leg writes
+	// its results at its own position and fusion happens once every leg is
+	// done, in query order — the section-level dedup of fuseResults (first
+	// occurrence wins) stays deterministic, identical to the sequential form.
+	groups := make([][]*index.SearchResult, len(queries))
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(retrieveConcurrency)
+
+	for idx, q := range queries {
+		g.Go(func() error {
+			r, err := o.search(ctx, q, maxResults, collections)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			groups[idx] = r
+			return nil
+		})
 	}
 
-	return fused, nil
+	if err := g.Wait(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return fuseResults(groups...), nil
 }
 
 // fuseResults unions several result groups, de-duplicating at the section level

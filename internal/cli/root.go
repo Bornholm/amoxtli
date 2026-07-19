@@ -95,6 +95,7 @@ func NewRootCommand() *cobra.Command {
 		newTaskCommand(opts),
 		newReindexCommand(opts),
 		newCleanupCommand(opts),
+		newCacheCommand(opts),
 		newBackupCommand(opts),
 		newRestoreCommand(opts),
 		newMCPCommand(opts),

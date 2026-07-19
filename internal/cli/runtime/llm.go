@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/bornholm/amoxtli/internal/cli/config"
+	"github.com/bornholm/amoxtli/internal/cli/workspace"
+	"github.com/bornholm/amoxtli/llmx"
 	"github.com/bornholm/genai/llm"
 	"github.com/bornholm/genai/llm/provider"
 	"github.com/bornholm/genai/llm/provider/mistral"
@@ -14,7 +16,11 @@ import (
 
 // newLLMClient builds a single genai client serving the configured chat
 // completion and embeddings endpoints, or nil when neither is configured.
-func newLLMClient(ctx context.Context, cfg *config.Config) (llm.Client, error) {
+// When the embeddings cache is enabled (the default as soon as embeddings are
+// configured) the client is wrapped with llmx.CachingClient, so re-indexing
+// unchanged content and repeated queries reuse on-disk vectors instead of
+// calling the endpoint again.
+func newLLMClient(ctx context.Context, ws *workspace.Workspace, cfg *config.Config) (llm.Client, error) {
 	var funcs []provider.OptionFunc
 
 	if cfg.HasChat() {
@@ -26,7 +32,7 @@ func newLLMClient(ctx context.Context, cfg *config.Config) (llm.Client, error) {
 	}
 
 	if cfg.HasEmbeddings() {
-		fn, err := embeddingsOption(cfg.LLM.Embeddings)
+		fn, err := embeddingsOption(&cfg.LLM.Embeddings.ClientConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -40,6 +46,17 @@ func newLLMClient(ctx context.Context, cfg *config.Config) (llm.Client, error) {
 	client, err := provider.Create(ctx, funcs...)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not create llm client")
+	}
+
+	if cfg.EmbeddingsCacheEnabled() {
+		// The namespace must identify the embedding space (see llmx.CachingClient):
+		// keying on the model name guarantees a model switch never serves vectors
+		// from the wrong space.
+		cached, err := llmx.NewCachingClient(client, ws.Resolve(cfg.EmbeddingsCachePath()), cfg.LLM.Embeddings.Model)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not create embeddings cache")
+		}
+		return cached, nil
 	}
 
 	return client, nil

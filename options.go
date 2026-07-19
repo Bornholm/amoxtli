@@ -66,12 +66,14 @@ type options struct {
 func defaultOptions() *options {
 	return &options{
 		maxWordsPerSection: 250,
-		// 12000 words map to roughly 22k tokens, leaving headroom below the
-		// common 32k-token context limit of chat endpoints once the system
-		// prompt, JSON schema and completion are accounted for. A word budget is
-		// only a coarse proxy for tokens — measured at ~1.8 tokens/word on mixed
-		// French prose and source code — so this stays deliberately conservative.
-		maxTotalWords:              12000,
+		// 8000 words map to roughly 14k tokens at the ~1.8 tokens/word measured
+		// on mixed French prose and source code, leaving comfortable headroom
+		// below the common 32k-token context limit of chat endpoints once the
+		// system prompt, JSON schema and completion are accounted for (the
+		// previous 12000-word default flirted with 22k tokens). It also bounds
+		// the cost of every LLM retrieval stage (judge, reranker, evidence
+		// evaluator), which is billed per search.
+		maxTotalWords:              8000,
 		taskParallelism:            5,
 		snapshotBoundary:           "amoxtli-snapshot-v1",
 		groundingMinScore:          0.4,

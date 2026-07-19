@@ -163,7 +163,9 @@ func (h *ReindexHandler) Handle(ctx context.Context, tsk task.Task, events chan 
 	deletedCount := 0
 
 	allDocumentsProcessed := false
-	docPage := 1
+	// The store's Page option is 0-based; starting at 1 would silently skip the
+	// first docLimit documents (a no-op reindex on small stores).
+	docPage := 0
 	docLimit := 50
 
 	for !allDocumentsProcessed {
@@ -216,7 +218,7 @@ func (h *ReindexHandler) Handle(ctx context.Context, tsk task.Task, events chan 
 		}
 
 		// Update progress
-		progress := float32(docPage*docLimit) / float32(totalDocuments)
+		progress := float32((docPage+1)*docLimit) / float32(totalDocuments)
 		if progress > 1 {
 			progress = 1
 		}
@@ -234,7 +236,7 @@ func (h *ReindexHandler) Handle(ctx context.Context, tsk task.Task, events chan 
 	events <- task.NewEvent(task.WithMessage("reindexing documents"))
 
 	allDocumentsProcessed = false
-	docPage = 1
+	docPage = 0
 
 	for !allDocumentsProcessed {
 		select {
@@ -279,7 +281,7 @@ func (h *ReindexHandler) Handle(ctx context.Context, tsk task.Task, events chan 
 			}
 
 			// Update progress (30% to 100%)
-			docProgress := float32((docPage-1)*docLimit+i+1) / float32(totalDocuments)
+			docProgress := float32(docPage*docLimit+i+1) / float32(totalDocuments)
 			progress := 0.3 + (0.7 * docProgress)
 			events <- task.NewEvent(task.WithProgress(progress), task.WithMessage("reindexing"))
 		}

@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/url"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/model"
@@ -13,15 +15,20 @@ import (
 // --- extra test doubles ---------------------------------------------------
 
 // stubSearch returns canned results per query and records the queries it was
-// asked, exposing itself as a SearchFunc.
+// asked, exposing itself as a SearchFunc. It is safe for concurrent use: the
+// orchestrator searches decomposed sub-queries in parallel.
 type stubSearch struct {
 	byQuery map[string][]*index.SearchResult
-	calls   []string
+
+	mu    sync.Mutex
+	calls []string
 }
 
 func (s *stubSearch) fn() SearchFunc {
 	return func(ctx context.Context, query string, maxResults int, collections []model.CollectionID) ([]*index.SearchResult, error) {
+		s.mu.Lock()
 		s.calls = append(s.calls, query)
+		s.mu.Unlock()
 		return s.byQuery[query], nil
 	}
 }
@@ -254,6 +261,70 @@ func TestOrchestrator_Decomposition(t *testing.T) {
 	}
 	if result.Grounding != nil {
 		t.Fatalf("grounding should be nil when checker disabled, got %+v", result.Grounding)
+	}
+}
+
+// TestOrchestrator_DecompositionParallelAndDeterministic checks that the
+// decomposed legs are searched concurrently — every leg blocks until all of
+// them have started, which deadlocks a sequential implementation — and that
+// fusion stays in query order regardless of leg completion order (the first
+// occurrence of a section wins, so the original query beats sub-questions even
+// when it finishes last).
+func TestOrchestrator_DecompositionParallelAndDeterministic(t *testing.T) {
+	const legs = 3
+
+	byQuery := map[string][]*index.SearchResult{
+		"q":    {resultWith("shared", "only-q")},
+		"sub1": {resultWith("shared", "only-sub1")},
+		"sub2": {resultWith("only-sub2")},
+	}
+	// Post-barrier delays inverting the completion order: the original query
+	// finishes last, sub2 first.
+	delays := map[string]time.Duration{
+		"q":    30 * time.Millisecond,
+		"sub1": 15 * time.Millisecond,
+		"sub2": 0,
+	}
+
+	started := make(chan struct{}, legs)
+	release := make(chan struct{})
+	var once sync.Once
+
+	search := func(ctx context.Context, query string, maxResults int, collections []model.CollectionID) ([]*index.SearchResult, error) {
+		started <- struct{}{}
+		if len(started) == legs {
+			once.Do(func() { close(release) })
+		}
+		select {
+		case <-release:
+		case <-time.After(5 * time.Second):
+			return nil, context.DeadlineExceeded
+		}
+		time.Sleep(delays[query])
+		return byQuery[query], nil
+	}
+
+	o := NewOrchestrator(search,
+		WithQueryDecomposer(&fakeDecomposer{subs: []string{"sub1", "sub2"}}),
+	)
+
+	result, err := o.Search(context.Background(), "q", 5, nil)
+	if err != nil {
+		t.Fatalf("unexpected error (sequential implementations time out here): %v", err)
+	}
+
+	want := [][]model.SectionID{
+		{"shared", "only-q"},
+		{"only-sub1"},
+		{"only-sub2"},
+	}
+	if len(result.Results) != len(want) {
+		t.Fatalf("expected %d fused results, got %d", len(want), len(result.Results))
+	}
+	for i, sections := range want {
+		if !reflect.DeepEqual(result.Results[i].Sections, sections) {
+			t.Errorf("results[%d].Sections = %v, want %v", i, result.Results[i].Sections, sections)
+		}
 	}
 }
 

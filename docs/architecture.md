@@ -53,6 +53,26 @@ Un document peut porter des métadonnées arbitraires (`map[string]any` : auteur
 
 `WithReranking()` insère un reranker LLM (`retrieval.NewLLMReranker`) dans le pipeline de recherche : il réordonne les candidats fusionnés (et filtrés) par pertinence à la requête, réutilisant le budget `WithMaxTotalWords` pour borner le prompt. Contrairement au Judge (qui filtre), le reranker ne fait que réordonner. Il s'exécute après le filtrage métadonnées et avant la pagination, donc l'ordre reranké est celui exposé et encodé dans les curseurs.
 
+### Coût LLM par recherche
+
+Chaque étage LLM optionnel ajoute un appel réseau (latence et facturation) à
+**chaque** recherche. Ordres de grandeur par configuration, hors cache :
+
+| Configuration | Appels chat | Appels embeddings |
+|---|---|---|
+| Plein-texte seul (pas de `llm`) | 0 | 0 |
+| + embeddings (index vectoriel) | 0 | 1 (requête) |
+| + `llm.chat` (défauts : HyDE + Judge) | 2 | 1 |
+| + `grounding_check` (remplace le Judge) | 2 | 1 |
+| + `reranking` | 3 | 1 |
+| Recherche itérative (`--deep`, décomposition + N sous-requêtes + reformulation) | 4 et plus | 1 + N |
+
+Le prompt du Judge / reranker / évaluateur est borné par `WithMaxTotalWords`
+(défaut 8000 mots, ≈ 14k tokens) — c'est le poste de coût dominant d'une
+recherche avec chat configuré. Les appels d'embeddings répétés sont absorbés
+par le cache persistant (`llmx.CachingClient`, activé par défaut dans la CLI) ;
+HyDE n'est appliqué qu'aux indexeurs sémantiques et est ignoré sans eux.
+
 ### Runner de tâches persistant (`task/gorm`)
 
 L'ingestion (`IndexFile`, `Reindex`, `CleanupIndex`) est asynchrone : elle

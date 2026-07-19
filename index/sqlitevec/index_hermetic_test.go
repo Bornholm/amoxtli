@@ -33,12 +33,15 @@ func keywordEmbeddings(text string) []float64 {
 }
 
 // keywordClient is a deterministic llm.Client. Only Embeddings is used by the
-// sqlite-vec index; it can be switched to fail to exercise error handling.
+// sqlite-vec index; it can be switched to fail to exercise error handling and
+// counts its calls so tests can assert how often the endpoint is reached.
 type keywordClient struct {
-	fail atomic.Bool
+	fail  atomic.Bool
+	calls atomic.Int64
 }
 
 func (c *keywordClient) Embeddings(ctx context.Context, inputs []string, funcs ...llm.EmbeddingsOptionFunc) (llm.EmbeddingsResponse, error) {
+	c.calls.Add(1)
 	if c.fail.Load() {
 		return nil, errors.New("embeddings unavailable")
 	}
@@ -118,6 +121,34 @@ func TestIndexSearchHermetic(t *testing.T) {
 	}
 	if results[0].Score <= 0 {
 		t.Errorf("results[0].Score = %v, want > 0", results[0].Score)
+	}
+}
+
+// TestSearchEmbedsQueryOnce pins the single-embedding property of Search: the
+// query is embedded exactly once per call, outside the SQL retry loop, and an
+// embeddings failure surfaces immediately without touching the database.
+func TestSearchEmbedsQueryOnce(t *testing.T) {
+	ctx := context.Background()
+	client := &keywordClient{}
+	idx := newHermeticIndex(t, client)
+
+	indexDoc(t, ctx, idx, "mem://alpha", "# Alpha\n\nThis section is about ALPHA topics.\n")
+
+	client.calls.Store(0)
+	if _, err := idx.Search(ctx, "a question about ALPHA", index.SearchOptions{MaxResults: 5}); err != nil {
+		t.Fatalf("search failed: %+v", errors.WithStack(err))
+	}
+	if got := client.calls.Load(); got != 1 {
+		t.Errorf("Search performed %d embeddings calls, want exactly 1", got)
+	}
+
+	client.fail.Store(true)
+	client.calls.Store(0)
+	if _, err := idx.Search(ctx, "another question", index.SearchOptions{MaxResults: 5}); err == nil {
+		t.Fatal("expected Search to fail when embeddings are unavailable")
+	}
+	if got := client.calls.Load(); got != 1 {
+		t.Errorf("failed Search performed %d embeddings calls, want exactly 1 (no retry of the network call)", got)
 	}
 }
 

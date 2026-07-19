@@ -6,6 +6,7 @@ package runtime
 import (
 	"context"
 	"io"
+	"log/slog"
 	"os"
 
 	"github.com/bornholm/amoxtli"
@@ -16,6 +17,7 @@ import (
 	gormStore "github.com/bornholm/amoxtli/ingest/gorm"
 	"github.com/bornholm/amoxtli/internal/cli/config"
 	"github.com/bornholm/amoxtli/internal/cli/workspace"
+	"github.com/bornholm/amoxtli/llmx"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/genai/llm"
@@ -31,6 +33,9 @@ type Runtime struct {
 
 	lock    *Lock
 	closers []io.Closer
+	// embeddingsCache is the caching decorator around the LLM client when the
+	// embeddings cache is enabled; kept to report hit/miss stats on Close.
+	embeddingsCache *llmx.CachingClient
 }
 
 // Open acquires the workspace lock and wires the configuration into a Codex.
@@ -62,9 +67,13 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 		return nil, errors.WithStack(err)
 	}
 
-	client, err := newLLMClient(ctx, cfg)
+	client, err := newLLMClient(ctx, ws, cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	if cached, ok := client.(*llmx.CachingClient); ok {
+		rt.embeddingsCache = cached
 	}
 
 	// Both the gorm SQLite store and the sqlite-vec index hand a WASM build to
@@ -320,6 +329,12 @@ func (r *Runtime) Close() error {
 
 	if r.Codex != nil {
 		keep(r.Codex.Close())
+	}
+
+	if r.embeddingsCache != nil {
+		if hits, misses := r.embeddingsCache.Stats(); hits+misses > 0 {
+			slog.Debug("embeddings cache", slog.Int64("hits", hits), slog.Int64("misses", misses))
+		}
 	}
 
 	for i := len(r.closers) - 1; i >= 0; i-- {

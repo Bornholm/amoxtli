@@ -55,6 +55,7 @@ type MetadataProvider interface {
 }
 
 type QueryDocumentsOptions struct {
+	// Page is the 0-based page index: the query skips Page*Limit documents.
 	Page  *int
 	Limit *int
 

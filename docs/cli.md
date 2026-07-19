@@ -47,6 +47,15 @@ d'embeddings est configuré sous `llm.embeddings`. Les fonctions pilotées par L
 `openrouter` et `mistral`. Le fournisseur `openai` couvre en outre tout endpoint
 compatible OpenAI (Ollama, vLLM…) via `base_url`.
 
+### Cache d'embeddings
+
+Dès que `llm.embeddings` est configuré, un cache persistant sur disque
+(`llm.embeddings.cache`, activé par défaut, répertoire `cache/embeddings` dans
+`.amoxtli/`) mémorise les vecteurs calculés, clés par modèle : réindexer un
+contenu inchangé ou répéter une requête identique ne touche plus l'endpoint
+d'embeddings (ni sa facturation, ni son rate-limit). `amoxtli cache purge` vide
+le cache ; les statistiques hits/misses sont journalisées en mode `--verbose`.
+
 ### Convertisseurs de fichiers
 
 Sans convertisseur, seul le `.md` est indexable. La section `converter` en
@@ -92,6 +101,7 @@ extension→langage (ex. `.phtml: php`). Langages intégrés : `go`, `javascript
 | `collection create\|list\|show\|rename\|describe\|stats\|delete` | Gère les collections |
 | `task list\|show\|cancel` | Suit les tâches d'indexation |
 | `reindex [-c coll]` / `cleanup [-c coll]` | Maintenance de l'index |
+| `cache purge` | Vide le cache d'embeddings sur disque |
 | `backup [-o fichier]` / `restore <fichier>` | Sauvegarde/restauration |
 | `mcp` | Serveur MCP sur stdio |
 

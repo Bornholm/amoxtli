@@ -59,8 +59,11 @@ func toDocInfo(doc model.PersistedDocument) docInfo {
 func queryOptions(page, limit int, orphaned bool, sourceLike, sortBy, order string, headerOnly bool) ingest.QueryDocumentsOptions {
 	opts := ingest.QueryDocumentsOptions{HeaderOnly: headerOnly}
 
-	if page > 0 {
-		opts.Page = &page
+	// The user-facing page numbers are 1-based; the store's Page option is
+	// 0-based. Both 0 (unset) and 1 mean the first page.
+	if page > 1 {
+		p := page - 1
+		opts.Page = &p
 	}
 	if limit > 0 {
 		opts.Limit = &limit

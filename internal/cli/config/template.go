@@ -65,6 +65,12 @@ index:
 #     base_url: http://localhost:11434/v1
 #     model: bge-m3
 #     api_key: ${OLLAMA_API_KEY:-ollama}
+#     # Persistent on-disk cache for computed vectors: re-indexing unchanged
+#     # content and repeated queries stop hitting the endpoint. Enabled by
+#     # default ("auto"); purge it with "amoxtli cache purge".
+#     cache:
+#       enabled: auto
+#       path: cache/embeddings
 
 # Retrieval enhancements; all of them require llm.chat.
 retrieval:
@@ -72,9 +78,9 @@ retrieval:
   grounding_check: false
   grounding_fail_open: true
   # Prompt budget (in words) for the LLM retrieval stages (reranker, judge,
-  # evidence evaluator). Words are a coarse proxy for tokens (~1.4 tokens/word),
+  # evidence evaluator). Words are a coarse proxy for tokens (~1.8 tokens/word),
   # so keep this well under your chat endpoint's context window. 0 uses the
-  # built-in default (12000, ~22k tokens). Lower it for smaller context windows.
+  # built-in default (8000, ~14k tokens). Lower it for smaller context windows.
   max_total_words: 0
   iterative:
     enabled: false
