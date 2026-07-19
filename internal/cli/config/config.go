@@ -90,6 +90,11 @@ type VectorIndexConfig struct {
 	// ReadPool is the number of dedicated read connections opened for
 	// concurrent searches (WAL). 0 defers to the library default (4).
 	ReadPool int `yaml:"read_pool"`
+	// CoarseQuantization enables the two-stage vector search: a fast KNN on
+	// binary-quantized vectors preselects candidates, re-scored with the full
+	// float vectors. Worthwhile on large corpora (100k+ chunks); requires a
+	// vector size divisible by 8. Off by default.
+	CoarseQuantization bool `yaml:"coarse_quantization"`
 }
 
 type LLMConfig struct {
@@ -151,10 +156,32 @@ func looksLikePostgresDSN(dsn string) bool {
 	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")
 }
 
+// Retrieval profiles: presets of the LLM retrieval stages, from cheapest to
+// most thorough. The SciFact evaluations showed the embedder dominates
+// quality, so the cheap profile is usually competitive.
+const (
+	// ProfileFast disables every per-search chat call (no HyDE, no Judge):
+	// embeddings + weighted RRF fusion + dedup only.
+	ProfileFast = "fast"
+	// ProfileBalanced keeps HyDE (one cached, seeded chat call) but no Judge.
+	ProfileBalanced = "balanced"
+	// ProfilePrecision adds the fused grounding evaluator on top of HyDE.
+	ProfilePrecision = "precision"
+)
+
+// Profiles lists the accepted retrieval.profile values.
+var Profiles = []string{ProfileFast, ProfileBalanced, ProfilePrecision}
+
 type RetrievalConfig struct {
-	Reranking         bool `yaml:"reranking"`
-	GroundingCheck    bool `yaml:"grounding_check"`
-	GroundingFailOpen bool `yaml:"grounding_fail_open"`
+	// Profile selects a preset of retrieval stages: "fast" (no per-search
+	// chat call), "balanced" (HyDE only) or "precision" (HyDE + grounding
+	// evaluator). Empty keeps the historical default (HyDE + Judge when
+	// llm.chat is configured). Explicit keys below still apply on top of the
+	// profile (they can enable more stages, not disable the profile's).
+	Profile           string `yaml:"profile"`
+	Reranking         bool   `yaml:"reranking"`
+	GroundingCheck    bool   `yaml:"grounding_check"`
+	GroundingFailOpen bool   `yaml:"grounding_fail_open"`
 	// MaxTotalWords bounds the prompt size (in words) of the LLM retrieval
 	// stages (reranker, judge, evidence evaluator). Keep it low enough that the
 	// resulting prompt fits your chat endpoint's context window: words are only
@@ -385,8 +412,15 @@ func (c *Config) Validate() error {
 		return errors.Errorf("unknown index driver %q (expected \"local\" or \"postgres\")", c.Index.Driver)
 	}
 
+	if p := c.Retrieval.Profile; p != "" && !slices.Contains(Profiles, p) {
+		return errors.Errorf("retrieval.profile: unknown profile %q (supported: %v)", p, Profiles)
+	}
+
 	if !c.HasChat() {
 		var needsChat []string
+		if p := c.Retrieval.Profile; p == ProfileBalanced || p == ProfilePrecision {
+			needsChat = append(needsChat, "retrieval.profile="+p)
+		}
 		if c.Retrieval.Reranking {
 			needsChat = append(needsChat, "retrieval.reranking")
 		}

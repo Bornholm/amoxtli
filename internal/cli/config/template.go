@@ -41,6 +41,10 @@ index:
     embeddings_concurrency: 0
     # Dedicated read connections for concurrent searches (WAL). 0 = default (4).
     read_pool: 0
+    # Two-stage vector search: binary-quantized (Hamming) preselection then
+    # float re-scoring. ~30x faster scans on large corpora (100k+ chunks) for a
+    # marginal quality cost. Requires vector_size divisible by 8. Off by default.
+    coarse_quantization: false
   # Hybrid PostgreSQL index (index.driver: postgres). Requires the "vector" and
   # "unaccent" extensions. The vector leg activates when llm.embeddings is set.
   #
@@ -89,6 +93,13 @@ index:
 
 # Retrieval enhancements; all of them require llm.chat.
 retrieval:
+  # Stage preset, from cheapest to most thorough (requires llm.chat except
+  # "fast"). Explicit keys below still add stages on top of the profile.
+  #   fast      = no per-search chat call (embeddings + RRF fusion + dedup);
+  #   balanced  = + HyDE query expansion (one cached, seeded chat call);
+  #   precision = + grounding evaluator (relevance filtering + verdict).
+  # Empty keeps the historical default (HyDE + Judge when llm.chat is set).
+  profile: ""
   reranking: false
   grounding_check: false
   grounding_fail_open: true

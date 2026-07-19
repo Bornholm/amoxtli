@@ -1,6 +1,7 @@
 package sqlitevec
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -27,9 +28,12 @@ type Index struct {
 	maxWords              int
 	vectorSize            int
 	embeddingsConcurrency int
-	getConn               func(ctx context.Context) (*sqlite3.Conn, error)
-	llm                   llm.Client
-	model                 string
+	// coarse enables the two-stage binary-quantization search (only honored
+	// when the vector size supports it, i.e. divisible by 8).
+	coarse  bool
+	getConn func(ctx context.Context) (*sqlite3.Conn, error)
+	llm     llm.Client
+	model   string
 	// rwLock allows concurrent Search operations while serializing Index/Delete
 	rwLock sync.RWMutex
 	// readers is the pool of dedicated read connections (NewIndexAtPath). When
@@ -79,6 +83,12 @@ type Options struct {
 	// NewIndexAtPath (defaults to DefaultReadPoolSize when <= 0). Ignored by
 	// NewIndex, which uses the single caller-owned connection.
 	ReadPoolSize int
+	// CoarseQuantization enables the two-stage search: a fast KNN on the
+	// binary-quantized vectors (Hamming distance) preselects k×8 candidates,
+	// re-scored with the full float vectors. ~30× faster scans at a marginal
+	// quality cost, worthwhile on large corpora. Requires a vector size
+	// divisible by 8.
+	CoarseQuantization bool
 }
 
 type OptionFunc func(opts *Options)
@@ -117,6 +127,14 @@ func WithEmbeddingsConcurrency(n int) OptionFunc {
 func WithReadPoolSize(n int) OptionFunc {
 	return func(opts *Options) {
 		opts.ReadPoolSize = n
+	}
+}
+
+// WithCoarseQuantization toggles the two-stage binary-quantization search
+// (see Options.CoarseQuantization).
+func WithCoarseQuantization(enabled bool) OptionFunc {
+	return func(opts *Options) {
+		opts.CoarseQuantization = enabled
 	}
 }
 
@@ -163,39 +181,7 @@ func (i *Index) DeleteByID(ctx context.Context, ids ...model.SectionID) error {
 			return nil
 		}
 
-		// Delete from embeddings_collections first (has FK)
-		colStmt, _, err := conn.Prepare("DELETE FROM embeddings_collections WHERE embeddings_id IN ( SELECT value FROM json_each(?) );")
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		defer colStmt.Close()
-
-		jsonColIDsBytes, err := json.Marshal(idsToDelete)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		jsonColIDs := string(jsonColIDsBytes)
-
-		if err := colStmt.BindText(1, jsonColIDs); err != nil {
-			return errors.WithStack(err)
-		}
-
-		if err := colStmt.Exec(); err != nil {
-			return errors.WithStack(err)
-		}
-
-		// Delete from vec0 virtual table
-		vecStmt, _, err := conn.Prepare("DELETE FROM embeddings_vec WHERE rowid IN ( SELECT value FROM json_each(?) );")
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		defer vecStmt.Close()
-
-		if err := vecStmt.BindText(1, jsonColIDs); err != nil {
-			return errors.WithStack(err)
-		}
-
-		if err := vecStmt.Exec(); err != nil {
+		if err := deleteVecRows(conn, idsToDelete); err != nil {
 			return errors.WithStack(err)
 		}
 
@@ -218,6 +204,47 @@ func (i *Index) DeleteByID(ctx context.Context, ids ...model.SectionID) error {
 	}, sqlite3.BUSY, sqlite3.LOCKED)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+
+	return nil
+}
+
+// deleteVecRows removes every vector-side row (embeddings_collections,
+// embeddings_vec2, embeddings_vec_map) attached to the given embeddings ids.
+// Callers hold the write lock and run inside a retry/savepoint.
+func deleteVecRows(conn *sqlite3.Conn, embeddingsIDs []int) error {
+	jsonIDsBytes, err := json.Marshal(embeddingsIDs)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	jsonIDs := string(jsonIDsBytes)
+
+	statements := []string{
+		"DELETE FROM embeddings_collections WHERE embeddings_id IN ( SELECT value FROM json_each(?) );",
+		// The vec0 rowids are the map ids of the deleted chunks.
+		"DELETE FROM embeddings_vec2 WHERE rowid IN ( SELECT id FROM embeddings_vec_map WHERE embeddings_id IN ( SELECT value FROM json_each(?) ) );",
+		"DELETE FROM embeddings_vec_map WHERE embeddings_id IN ( SELECT value FROM json_each(?) );",
+	}
+
+	for _, sql := range statements {
+		stmt, _, err := conn.Prepare(sql)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		if err := stmt.BindText(1, jsonIDs); err != nil {
+			stmt.Close()
+			return errors.WithStack(err)
+		}
+
+		if err := stmt.Exec(); err != nil {
+			stmt.Close()
+			return errors.WithStack(err)
+		}
+
+		if err := stmt.Close(); err != nil {
+			return errors.WithStack(err)
+		}
 	}
 
 	return nil
@@ -247,39 +274,7 @@ func (i *Index) deleteBySourceLocked(ctx context.Context, source *url.URL) error
 			return nil
 		}
 
-		// Delete from embeddings_collections first (has FK)
-		colStmt, _, err := conn.Prepare("DELETE FROM embeddings_collections WHERE embeddings_id IN ( SELECT value FROM json_each(?) );")
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		defer colStmt.Close()
-
-		jsonColIDsBytes, err := json.Marshal(idsToDelete)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		jsonColIDs := string(jsonColIDsBytes)
-
-		if err := colStmt.BindText(1, jsonColIDs); err != nil {
-			return errors.WithStack(err)
-		}
-
-		if err := colStmt.Exec(); err != nil {
-			return errors.WithStack(err)
-		}
-
-		// Delete from vec0 virtual table
-		vecStmt, _, err := conn.Prepare("DELETE FROM embeddings_vec WHERE rowid IN ( SELECT value FROM json_each(?) );")
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		defer vecStmt.Close()
-
-		if err := vecStmt.BindText(1, jsonColIDs); err != nil {
-			return errors.WithStack(err)
-		}
-
-		if err := vecStmt.Exec(); err != nil {
+		if err := deleteVecRows(conn, idsToDelete); err != nil {
 			return errors.WithStack(err)
 		}
 
@@ -386,11 +381,19 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 		}
 		defer stmt.Close()
 
-		// Prepare vec0 statement for HNSW index
-		vecStmt, _, err := conn.Prepare(fmt.Sprintf(`
-			INSERT INTO embeddings_vec (rowid, embedding)
-			VALUES (?, vec_normalize(vec_slice(?, 0, %d)));
-		`, i.vectorSize))
+		mapStmt, _, err := conn.Prepare(`
+			INSERT INTO embeddings_vec_map (embeddings_id, collection_id)
+			VALUES (?, ?)
+			RETURNING id;
+		`)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		defer mapStmt.Close()
+
+		// One vec0 row per (chunk, collection): the collection is the vec0
+		// partition key so filtered KNN queries scan only that collection.
+		vecStmt, _, err := conn.Prepare(i.insertVecSQL())
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -416,17 +419,38 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 			embeddingsID := stmt.ColumnInt(0)
 			stmt.Reset()
 
-			// Insert into vec0 for HNSW index
-			if err := vecStmt.BindInt(1, embeddingsID); err != nil {
-				return err
+			// Chunks without any collection land in the '' partition so
+			// unfiltered searches still see them.
+			partitions := []string{""}
+			collections := item.Section.Document().Collections()
+			if len(collections) > 0 {
+				partitions = partitions[:0]
+				for _, coll := range collections {
+					partitions = append(partitions, string(coll.ID()))
+				}
 			}
-			if err := vecStmt.BindBlob(2, vecBlob); err != nil {
-				return err
+
+			for _, partition := range partitions {
+				if err := mapStmt.BindInt(1, embeddingsID); err != nil {
+					return err
+				}
+				if err := mapStmt.BindText(2, partition); err != nil {
+					return err
+				}
+				if hasRow := mapStmt.Step(); !hasRow {
+					return errors.New("no vec map id returned")
+				}
+				vecRowID := mapStmt.ColumnInt64(0)
+				mapStmt.Reset()
+
+				if err := bindVecInsert(vecStmt, vecRowID, vecBlob, partition, i.hasCoarse()); err != nil {
+					return errors.WithStack(err)
+				}
+				if err := vecStmt.Exec(); err != nil {
+					return err
+				}
+				vecStmt.Reset()
 			}
-			if err := vecStmt.Exec(); err != nil {
-				return err
-			}
-			vecStmt.Reset()
 
 			for _, coll := range item.Section.Document().Collections() {
 				if err := i.insertCollection(ctx, conn, embeddingsID, coll.ID()); err != nil {
@@ -437,6 +461,48 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 
 		return nil
 	}, sqlite3.BUSY, sqlite3.LOCKED)
+}
+
+// hasCoarse reports whether the index stores (and may search) the
+// binary-quantized column — the vector size must be divisible by 8.
+func (i *Index) hasCoarse() bool {
+	return supportsCoarse(i.vectorSize)
+}
+
+// insertVecSQL builds the vec0 insert statement, including the quantized
+// column when the schema has one.
+func (i *Index) insertVecSQL() string {
+	if i.hasCoarse() {
+		return fmt.Sprintf(`
+			INSERT INTO embeddings_vec2 (rowid, embedding, embedding_coarse, collection_id)
+			VALUES (?, vec_normalize(vec_slice(?, 0, %d)), vec_quantize_binary(vec_normalize(vec_slice(?, 0, %d))), ?);
+		`, i.vectorSize, i.vectorSize)
+	}
+	return fmt.Sprintf(`
+		INSERT INTO embeddings_vec2 (rowid, embedding, collection_id)
+		VALUES (?, vec_normalize(vec_slice(?, 0, %d)), ?);
+	`, i.vectorSize)
+}
+
+// bindVecInsert binds the parameters of an insertVecSQL statement.
+func bindVecInsert(stmt *sqlite3.Stmt, rowID int64, vecBlob []byte, partition string, coarse bool) error {
+	if err := stmt.BindInt64(1, rowID); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := stmt.BindBlob(2, vecBlob); err != nil {
+		return errors.WithStack(err)
+	}
+	next := 3
+	if coarse {
+		if err := stmt.BindBlob(3, vecBlob); err != nil {
+			return errors.WithStack(err)
+		}
+		next = 4
+	}
+	if err := stmt.BindText(next, partition); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 // collectChunks walks the document sections and splits their content into the
@@ -675,6 +741,11 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 		return nil, errors.WithStack(err)
 	}
 
+	maxResults := opts.MaxResults
+	if maxResults <= 0 {
+		maxResults = 10 // default
+	}
+
 	conn, release, err := i.acquireReader(ctx)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -683,137 +754,331 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 
 	var searchResults []*index.SearchResult
 	err = retryOnConn(ctx, conn, func(ctx context.Context, conn *sqlite3.Conn) error {
-		// Use vec0 virtual table with HNSW index for fast KNN search
-		// IMPORTANT: vec0 uses <column> match <vector> syntax, not <column>.match
-		// Also requires k = <number> to specify number of nearest neighbors
-		sql := `
-		SELECT
-			e.source,
-			e.section_id,
-			v.distance
-		FROM embeddings_vec v
-		JOIN embeddings e ON v.rowid = e.id
-	`
+		// One KNN leg per filtered collection: the collection is the vec0
+		// partition key, so each leg scans only that collection's rows and is
+		// guaranteed to return up to maxResults matches from it (the previous
+		// post-KNN JOIN filter could silently return fewer than k results
+		// when the global top-k lived in other collections). Without a filter
+		// a single leg scans every partition, oversampled to absorb the
+		// duplicate rows of multi-collection chunks.
+		var matches []vecMatch
 
-		hasCollections := len(opts.Collections) > 0
-		if hasCollections {
-			sql += ` JOIN embeddings_collections ec ON e.id = ec.embeddings_id`
+		if len(opts.Collections) > 0 {
+			for _, collection := range opts.Collections {
+				legMatches, err := i.knnLeg(conn, queryVec, maxResults, string(collection))
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				matches = append(matches, legMatches...)
+			}
+		} else {
+			matches, err = i.knnLeg(conn, queryVec, maxResults*unfilteredOversample, allPartitions)
+			if err != nil {
+				return errors.WithStack(err)
+			}
 		}
 
-		// Use <column> match <value> syntax for vec0 KNN query
-		sql += fmt.Sprintf(` WHERE v.embedding match vec_normalize(vec_slice(?, 0, %d))`, i.vectorSize)
-
-		// Add k parameter for vec0 (number of nearest neighbors)
-		sql += ` AND k = ?`
-
-		if hasCollections {
-			sql += ` AND ec.collection_id IN ( SELECT value FROM json_each(?) )`
-		}
-
-		sql += ` ORDER BY v.distance ASC`
-
-		sql += `;`
-
-		stmt, _, err := conn.Prepare(sql)
+		searchResults, err = resolveMatches(conn, matches, maxResults)
 		if err != nil {
 			return errors.WithStack(err)
 		}
-
-		defer stmt.Close()
-
-		bindIndex := 1
-
-		// Bind the query vector for knn_query (always first)
-		if err := stmt.BindBlob(bindIndex, queryVec); err != nil {
-			return errors.WithStack(err)
-		}
-
-		bindIndex++
-
-		// Bind k parameter (number of nearest neighbors) - required for vec0
-		maxResults := opts.MaxResults
-		if maxResults <= 0 {
-			maxResults = 10 // default
-		}
-		if err := stmt.BindInt(bindIndex, maxResults); err != nil {
-			return errors.WithStack(err)
-		}
-
-		bindIndex++
-
-		if hasCollections {
-			jsonCollections, err := json.Marshal(opts.Collections)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-
-			if err := stmt.BindBlob(bindIndex, jsonCollections); err != nil {
-				return errors.WithStack(err)
-			}
-		}
-
-		mappedScores := map[string]float64{}
-		mappedSections := map[string][]model.SectionID{}
-		mappedSectionScores := map[string]map[model.SectionID]float64{}
-
-		for stmt.Step() {
-			source := stmt.ColumnText(0)
-			sectionID := stmt.ColumnText(1)
-			distance := stmt.ColumnFloat(2)
-
-			if _, exists := mappedSections[source]; !exists {
-				mappedSections[source] = make([]model.SectionID, 0)
-				mappedSectionScores[source] = map[model.SectionID]float64{}
-			}
-
-			if distance == 0 {
-				distance = math.SmallestNonzeroFloat64
-			}
-
-			score := 1 / distance
-
-			mappedSections[source] = append(mappedSections[source], model.SectionID(sectionID))
-			mappedScores[source] += score
-			mappedSectionScores[source][model.SectionID(sectionID)] += score
-		}
-
-		if err := stmt.Err(); err != nil {
-			return errors.WithStack(err)
-		}
-
-		searchResults = make([]*index.SearchResult, 0)
-
-		for rawSource, sectionIDs := range mappedSections {
-			source, err := url.Parse(rawSource)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-
-			searchResults = append(searchResults, &index.SearchResult{
-				Source:        source,
-				Sections:      sectionIDs,
-				Score:         mappedScores[rawSource],
-				SectionScores: mappedSectionScores[rawSource],
-			})
-		}
-
-		slices.SortFunc(searchResults, func(r1 *index.SearchResult, r2 *index.SearchResult) int {
-			score1 := mappedScores[r1.Source.String()]
-			score2 := mappedScores[r2.Source.String()]
-			if score1 > score2 {
-				return -1
-			}
-			if score1 < score2 {
-				return 1
-			}
-			return 0
-		})
 
 		return nil
 	}, sqlite3.BUSY, sqlite3.LOCKED)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+
+	return searchResults, nil
+}
+
+// vecMatch is one KNN hit: the embeddings_vec2 rowid (= embeddings_vec_map
+// id) and its distance to the query vector.
+type vecMatch struct {
+	rowID    int64
+	distance float64
+}
+
+// allPartitions makes knnLeg scan every partition (no collection filter).
+const allPartitions = ""
+
+// unfilteredOversample widens the KNN of an unfiltered search: a chunk
+// belonging to several collections has one vec0 row per collection, so the
+// raw top-k may contain duplicates that deduplication then removes.
+const unfilteredOversample = 4
+
+// coarseOversample is the candidate multiplier of the two-stage search: the
+// binary (Hamming) stage preselects k×coarseOversample rows, re-scored with
+// the float vectors. ×8 keeps the quality loss marginal (<1% in the
+// sqlite-vec literature).
+const coarseOversample = 8
+
+// knnLeg runs one KNN query, restricted to a collection partition unless
+// partition is allPartitions. Note vec0 performs an exhaustive scan (there is
+// no ANN index); partitioning and coarse quantization are the two levers that
+// bound its cost.
+func (i *Index) knnLeg(conn *sqlite3.Conn, queryVec []byte, k int, partition string) ([]vecMatch, error) {
+	if i.coarse && i.hasCoarse() {
+		return i.knnCoarse(conn, queryVec, k, partition)
+	}
+	return i.knnDirect(conn, queryVec, k, partition)
+}
+
+// knnDirect is the single-stage KNN on the float vectors.
+func (i *Index) knnDirect(conn *sqlite3.Conn, queryVec []byte, k int, partition string) ([]vecMatch, error) {
+	sql := fmt.Sprintf(`
+		SELECT v.rowid, v.distance
+		FROM embeddings_vec2 v
+		WHERE v.embedding MATCH vec_normalize(vec_slice(?, 0, %d))
+		AND k = ?`, i.vectorSize)
+	if partition != allPartitions {
+		sql += ` AND v.collection_id = ?`
+	}
+	sql += ` ORDER BY v.distance ASC;`
+
+	stmt, _, err := conn.Prepare(sql)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindBlob(1, queryVec); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := stmt.BindInt(2, k); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if partition != allPartitions {
+		if err := stmt.BindText(3, partition); err != nil {
+			return nil, errors.WithStack(err)
+		}
+	}
+
+	var matches []vecMatch
+	for stmt.Step() {
+		matches = append(matches, vecMatch{rowID: stmt.ColumnInt64(0), distance: stmt.ColumnFloat(1)})
+	}
+	if err := stmt.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return matches, nil
+}
+
+// knnCoarse is the two-stage KNN: Hamming preselection on the binary-quantized
+// column, then float re-scoring of the candidates.
+func (i *Index) knnCoarse(conn *sqlite3.Conn, queryVec []byte, k int, partition string) ([]vecMatch, error) {
+	sql := fmt.Sprintf(`
+		SELECT v.rowid
+		FROM embeddings_vec2 v
+		WHERE v.embedding_coarse MATCH vec_quantize_binary(vec_normalize(vec_slice(?, 0, %d)))
+		AND k = ?`, i.vectorSize)
+	if partition != allPartitions {
+		sql += ` AND v.collection_id = ?`
+	}
+	sql += ` ORDER BY distance ASC;`
+
+	stmt, _, err := conn.Prepare(sql)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	if err := stmt.BindBlob(1, queryVec); err != nil {
+		stmt.Close()
+		return nil, errors.WithStack(err)
+	}
+	if err := stmt.BindInt(2, k*coarseOversample); err != nil {
+		stmt.Close()
+		return nil, errors.WithStack(err)
+	}
+	if partition != allPartitions {
+		if err := stmt.BindText(3, partition); err != nil {
+			stmt.Close()
+			return nil, errors.WithStack(err)
+		}
+	}
+
+	var candidates []int64
+	for stmt.Step() {
+		candidates = append(candidates, stmt.ColumnInt64(0))
+	}
+	if err := stmt.Err(); err != nil {
+		stmt.Close()
+		return nil, errors.WithStack(err)
+	}
+	if err := stmt.Close(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Re-score the candidates with the float vectors (same L2-on-normalized
+	// metric as the direct KNN), then keep the top k.
+	jsonCandidates, err := json.Marshal(candidates)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	rescoreSQL := fmt.Sprintf(`
+		SELECT v.rowid, vec_distance_l2(v.embedding, vec_normalize(vec_slice(?, 0, %d)))
+		FROM embeddings_vec2 v
+		WHERE v.rowid IN ( SELECT value FROM json_each(?) );`, i.vectorSize)
+
+	rescore, _, err := conn.Prepare(rescoreSQL)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer rescore.Close()
+
+	if err := rescore.BindBlob(1, queryVec); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := rescore.BindText(2, string(jsonCandidates)); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	var matches []vecMatch
+	for rescore.Step() {
+		matches = append(matches, vecMatch{rowID: rescore.ColumnInt64(0), distance: rescore.ColumnFloat(1)})
+	}
+	if err := rescore.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	slices.SortFunc(matches, func(a, b vecMatch) int {
+		return cmp.Compare(a.distance, b.distance)
+	})
+	if len(matches) > k {
+		matches = matches[:k]
+	}
+
+	return matches, nil
+}
+
+// resolveMatches maps the KNN hits back to chunks (via embeddings_vec_map),
+// deduplicates chunks reached through several collection partitions (keeping
+// their best distance), truncates to the maxResults best chunks and
+// aggregates them into per-source results, scored like the previous
+// implementation (sum of 1/distance).
+func resolveMatches(conn *sqlite3.Conn, matches []vecMatch, maxResults int) ([]*index.SearchResult, error) {
+	searchResults := make([]*index.SearchResult, 0)
+	if len(matches) == 0 {
+		return searchResults, nil
+	}
+
+	rowIDs := make([]int64, 0, len(matches))
+	for _, m := range matches {
+		rowIDs = append(rowIDs, m.rowID)
+	}
+
+	jsonRowIDs, err := json.Marshal(rowIDs)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	stmt, _, err := conn.Prepare(`
+		SELECT m.id, m.embeddings_id, e.source, e.section_id
+		FROM embeddings_vec_map m
+		JOIN embeddings e ON e.id = m.embeddings_id
+		WHERE m.id IN ( SELECT value FROM json_each(?) );`)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer stmt.Close()
+
+	if err := stmt.BindText(1, string(jsonRowIDs)); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	type chunkInfo struct {
+		embeddingsID int64
+		source       string
+		sectionID    string
+	}
+
+	byRowID := make(map[int64]chunkInfo, len(matches))
+	for stmt.Step() {
+		byRowID[stmt.ColumnInt64(0)] = chunkInfo{
+			embeddingsID: stmt.ColumnInt64(1),
+			source:       stmt.ColumnText(2),
+			sectionID:    stmt.ColumnText(3),
+		}
+	}
+	if err := stmt.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	// Deduplicate by chunk, keeping the best distance.
+	type chunkHit struct {
+		chunkInfo
+		distance float64
+	}
+
+	best := map[int64]chunkHit{}
+	for _, m := range matches {
+		info, exists := byRowID[m.rowID]
+		if !exists {
+			continue
+		}
+		if existing, exists := best[info.embeddingsID]; !exists || m.distance < existing.distance {
+			best[info.embeddingsID] = chunkHit{chunkInfo: info, distance: m.distance}
+		}
+	}
+
+	hits := make([]chunkHit, 0, len(best))
+	for _, h := range best {
+		hits = append(hits, h)
+	}
+	slices.SortFunc(hits, func(a, b chunkHit) int {
+		if c := cmp.Compare(a.distance, b.distance); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.embeddingsID, b.embeddingsID)
+	})
+	if len(hits) > maxResults {
+		hits = hits[:maxResults]
+	}
+
+	mappedScores := map[string]float64{}
+	mappedSections := map[string][]model.SectionID{}
+	mappedSectionScores := map[string]map[model.SectionID]float64{}
+
+	for _, h := range hits {
+		if _, exists := mappedSections[h.source]; !exists {
+			mappedSections[h.source] = make([]model.SectionID, 0)
+			mappedSectionScores[h.source] = map[model.SectionID]float64{}
+		}
+
+		distance := h.distance
+		if distance == 0 {
+			distance = math.SmallestNonzeroFloat64
+		}
+		score := 1 / distance
+
+		mappedSections[h.source] = append(mappedSections[h.source], model.SectionID(h.sectionID))
+		mappedScores[h.source] += score
+		mappedSectionScores[h.source][model.SectionID(h.sectionID)] += score
+	}
+
+	for rawSource, sectionIDs := range mappedSections {
+		source, err := url.Parse(rawSource)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		searchResults = append(searchResults, &index.SearchResult{
+			Source:        source,
+			Sections:      sectionIDs,
+			Score:         mappedScores[rawSource],
+			SectionScores: mappedSectionScores[rawSource],
+		})
+	}
+
+	slices.SortFunc(searchResults, func(r1, r2 *index.SearchResult) int {
+		return cmp.Compare(mappedScores[r2.Source.String()], mappedScores[r1.Source.String()])
+	})
 
 	return searchResults, nil
 }
@@ -912,10 +1177,17 @@ func retryOnConn(ctx context.Context, conn *sqlite3.Conn, fn func(ctx context.Co
 // size is rejected to prevent silently mixing incompatible vectors.
 func NewIndex(conn *sqlite3.Conn, client llm.Client, funcs ...OptionFunc) *Index {
 	opts := NewOptions(funcs...)
+
+	if opts.CoarseQuantization && !supportsCoarse(opts.VectorSize) {
+		slog.Warn("sqlitevec: coarse quantization requires a vector size divisible by 8; disabling it", slog.Int("vectorSize", opts.VectorSize))
+		opts.CoarseQuantization = false
+	}
+
 	return &Index{
 		maxWords:              opts.MaxWords,
 		vectorSize:            opts.VectorSize,
 		embeddingsConcurrency: opts.EmbeddingsConcurrency,
+		coarse:                opts.CoarseQuantization,
 		llm:                   client,
 		model:                 opts.EmbeddingsModel,
 		getConn:               createGetConn(conn, opts.EmbeddingsModel, opts.VectorSize),
@@ -930,6 +1202,10 @@ func NewIndex(conn *sqlite3.Conn, client llm.Client, funcs ...OptionFunc) *Index
 // and the returned index must be Closed by the caller.
 func NewIndexAtPath(path string, client llm.Client, funcs ...OptionFunc) (*Index, error) {
 	opts := NewOptions(funcs...)
+
+	if opts.CoarseQuantization && !supportsCoarse(opts.VectorSize) {
+		return nil, errors.Errorf("sqlitevec: coarse quantization requires a vector size divisible by 8 (got %d)", opts.VectorSize)
+	}
 
 	writer, err := sqlite3.Open(path)
 	if err != nil {
@@ -971,6 +1247,7 @@ func NewIndexAtPath(path string, client llm.Client, funcs ...OptionFunc) (*Index
 		maxWords:              opts.MaxWords,
 		vectorSize:            opts.VectorSize,
 		embeddingsConcurrency: opts.EmbeddingsConcurrency,
+		coarse:                opts.CoarseQuantization,
 		llm:                   client,
 		model:                 opts.EmbeddingsModel,
 		getConn: func(ctx context.Context) (*sqlite3.Conn, error) {
@@ -1005,19 +1282,24 @@ var (
 func (i *Index) Semantic() bool { return true }
 
 // initializeConn applies the connection pragmas, runs the schema migrations
-// and records/verifies the index identity (embeddings model + vector size).
+// (including the versioned vec0 schema upgrade) and records/verifies the
+// index identity (embeddings model + vector size).
 func initializeConn(conn *sqlite3.Conn, model string, vectorSize int) error {
 	if err := conn.Exec("PRAGMA journal_mode=wal; PRAGMA foreign_keys=on; PRAGMA busy_timeout=30000"); err != nil {
 		return errors.WithStack(err)
 	}
 
-	for _, sql := range migrations(vectorSize) {
+	for _, sql := range migrations() {
 		if err := conn.Exec(sql); err != nil {
 			return errors.Wrapf(err, "could not execute migration '%s'", sql)
 		}
 	}
 
 	if err := checkMetadata(conn, model, vectorSize); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := upgradeSchema(conn, vectorSize); err != nil {
 		return errors.WithStack(err)
 	}
 

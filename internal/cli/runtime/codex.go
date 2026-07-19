@@ -256,6 +256,9 @@ func (rt *Runtime) openLocalIndexers(ctx context.Context, ws *workspace.Workspac
 		if cfg.Index.Vector.ReadPool > 0 {
 			vecOpts = append(vecOpts, sqlitevecIndex.WithReadPoolSize(cfg.Index.Vector.ReadPool))
 		}
+		if cfg.Index.Vector.CoarseQuantization {
+			vecOpts = append(vecOpts, sqlitevecIndex.WithCoarseQuantization(true))
+		}
 
 		// NewIndexAtPath owns a writer plus a read pool, so concurrent searches
 		// (e.g. the MCP HTTP server) don't serialize on a single connection.
@@ -284,7 +287,9 @@ func (f closerFunc) Close() error { return f() }
 
 // retrievalOptions maps the llm and retrieval configuration sections to Codex
 // options. Without a chat client the LLM-driven pipeline stages are disabled
-// (the config validation already rejected combinations requiring one).
+// (the config validation already rejected combinations requiring one). The
+// retrieval profile sets the stage baseline; the explicit keys still apply on
+// top of it (they can enable more stages, not disable the profile's).
 func retrievalOptions(cfg *config.Config, client llm.Client, stageClients map[string]llm.Client) []amoxtli.Option {
 	if !cfg.HasChat() {
 		return []amoxtli.Option{
@@ -299,6 +304,22 @@ func retrievalOptions(cfg *config.Config, client llm.Client, stageClients map[st
 		opts = append(opts, amoxtli.WithStageLLMClient(amoxtli.Stage(name), stageClient))
 	}
 
+	groundingCheck := cfg.Retrieval.GroundingCheck || cfg.Retrieval.Iterative.Enabled
+
+	switch cfg.Retrieval.Profile {
+	case config.ProfileFast:
+		// No per-search chat call: search is embeddings + RRF + dedup. The
+		// chat client stays available for explicitly enabled stages (--deep,
+		// reranking, grounding).
+		opts = append(opts, amoxtli.WithDisableHyDE(), amoxtli.WithDisableJudge())
+	case config.ProfileBalanced:
+		// HyDE only (one seeded, cached chat call per distinct query).
+		opts = append(opts, amoxtli.WithDisableJudge())
+	case config.ProfilePrecision:
+		// HyDE + the fused grounding evaluator (which replaces the Judge).
+		groundingCheck = true
+	}
+
 	if cfg.Retrieval.MaxTotalWords > 0 {
 		opts = append(opts, amoxtli.WithMaxTotalWords(cfg.Retrieval.MaxTotalWords))
 	}
@@ -311,7 +332,7 @@ func retrievalOptions(cfg *config.Config, client llm.Client, stageClients map[st
 		opts = append(opts, amoxtli.WithReranking())
 	}
 
-	if cfg.Retrieval.GroundingCheck || cfg.Retrieval.Iterative.Enabled {
+	if groundingCheck {
 		opts = append(opts, amoxtli.WithGroundingCheck())
 		if cfg.Retrieval.GroundingFailOpen {
 			opts = append(opts, amoxtli.WithGroundingFailOpen())

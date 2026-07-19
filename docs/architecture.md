@@ -6,7 +6,7 @@
 | `model` | Modèle de domaine : Document, Section, Collection |
 | `index` | Contrat `index.Index` + options de recherche |
 | `index/bleve` | Backend plein-texte (bleve) |
-| `index/sqlitevec` | Backend vectoriel (sqlite-vec + embeddings) |
+| `index/sqlitevec` | Backend vectoriel (sqlite-vec + embeddings) : vec0 partitionné par collection, quantization binaire optionnelle |
 | `index/postgres` | Backend hybride PostgreSQL (FTS `tsvector` + pgvector, fusion RRF) |
 | `index/pipeline` | Index composite : fusion RRF pondérée par index + transformers (HyDE, Judge, dédup) |
 | `retrieval` | Orchestration de récupération pilotée par le grounding (γ) : vérification, re-retrieval itératif, décomposition de requête, reranker LLM |
@@ -52,6 +52,29 @@ Un document peut porter des métadonnées arbitraires (`map[string]any` : auteur
 ### Reranking (`ingest.Reranker`)
 
 `WithReranking()` insère un reranker LLM (`retrieval.NewLLMReranker`) dans le pipeline de recherche : il réordonne les candidats fusionnés (et filtrés) par pertinence à la requête, réutilisant le budget `WithMaxTotalWords` pour borner le prompt. Contrairement au Judge (qui filtre), le reranker ne fait que réordonner. Il s'exécute après le filtrage métadonnées et avant la pagination, donc l'ordre reranké est celui exposé et encodé dans les curseurs.
+
+### Index vectoriel sqlite-vec : partition et quantization
+
+vec0 effectue un **scan exhaustif** (pas d'index ANN). Deux leviers en bornent
+le coût :
+
+- **Partition par collection** (schéma v2) : une ligne vec0 par
+  (chunk × collection), la collection étant la *partition key* vec0. Une
+  recherche filtrée ne scanne que les lignes de sa collection **et garantit k
+  résultats issus de la collection** — l'ancien filtre post-KNN pouvait en
+  retourner silencieusement moins (les k voisins globaux pouvaient vivre
+  ailleurs). Les chunks sans collection vivent dans la partition `''` ; une
+  recherche non filtrée scanne toutes les partitions et déduplique les chunks
+  multi-collections. La table `embeddings_vec_map` relie les rowids vec0 aux
+  chunks (`embeddings_id`) avec un index classique. La migration v1→v2 est
+  automatique à l'ouverture : les blobs existants sont **re-liés, pas
+  re-calculés**.
+- **Quantization binaire** (`coarse_quantization`, opt-in, dimension divisible
+  par 8) : recherche en deux temps — KNN Hamming sur la colonne
+  `embedding_coarse bit[N]` (~30× plus rapide) présélectionnant k×8 candidats,
+  puis re-scoring float et tri. Perte de qualité marginale (littérature < 1 %),
+  pertinent au-delà de ~100k chunks. À valider sur le harness d'éval avant de
+  l'activer en production.
 
 ### Coût LLM par recherche
 

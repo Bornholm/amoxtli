@@ -26,6 +26,7 @@ type SnapshottedMetadata struct {
 type SnapshottedRecord struct {
 	Source      string
 	SectionID   string
+	ChunkIndex  int
 	Embeddings  []byte
 	Collections []string
 }
@@ -49,16 +50,23 @@ func (i *Index) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
 		}
 
 		err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+			// One record per chunk. The vector blob lives in vec0; a chunk in
+			// several collections has one identical vector row per collection,
+			// so any of them (MIN map id) is representative.
 			sql := `
 				SELECT
 					e.id,
 					e.source,
 					e.section_id,
-					e.embeddings,
-					COALESCE(json_group_array(ec.collection_id), '[]') AS collections
+					e.chunk_index,
+					(
+						SELECT v.embedding FROM embeddings_vec2 v
+						WHERE v.rowid = ( SELECT MIN(m.id) FROM embeddings_vec_map m WHERE m.embeddings_id = e.id )
+					),
+					COALESCE(json_group_array(ec.collection_id) FILTER ( WHERE ec.collection_id IS NOT NULL ), '[]') AS collections
 				FROM embeddings e
 				LEFT JOIN embeddings_collections ec ON e.id = ec.embeddings_id
-				GROUP BY e.id, e.source, e.section_id
+				GROUP BY e.id, e.source, e.section_id, e.chunk_index
 				;
 			`
 
@@ -73,8 +81,9 @@ func (i *Index) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
 				record := SnapshottedRecord{}
 				record.Source = stmt.ColumnText(1)
 				record.SectionID = stmt.ColumnText(2)
-				record.Embeddings = stmt.ColumnBlob(3, []byte{})
-				rawCollections := stmt.ColumnBlob(4, []byte{})
+				record.ChunkIndex = stmt.ColumnInt(3)
+				record.Embeddings = stmt.ColumnBlob(4, []byte{})
+				rawCollections := stmt.ColumnBlob(5, []byte{})
 				if err := json.Unmarshal(rawCollections, &record.Collections); err != nil {
 					return errors.WithStack(err)
 				}
@@ -114,8 +123,15 @@ func (i *Index) RestoreSnapshot(ctx context.Context, r io.Reader) error {
 	}
 
 	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
-		if err := conn.Exec("DELETE FROM embeddings;"); err != nil {
-			return errors.WithStack(err)
+		for _, sql := range []string{
+			"DELETE FROM embeddings_vec2;",
+			"DELETE FROM embeddings_vec_map;",
+			"DELETE FROM embeddings_collections;",
+			"DELETE FROM embeddings;",
+		} {
+			if err := conn.Exec(sql); err != nil {
+				return errors.WithStack(err)
+			}
 		}
 
 		return nil
@@ -163,57 +179,99 @@ func (i *Index) restoreRecords(ctx context.Context, records ...*SnapshottedRecor
 	}()
 
 	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		insertStmt, _, err := conn.Prepare("INSERT INTO embeddings ( source, section_id, chunk_index ) VALUES (?, ?, ?) RETURNING id;")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		defer insertStmt.Close()
+
+		mapStmt, _, err := conn.Prepare("INSERT INTO embeddings_vec_map ( embeddings_id, collection_id ) VALUES (?, ?) RETURNING id;")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		defer mapStmt.Close()
+
+		// The snapshotted vectors are already normalized/sliced, so they are
+		// reinserted as-is (vec_slice would reject a shorter stored vector).
+		vecSQL := "INSERT INTO embeddings_vec2 ( rowid, embedding, collection_id ) VALUES (?, ?, ?);"
+		if i.hasCoarse() {
+			vecSQL = "INSERT INTO embeddings_vec2 ( rowid, embedding, embedding_coarse, collection_id ) VALUES (?, ?, vec_quantize_binary(?), ?);"
+		}
+		vecStmt, _, err := conn.Prepare(vecSQL)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		defer vecStmt.Close()
 
 		restoreRecord := func(record *SnapshottedRecord) error {
-			deleteStmt, _, err := conn.Prepare("DELETE FROM embeddings WHERE source = ? and section_id = ?;")
-			if err != nil {
-				return errors.WithStack(err)
-			}
-
-			defer deleteStmt.Close()
-
-			if err := deleteStmt.BindText(1, record.Source); err != nil {
-				return errors.WithStack(err)
-			}
-
-			if err := deleteStmt.BindText(2, record.SectionID); err != nil {
-				return errors.WithStack(err)
-			}
-
-			if err := deleteStmt.Exec(); err != nil {
-				return errors.WithStack(err)
-			}
-
-			if err := deleteStmt.Close(); err != nil {
-				return errors.WithStack(err)
-			}
-
-			insertStmt, _, err := conn.Prepare("INSERT INTO embeddings ( source, section_id, embeddings ) VALUES (?, ?, ?) RETURNING id;")
-			if err != nil {
-				return errors.WithStack(err)
-			}
-
-			defer insertStmt.Close()
-
 			if err := insertStmt.BindText(1, record.Source); err != nil {
 				return errors.WithStack(err)
 			}
-
 			if err := insertStmt.BindText(2, record.SectionID); err != nil {
 				return errors.WithStack(err)
 			}
-
-			if err := insertStmt.BindBlob(3, record.Embeddings); err != nil {
+			if err := insertStmt.BindInt(3, record.ChunkIndex); err != nil {
 				return errors.WithStack(err)
 			}
 
-			insertStmt.Step()
-
-			if err := insertStmt.Err(); err != nil {
-				return errors.WithStack(err)
+			if hasRow := insertStmt.Step(); !hasRow {
+				if err := insertStmt.Err(); err != nil {
+					return errors.WithStack(err)
+				}
+				return errors.New("no id returned")
 			}
 
 			embeddingsID := insertStmt.ColumnInt(0)
+			if err := insertStmt.Reset(); err != nil {
+				return errors.WithStack(err)
+			}
+
+			partitions := []string{""}
+			if len(record.Collections) > 0 {
+				partitions = record.Collections
+			}
+
+			for _, partition := range partitions {
+				if err := mapStmt.BindInt(1, embeddingsID); err != nil {
+					return errors.WithStack(err)
+				}
+				if err := mapStmt.BindText(2, partition); err != nil {
+					return errors.WithStack(err)
+				}
+				if hasRow := mapStmt.Step(); !hasRow {
+					if err := mapStmt.Err(); err != nil {
+						return errors.WithStack(err)
+					}
+					return errors.New("no vec map id returned")
+				}
+				vecRowID := mapStmt.ColumnInt64(0)
+				if err := mapStmt.Reset(); err != nil {
+					return errors.WithStack(err)
+				}
+
+				if err := vecStmt.BindInt64(1, vecRowID); err != nil {
+					return errors.WithStack(err)
+				}
+				if err := vecStmt.BindBlob(2, record.Embeddings); err != nil {
+					return errors.WithStack(err)
+				}
+				next := 3
+				if i.hasCoarse() {
+					if err := vecStmt.BindBlob(3, record.Embeddings); err != nil {
+						return errors.WithStack(err)
+					}
+					next = 4
+				}
+				if err := vecStmt.BindText(next, partition); err != nil {
+					return errors.WithStack(err)
+				}
+				if err := vecStmt.Exec(); err != nil {
+					return errors.WithStack(err)
+				}
+				if err := vecStmt.Reset(); err != nil {
+					return errors.WithStack(err)
+				}
+			}
 
 			for _, collectionID := range record.Collections {
 				if err := i.insertCollection(ctx, conn, embeddingsID, model.CollectionID(collectionID)); err != nil {

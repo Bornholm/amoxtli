@@ -200,6 +200,16 @@ func TestParseErrors(t *testing.T) {
 			wantErr: "llm.stages requires llm.chat",
 		},
 		{
+			name:    "unknown retrieval profile",
+			raw:     "retrieval:\n  profile: turbo",
+			wantErr: "unknown profile",
+		},
+		{
+			name:    "balanced profile without chat",
+			raw:     "retrieval:\n  profile: balanced",
+			wantErr: "requires llm.chat",
+		},
+		{
 			name:    "unknown stage",
 			raw:     "llm:\n  chat:\n    provider: openai\n    model: m\n  stages:\n    hype:\n      provider: openai\n      model: m",
 			wantErr: "unknown stage",

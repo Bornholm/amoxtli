@@ -47,6 +47,23 @@ d'embeddings est configuré sous `llm.embeddings`. Les fonctions pilotées par L
 `openrouter` et `mistral`. Le fournisseur `openai` couvre en outre tout endpoint
 compatible OpenAI (Ollama, vLLM…) via `base_url`.
 
+### Profils de récupération
+
+`retrieval.profile` choisit un préréglage des étages LLM, du moins cher au plus
+poussé — les clés explicites (`reranking`, `grounding_check`, …) s'ajoutent
+par-dessus :
+
+| Profil | Étages | Appels chat / recherche |
+|---|---|---|
+| `fast` | embeddings + fusion RRF + dédup | 0 |
+| `balanced` | + HyDE (seedé, mis en cache) | 1 (0 si requête répétée) |
+| `precision` | + évaluateur de grounding | 2 |
+| *(vide)* | défaut historique : HyDE + Judge | 2 |
+
+`fast` fonctionne sans `llm.chat` ; `balanced` et `precision` l'exigent. Les
+évals SciFact montrent que la qualité vient d'abord de l'embedder : `fast` est
+généralement compétitif pour une fraction du coût.
+
 ### Cache LLM
 
 Dès que `llm.embeddings` ou `llm.chat` est configuré, un cache persistant sur
