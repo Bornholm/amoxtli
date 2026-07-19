@@ -39,6 +39,8 @@ index:
     # for large-file indexing speed. Raise if your embeddings endpoint tolerates
     # more concurrency; lower to avoid rate limiting (429). 0 = default (8).
     embeddings_concurrency: 0
+    # Dedicated read connections for concurrent searches (WAL). 0 = default (4).
+    read_pool: 0
   # Hybrid PostgreSQL index (index.driver: postgres). Requires the "vector" and
   # "unaccent" extensions. The vector leg activates when llm.embeddings is set.
   #
@@ -65,12 +67,25 @@ index:
 #     base_url: http://localhost:11434/v1
 #     model: bge-m3
 #     api_key: ${OLLAMA_API_KEY:-ollama}
-#     # Persistent on-disk cache for computed vectors: re-indexing unchanged
-#     # content and repeated queries stop hitting the endpoint. Enabled by
-#     # default ("auto"); purge it with "amoxtli cache purge".
-#     cache:
-#       enabled: auto
-#       path: cache/embeddings
+#   # Persistent on-disk LLM cache: embedding vectors and deterministic seeded
+#   # chat completions (HyDE). Re-indexing unchanged content and repeating a
+#   # query stop hitting the endpoints. Enabled by default ("auto"); purge it
+#   # with "amoxtli cache purge".
+#   cache:
+#     enabled: auto
+#     path: cache
+#   # Dedicated chat client per retrieval stage (hyde, judge, grounding,
+#   # rerank, decompose, reformulate), overriding llm.chat for that stage.
+#   # Main cost lever: point the high-volume stages at a small fast model.
+#   stages:
+#     hyde:
+#       provider: openrouter
+#       model: anthropic/claude-haiku-4.5
+#       api_key: ${OPENROUTER_API_KEY}
+#     judge:
+#       provider: openrouter
+#       model: anthropic/claude-haiku-4.5
+#       api_key: ${OPENROUTER_API_KEY}
 
 # Retrieval enhancements; all of them require llm.chat.
 retrieval:
@@ -82,6 +97,10 @@ retrieval:
   # so keep this well under your chat endpoint's context window. 0 uses the
   # built-in default (8000, ~14k tokens). Lower it for smaller context windows.
   max_total_words: 0
+  # Per-section cap (in words) inside those prompts, on top of max_total_words:
+  # relevance is almost always judgeable from the beginning of a section. 0 uses
+  # the built-in default (200).
+  max_section_words: 0
   iterative:
     enabled: false
     max_rounds: 2

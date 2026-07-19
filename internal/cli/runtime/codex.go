@@ -22,7 +22,6 @@ import (
 	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/genai/llm"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
 )
 
@@ -33,9 +32,9 @@ type Runtime struct {
 
 	lock    *Lock
 	closers []io.Closer
-	// embeddingsCache is the caching decorator around the LLM client when the
-	// embeddings cache is enabled; kept to report hit/miss stats on Close.
-	embeddingsCache *llmx.CachingClient
+	// llmCache is the caching decorator around the default LLM client when the
+	// LLM cache is enabled; kept to report hit/miss stats on Close.
+	llmCache *llmx.CachingClient
 }
 
 // Open acquires the workspace lock and wires the configuration into a Codex.
@@ -73,7 +72,7 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 	}
 
 	if cached, ok := client.(*llmx.CachingClient); ok {
-		rt.embeddingsCache = cached
+		rt.llmCache = cached
 	}
 
 	// Both the gorm SQLite store and the sqlite-vec index hand a WASM build to
@@ -102,7 +101,12 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 		amoxtli.WithIndexers(indexers...),
 	}
 
-	opts = append(opts, retrievalOptions(cfg, client)...)
+	stageClients, err := newStageLLMClients(ctx, ws, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	opts = append(opts, retrievalOptions(cfg, client, stageClients)...)
 
 	converter, err := newFileConverter(ctx, cfg)
 	if err != nil {
@@ -237,13 +241,6 @@ func (rt *Runtime) openLocalIndexers(ctx context.Context, ws *workspace.Workspac
 	}
 
 	if cfg.VectorEnabled() {
-		conn, err := sqlite3.Open(ws.Resolve(cfg.Index.Vector.Path))
-		if err != nil {
-			return nil, errors.Wrap(err, "could not open vector index")
-		}
-
-		rt.closers = append(rt.closers, conn)
-
 		vecOpts := []sqlitevecIndex.OptionFunc{
 			sqlitevecIndex.WithEmbeddingsModel(cfg.LLM.Embeddings.Model),
 		}
@@ -256,10 +253,22 @@ func (rt *Runtime) openLocalIndexers(ctx context.Context, ws *workspace.Workspac
 		if cfg.Index.Vector.EmbeddingsConcurrency > 0 {
 			vecOpts = append(vecOpts, sqlitevecIndex.WithEmbeddingsConcurrency(cfg.Index.Vector.EmbeddingsConcurrency))
 		}
+		if cfg.Index.Vector.ReadPool > 0 {
+			vecOpts = append(vecOpts, sqlitevecIndex.WithReadPoolSize(cfg.Index.Vector.ReadPool))
+		}
+
+		// NewIndexAtPath owns a writer plus a read pool, so concurrent searches
+		// (e.g. the MCP HTTP server) don't serialize on a single connection.
+		idx, err := sqlitevecIndex.NewIndexAtPath(ws.Resolve(cfg.Index.Vector.Path), client, vecOpts...)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not open vector index")
+		}
+
+		rt.closers = append(rt.closers, idx)
 
 		indexers = append(indexers, amoxtli.Indexer{
 			ID:     "vector",
-			Index:  sqlitevecIndex.NewIndex(conn, client, vecOpts...),
+			Index:  idx,
 			Weight: cfg.Index.Vector.Weight,
 		})
 	}
@@ -276,7 +285,7 @@ func (f closerFunc) Close() error { return f() }
 // retrievalOptions maps the llm and retrieval configuration sections to Codex
 // options. Without a chat client the LLM-driven pipeline stages are disabled
 // (the config validation already rejected combinations requiring one).
-func retrievalOptions(cfg *config.Config, client llm.Client) []amoxtli.Option {
+func retrievalOptions(cfg *config.Config, client llm.Client, stageClients map[string]llm.Client) []amoxtli.Option {
 	if !cfg.HasChat() {
 		return []amoxtli.Option{
 			amoxtli.WithDisableHyDE(),
@@ -286,8 +295,16 @@ func retrievalOptions(cfg *config.Config, client llm.Client) []amoxtli.Option {
 
 	opts := []amoxtli.Option{amoxtli.WithLLMClient(client)}
 
+	for name, stageClient := range stageClients {
+		opts = append(opts, amoxtli.WithStageLLMClient(amoxtli.Stage(name), stageClient))
+	}
+
 	if cfg.Retrieval.MaxTotalWords > 0 {
 		opts = append(opts, amoxtli.WithMaxTotalWords(cfg.Retrieval.MaxTotalWords))
+	}
+
+	if cfg.Retrieval.MaxSectionWords > 0 {
+		opts = append(opts, amoxtli.WithMaxWordsPerSectionInPrompt(cfg.Retrieval.MaxSectionWords))
 	}
 
 	if cfg.Retrieval.Reranking {
@@ -331,9 +348,12 @@ func (r *Runtime) Close() error {
 		keep(r.Codex.Close())
 	}
 
-	if r.embeddingsCache != nil {
-		if hits, misses := r.embeddingsCache.Stats(); hits+misses > 0 {
+	if r.llmCache != nil {
+		if hits, misses := r.llmCache.Stats(); hits+misses > 0 {
 			slog.Debug("embeddings cache", slog.Int64("hits", hits), slog.Int64("misses", misses))
+		}
+		if hits, misses := r.llmCache.ChatStats(); hits+misses > 0 {
+			slog.Debug("chat cache", slog.Int64("hits", hits), slog.Int64("misses", misses))
 		}
 	}
 

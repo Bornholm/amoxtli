@@ -87,12 +87,29 @@ type VectorIndexConfig struct {
 	// concurrent requests; lower it to avoid rate limiting (429). 0 defers to the
 	// library default.
 	EmbeddingsConcurrency int `yaml:"embeddings_concurrency"`
+	// ReadPool is the number of dedicated read connections opened for
+	// concurrent searches (WAL). 0 defers to the library default (4).
+	ReadPool int `yaml:"read_pool"`
 }
 
 type LLMConfig struct {
-	Chat       *ClientConfig           `yaml:"chat"`
-	Embeddings *EmbeddingsClientConfig `yaml:"embeddings"`
+	Chat       *ClientConfig `yaml:"chat"`
+	Embeddings *ClientConfig `yaml:"embeddings"`
+	// Stages assigns a dedicated chat client to individual retrieval stages
+	// (hyde, judge, grounding, rerank, decompose, reformulate), overriding
+	// llm.chat for that stage. The main cost lever of a search: point the
+	// high-volume stages (hyde, judge) at a small fast model while keeping a
+	// stronger model as the default. Requires llm.chat.
+	Stages map[string]*ClientConfig `yaml:"stages"`
+	// Cache is the persistent on-disk LLM cache: embedding vectors (below
+	// <path>/embeddings) and deterministic seeded chat completions such as
+	// HyDE (below <path>/chat).
+	Cache LLMCacheConfig `yaml:"cache"`
 }
+
+// StageNames lists the retrieval stages accepted under llm.stages, mirroring
+// amoxtli.Stages.
+var StageNames = []string{"hyde", "judge", "grounding", "rerank", "decompose", "reformulate"}
 
 type ClientConfig struct {
 	Provider string `yaml:"provider"`
@@ -101,30 +118,23 @@ type ClientConfig struct {
 	APIKey   string `yaml:"api_key"`
 }
 
-// EmbeddingsClientConfig is the embeddings endpoint configuration: the client
-// itself plus the on-disk cache for computed vectors.
-type EmbeddingsClientConfig struct {
-	ClientConfig `yaml:",inline"`
-	Cache        EmbeddingsCacheConfig `yaml:"cache"`
-}
-
-// EmbeddingsCacheConfig configures the persistent embeddings cache. Embedding
-// a text is deterministic for a given model, so vectors are reused across
-// runs: re-indexing unchanged content and repeated queries become cache hits
-// instead of billable, rate-limited calls.
-type EmbeddingsCacheConfig struct {
+// LLMCacheConfig configures the persistent LLM cache. Embedding a text is
+// deterministic for a given model — and the HyDE completion is seeded per
+// query — so both are reused across runs: re-indexing unchanged content and
+// repeating a query become cache hits instead of billable, rate-limited calls.
+type LLMCacheConfig struct {
 	// Enabled accepts true, false or "auto"; auto (the default) enables the
-	// cache whenever an embeddings client is configured.
+	// cache whenever an embeddings or chat client is configured.
 	Enabled Toggle `yaml:"enabled"`
-	// Path is the cache directory, relative to the .amoxtli directory (default
-	// "cache/embeddings"). Entries are keyed by embeddings model, so switching
-	// model never serves vectors from the wrong space.
+	// Path is the cache root directory, relative to the .amoxtli directory
+	// (default "cache"). Entries are keyed by model, so switching model never
+	// serves results from the wrong space.
 	Path string `yaml:"path"`
 }
 
-// DefaultEmbeddingsCachePath is the embeddings cache location used when
-// llm.embeddings.cache.path is left empty, relative to the .amoxtli directory.
-const DefaultEmbeddingsCachePath = "cache/embeddings"
+// DefaultLLMCachePath is the LLM cache root used when llm.cache.path is left
+// empty, relative to the .amoxtli directory.
+const DefaultLLMCachePath = "cache"
 
 // SupportedProviders lists the llm.chat / llm.embeddings providers the CLI
 // can wire. All share provider.CommonOptions (model, base_url, api_key).
@@ -151,9 +161,14 @@ type RetrievalConfig struct {
 	// a coarse proxy for tokens (~1.8 tokens/word on mixed prose and code), so
 	// 18000 words already overflow a 32k-token limit. Zero defers to the
 	// library default (8000).
-	MaxTotalWords int                 `yaml:"max_total_words"`
-	Iterative     IterativeConfig     `yaml:"iterative"`
-	Decomposition DecompositionConfig `yaml:"decomposition"`
+	MaxTotalWords int `yaml:"max_total_words"`
+	// MaxSectionWords bounds how many words of each retrieved section are
+	// included in those prompts, on top of MaxTotalWords. Relevance is almost
+	// always judgeable from the beginning of a section, so a low cap cuts the
+	// per-search prompt cost. Zero defers to the library default (200).
+	MaxSectionWords int                 `yaml:"max_section_words"`
+	Iterative       IterativeConfig     `yaml:"iterative"`
+	Decomposition   DecompositionConfig `yaml:"decomposition"`
 }
 
 type IterativeConfig struct {
@@ -273,20 +288,20 @@ func (c *Config) HasEmbeddings() bool {
 	return c.LLM.Embeddings != nil && c.LLM.Embeddings.Model != ""
 }
 
-// EmbeddingsCacheEnabled resolves the embeddings cache toggle: enabled by
-// default as soon as an embeddings client is configured.
-func (c *Config) EmbeddingsCacheEnabled() bool {
-	return c.HasEmbeddings() && c.LLM.Embeddings.Cache.Enabled.Resolve(true)
+// LLMCacheEnabled resolves the LLM cache toggle: enabled by default as soon as
+// an embeddings or chat client is configured.
+func (c *Config) LLMCacheEnabled() bool {
+	return (c.HasEmbeddings() || c.HasChat()) && c.LLM.Cache.Enabled.Resolve(true)
 }
 
-// EmbeddingsCachePath returns the configured embeddings cache directory,
-// falling back to DefaultEmbeddingsCachePath. The path may be relative to the
-// .amoxtli directory (resolve it with workspace.Resolve).
-func (c *Config) EmbeddingsCachePath() string {
-	if c.LLM.Embeddings != nil && c.LLM.Embeddings.Cache.Path != "" {
-		return c.LLM.Embeddings.Cache.Path
+// LLMCachePath returns the configured LLM cache root directory, falling back
+// to DefaultLLMCachePath. The path may be relative to the .amoxtli directory
+// (resolve it with workspace.Resolve).
+func (c *Config) LLMCachePath() string {
+	if c.LLM.Cache.Path != "" {
+		return c.LLM.Cache.Path
 	}
-	return DefaultEmbeddingsCachePath
+	return DefaultLLMCachePath
 }
 
 // VectorEnabled resolves the vector index toggle against the presence of an
@@ -407,18 +422,29 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	var embeddingsClient *ClientConfig
-	if c.LLM.Embeddings != nil {
-		embeddingsClient = &c.LLM.Embeddings.ClientConfig
+	if len(c.LLM.Stages) > 0 && !c.HasChat() {
+		return errors.New("llm.stages requires llm.chat to be configured (stages override the default chat client)")
 	}
 
-	for _, client := range []struct {
+	clients := []struct {
 		name string
 		cfg  *ClientConfig
 	}{
 		{"llm.chat", c.LLM.Chat},
-		{"llm.embeddings", embeddingsClient},
-	} {
+		{"llm.embeddings", c.LLM.Embeddings},
+	}
+
+	for name, stage := range c.LLM.Stages {
+		if !slices.Contains(StageNames, name) {
+			return errors.Errorf("llm.stages: unknown stage %q (supported: %v)", name, StageNames)
+		}
+		clients = append(clients, struct {
+			name string
+			cfg  *ClientConfig
+		}{"llm.stages." + name, stage})
+	}
+
+	for _, client := range clients {
 		if client.cfg == nil {
 			continue
 		}

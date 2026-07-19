@@ -76,7 +76,7 @@ func TestCachingClientTreatsCorruptedEntryAsMiss(t *testing.T) {
 	}
 
 	// Corrupt every cache entry on disk.
-	entries, err := filepath.Glob(filepath.Join(dir, "*", "*.json"))
+	entries, err := filepath.Glob(filepath.Join(dir, "embeddings", "*", "*.json"))
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("expected 1 cache entry, got %v (err %v)", entries, err)
 	}

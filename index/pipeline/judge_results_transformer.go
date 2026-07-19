@@ -15,11 +15,33 @@ import (
 	"github.com/pkg/errors"
 )
 
-// Hypothetical document
+// JudgeResultsTransformer filters retrieved sections through an LLM relevance
+// judge (RELEVANT / NOT RELEVANT per section, one structured call).
 type JudgeResultsTransformer struct {
-	llm           llm.Client
-	store         SectionStore
-	maxTotalWords int
+	llm             llm.Client
+	store           SectionStore
+	maxTotalWords   int
+	maxSectionWords int
+}
+
+// DefaultJudgeMaxSectionWords bounds, by default, how many words of each
+// section are included in the judge prompt. A binary relevance verdict can
+// almost always be made from the beginning of a section, and the per-section
+// cap keeps the judge's prompt cost bounded even on long sections.
+const DefaultJudgeMaxSectionWords = 200
+
+// JudgeOption configures a JudgeResultsTransformer.
+type JudgeOption func(*JudgeResultsTransformer)
+
+// WithJudgeMaxSectionWords bounds how many words of each section are included
+// in the judge prompt (default DefaultJudgeMaxSectionWords; <= 0 keeps the
+// default).
+func WithJudgeMaxSectionWords(n int) JudgeOption {
+	return func(t *JudgeResultsTransformer) {
+		if n > 0 {
+			t.maxSectionWords = n
+		}
+	}
 }
 
 const defaultJudgeResultsTransformer = `
@@ -197,10 +219,18 @@ func (t *JudgeResultsTransformer) getUserPrompt(ctx context.Context, query strin
 				return "", errors.WithStack(err)
 			}
 
+			// Cap each section on top of the total budget: relevance is judged
+			// from the beginning of the section, and the cap keeps long sections
+			// from monopolizing the prompt.
+			maxSectionWords := t.maxSectionWords
+			if maxSectionWords <= 0 {
+				maxSectionWords = DefaultJudgeMaxSectionWords
+			}
+
 			words := strings.Fields(string(content))
-			remaining := maxTotalWords - totalWords
-			if len(words) > remaining {
-				words = words[:remaining]
+			limit := min(maxSectionWords, maxTotalWords-totalWords)
+			if len(words) > limit {
+				words = words[:limit]
 			}
 			totalWords += len(words)
 
@@ -212,12 +242,17 @@ func (t *JudgeResultsTransformer) getUserPrompt(ctx context.Context, query strin
 	return sb.String(), nil
 }
 
-func NewJudgeResultsTransformer(client llm.Client, store SectionStore, maxTotalWords int) *JudgeResultsTransformer {
-	return &JudgeResultsTransformer{
-		llm:           client,
-		store:         store,
-		maxTotalWords: maxTotalWords,
+func NewJudgeResultsTransformer(client llm.Client, store SectionStore, maxTotalWords int, funcs ...JudgeOption) *JudgeResultsTransformer {
+	t := &JudgeResultsTransformer{
+		llm:             client,
+		store:           store,
+		maxTotalWords:   maxTotalWords,
+		maxSectionWords: DefaultJudgeMaxSectionWords,
 	}
+	for _, fn := range funcs {
+		fn(t)
+	}
+	return t
 }
 
 var _ ResultsTransformer = &JudgeResultsTransformer{}

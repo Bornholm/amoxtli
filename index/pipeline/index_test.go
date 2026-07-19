@@ -181,6 +181,98 @@ func TestSemanticOnlyTransformerSkippedForLexicalPipeline(t *testing.T) {
 	}
 }
 
+// TestLexicalSearchOverlapsSemanticTransform checks that lexical indexes start
+// searching immediately with the base query instead of waiting for the
+// semantic-only transformation (the HyDE LLM round-trip): the lexical leg must
+// have been searched before the semantic transformer completes.
+func TestLexicalSearchOverlapsSemanticTransform(t *testing.T) {
+	semantic := &mockIndex{semantic: true}
+	lexical := &mockIndex{semantic: false, searched: make(chan struct{})}
+
+	// The transformer blocks until the lexical index has been searched (or a
+	// timeout proves the pipeline is sequential again).
+	transformer := &blockingTransformer{
+		suffix:   " HYDE",
+		unblock:  lexical.searched,
+		deadline: 5 * time.Second,
+	}
+
+	idx := NewIndex(
+		WeightedIndexes{
+			NewIdentifiedIndex("vec", semantic): 1,
+			NewIdentifiedIndex("fts", lexical):  1,
+		},
+		WithQueryTransformers(transformer),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := idx.Search(ctx, "base", index.SearchOptions{MaxResults: 5}); err != nil {
+		t.Fatalf("%+v (a sequential pipeline times out in the transformer)", errors.WithStack(err))
+	}
+
+	if g := semantic.recordedQuery(); g != "base HYDE" {
+		t.Errorf("semantic index query = %q, want %q", g, "base HYDE")
+	}
+	if g := lexical.recordedQuery(); g != "base" {
+		t.Errorf("lexical index query = %q, want %q", g, "base")
+	}
+}
+
+// TestSemanticTransformErrorFailsSearch checks that a semantic-only transformer
+// failure still fails the whole Search (same contract as the previous
+// sequential implementation).
+func TestSemanticTransformErrorFailsSearch(t *testing.T) {
+	idx := NewIndex(
+		WeightedIndexes{
+			NewIdentifiedIndex("vec", &mockIndex{semantic: true}): 1,
+			NewIdentifiedIndex("fts", &mockIndex{}):               1,
+		},
+		WithQueryTransformers(failingSemanticTransformer{}),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := idx.Search(ctx, "base", index.SearchOptions{MaxResults: 5}); err == nil {
+		t.Error("expected Search to fail when the semantic transformer fails")
+	}
+}
+
+// blockingTransformer is a semantic-only transformer that waits for unblock to
+// be closed before returning, failing after deadline. It simulates a slow HyDE
+// call whose completion depends on the lexical leg having already run.
+type blockingTransformer struct {
+	suffix   string
+	unblock  chan struct{}
+	deadline time.Duration
+}
+
+func (t *blockingTransformer) TransformQuery(ctx context.Context, query string, opts index.SearchOptions) (string, error) {
+	select {
+	case <-t.unblock:
+	case <-time.After(t.deadline):
+		return "", errors.New("lexical index was not searched while the semantic transformer was running")
+	}
+	return query + t.suffix, nil
+}
+
+func (t *blockingTransformer) SemanticOnly() bool { return true }
+
+var _ SemanticQueryTransformer = &blockingTransformer{}
+
+// failingSemanticTransformer always fails; semantic-only.
+type failingSemanticTransformer struct{}
+
+func (failingSemanticTransformer) TransformQuery(ctx context.Context, query string, opts index.SearchOptions) (string, error) {
+	return "", errors.New("transform failed")
+}
+
+func (failingSemanticTransformer) SemanticOnly() bool { return true }
+
+var _ SemanticQueryTransformer = failingSemanticTransformer{}
+
 func makeResult(t *testing.T, rawURL string, section string) *index.SearchResult {
 	t.Helper()
 	source, err := url.Parse(rawURL)
@@ -218,6 +310,9 @@ type mockIndex struct {
 
 	mu        sync.Mutex
 	lastQuery string
+	// searched is closed on the first Search call (lazily initialized).
+	searched     chan struct{}
+	searchedOnce sync.Once
 }
 
 // Semantic implements index.Semantic.
@@ -248,6 +343,9 @@ func (m *mockIndex) Search(ctx context.Context, query string, opts index.SearchO
 	m.mu.Lock()
 	m.lastQuery = query
 	m.mu.Unlock()
+	if m.searched != nil {
+		m.searchedOnce.Do(func() { close(m.searched) })
+	}
 	return m.results, nil
 }
 

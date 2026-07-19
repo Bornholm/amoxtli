@@ -24,12 +24,36 @@ type Indexer struct {
 	Weight float64
 }
 
+// Stage identifies an LLM-driven retrieval stage that can be given a dedicated
+// client with WithStageLLMClient.
+type Stage string
+
+const (
+	// StageHyDE is the hypothetical-answer query expansion (semantic indexes).
+	StageHyDE Stage = "hyde"
+	// StageJudge is the relevance judge filtering retrieved sections.
+	StageJudge Stage = "judge"
+	// StageGrounding is the fused evidence evaluator (relevance + verdict).
+	StageGrounding Stage = "grounding"
+	// StageRerank is the LLM reranker reordering fused results.
+	StageRerank Stage = "rerank"
+	// StageDecompose splits a complex question into sub-questions.
+	StageDecompose Stage = "decompose"
+	// StageReformulate rewrites the query for iterative re-retrieval.
+	StageReformulate Stage = "reformulate"
+)
+
+// Stages lists every stage accepted by WithStageLLMClient.
+var Stages = []Stage{StageHyDE, StageJudge, StageGrounding, StageRerank, StageDecompose, StageReformulate}
+
 type options struct {
 	llmClient          llm.Client
+	stageClients       map[Stage]llm.Client
 	fileConverter      convert.Converter
 	sourceCode         *sourcecode.Registry
 	maxWordsPerSection int
 	maxTotalWords      int
+	maxSectionWords    int
 	taskParallelism    int
 	disableHyDE        bool
 	disableJudge       bool
@@ -86,11 +110,40 @@ func defaultOptions() *options {
 // Option is a function that configures a Codex instance.
 type Option func(*options)
 
-// WithLLMClient sets the LLM client used by the HyDE and Judge transformers.
+// WithLLMClient sets the default LLM client used by every LLM retrieval stage
+// (HyDE, Judge, grounding, reranker, decomposition, reformulation) unless a
+// stage has its own client (WithStageLLMClient).
 func WithLLMClient(client llm.Client) Option {
 	return func(o *options) {
 		o.llmClient = client
 	}
+}
+
+// WithStageLLMClient assigns a dedicated LLM client to a single retrieval
+// stage, overriding WithLLMClient for that stage. The main lever on the LLM
+// cost of a search: point the cheap, high-volume stages (HyDE, Judge) at a
+// small fast model while keeping a stronger model for the rest. It can be
+// called once per stage; a nil client removes the override.
+func WithStageLLMClient(stage Stage, client llm.Client) Option {
+	return func(o *options) {
+		if o.stageClients == nil {
+			o.stageClients = map[Stage]llm.Client{}
+		}
+		if client == nil {
+			delete(o.stageClients, stage)
+			return
+		}
+		o.stageClients[stage] = client
+	}
+}
+
+// clientFor resolves the client of a stage: its dedicated client when set,
+// otherwise the default WithLLMClient one (possibly nil).
+func (o *options) clientFor(stage Stage) llm.Client {
+	if c, ok := o.stageClients[stage]; ok {
+		return c
+	}
+	return o.llmClient
 }
 
 // WithObservability wraps the configured LLM client (WithLLMClient) with the
@@ -152,6 +205,18 @@ func WithMaxWordsPerSection(n int) Option {
 func WithMaxTotalWords(n int) Option {
 	return func(o *options) {
 		o.maxTotalWords = n
+	}
+}
+
+// WithMaxWordsPerSectionInPrompt bounds how many words of each retrieved
+// section are included in the prompts of the LLM retrieval stages (Judge,
+// reranker, evidence evaluator), on top of the total WithMaxTotalWords budget.
+// Relevance can almost always be judged from the beginning of a section, so a
+// low cap (default 200) cuts the per-search prompt cost with little quality
+// impact. <= 0 keeps the default.
+func WithMaxWordsPerSectionInPrompt(n int) Option {
+	return func(o *options) {
+		o.maxSectionWords = n
 	}
 }
 

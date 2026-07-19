@@ -189,7 +189,7 @@ func newRestoreCommand(opts *rootOptions) *cobra.Command {
 func newCacheCommand(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "cache",
-		Short: "Manage the embeddings cache",
+		Short: "Manage the LLM cache (embeddings and chat completions)",
 	}
 
 	cmd.AddCommand(newCachePurgeCommand(opts))
@@ -200,7 +200,7 @@ func newCacheCommand(opts *rootOptions) *cobra.Command {
 func newCachePurgeCommand(opts *rootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "purge",
-		Short: "Delete the on-disk embeddings cache",
+		Short: "Delete the on-disk LLM cache",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ws, cfg, err := opts.loadConfig()
@@ -208,12 +208,12 @@ func newCachePurgeCommand(opts *rootOptions) *cobra.Command {
 				return err
 			}
 
-			dir := ws.Resolve(cfg.EmbeddingsCachePath())
+			dir := ws.Resolve(cfg.LLMCachePath())
 			if err := os.RemoveAll(dir); err != nil {
 				return errors.WithStack(err)
 			}
 
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Purged embeddings cache at %s\n", dir)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Purged LLM cache at %s\n", dir)
 
 			return nil
 		},

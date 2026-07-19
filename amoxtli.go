@@ -75,11 +75,16 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 		return nil, errors.New("amoxtli: WithStore is required")
 	}
 
-	// Wrap the LLM client with the OpenTelemetry decorator before it is handed to
-	// the pipeline transformers, evaluator and reranker, so all of their calls
-	// are instrumented.
-	if opts.observability && opts.llmClient != nil {
-		opts.llmClient = llmx.NewObservableClient(opts.llmClient)
+	// Wrap the LLM clients (default and per-stage) with the OpenTelemetry
+	// decorator before they are handed to the pipeline transformers, evaluator
+	// and reranker, so all of their calls are instrumented.
+	if opts.observability {
+		if opts.llmClient != nil {
+			opts.llmClient = llmx.NewObservableClient(opts.llmClient)
+		}
+		for stage, client := range opts.stageClients {
+			opts.stageClients[stage] = llmx.NewObservableClient(client)
+		}
 	}
 
 	idx := opts.index
@@ -96,11 +101,11 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 		}
 
 		pipelineOpts := []pipeline.OptionFunc{}
-		if !opts.disableHyDE && opts.llmClient != nil {
+		if hydeClient := opts.clientFor(StageHyDE); !opts.disableHyDE && hydeClient != nil {
 			if lister, ok := store.(pipeline.CollectionLister); ok {
 				pipelineOpts = append(pipelineOpts,
 					pipeline.WithQueryTransformers(
-						pipeline.NewHyDEQueryTransformer(opts.llmClient, lister),
+						pipeline.NewHyDEQueryTransformer(hydeClient, lister),
 					),
 				)
 			}
@@ -113,9 +118,10 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 		// relevance filtering (applied by Search and the orchestrator), so the
 		// Judge transformer is left out of the pipeline to avoid a redundant LLM
 		// pass over the same evidence.
-		if !opts.disableJudge && opts.llmClient != nil && !opts.groundingCheck {
+		if judgeClient := opts.clientFor(StageJudge); !opts.disableJudge && judgeClient != nil && !opts.groundingCheck {
 			resultsTransformers = append(resultsTransformers,
-				pipeline.NewJudgeResultsTransformer(opts.llmClient, store, opts.maxTotalWords),
+				pipeline.NewJudgeResultsTransformer(judgeClient, store, opts.maxTotalWords,
+					pipeline.WithJudgeMaxSectionWords(opts.maxSectionWords)),
 			)
 		}
 		pipelineOpts = append(pipelineOpts,
@@ -165,9 +171,10 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	if opts.sourceCode != nil {
 		managerOpts = append(managerOpts, ingest.WithManagerSourceCode(opts.sourceCode))
 	}
-	if opts.reranking && opts.llmClient != nil {
+	if rerankClient := opts.clientFor(StageRerank); opts.reranking && rerankClient != nil {
 		managerOpts = append(managerOpts,
-			ingest.WithManagerReranker(retrieval.NewLLMReranker(opts.llmClient, store, opts.maxTotalWords)),
+			ingest.WithManagerReranker(retrieval.NewLLMReranker(rerankClient, store, opts.maxTotalWords,
+				retrieval.WithMaxSectionWords(opts.maxSectionWords))),
 		)
 	}
 
@@ -195,8 +202,9 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	// shared across Search (filtering), CheckGrounding (verdict) and the
 	// orchestrator/SearchIterative (both). It replaces the pipeline Judge when
 	// enabled.
-	if opts.groundingCheck && opts.llmClient != nil {
-		codex.evaluator = retrieval.NewLLMEvidenceEvaluator(opts.llmClient, store, opts.maxTotalWords)
+	if groundingClient := opts.clientFor(StageGrounding); opts.groundingCheck && groundingClient != nil {
+		codex.evaluator = retrieval.NewLLMEvidenceEvaluator(groundingClient, store, opts.maxTotalWords,
+			retrieval.WithMaxSectionWords(opts.maxSectionWords))
 	}
 	codex.groundingFailOpen = opts.groundingFailOpen
 	codex.orchestrator = newOrchestrator(opts, manager, codex.evaluator)
@@ -234,16 +242,16 @@ func newOrchestrator(opts *options, manager *ingest.Manager, evaluator retrieval
 			retrieval.WithGroundingMode(opts.groundingMode),
 		)
 	}
-	if opts.iterativeRetrieval && opts.llmClient != nil {
+	if reformulateClient := opts.clientFor(StageReformulate); opts.iterativeRetrieval && reformulateClient != nil {
 		orchestratorOpts = append(orchestratorOpts,
-			retrieval.WithQueryReformulator(retrieval.NewLLMQueryReformulator(opts.llmClient)),
+			retrieval.WithQueryReformulator(retrieval.NewLLMQueryReformulator(reformulateClient)),
 			retrieval.WithMaxRounds(opts.iterativeMaxRounds),
 		)
 	}
-	if opts.queryDecomposition && opts.llmClient != nil {
+	if decomposeClient := opts.clientFor(StageDecompose); opts.queryDecomposition && decomposeClient != nil {
 		orchestratorOpts = append(orchestratorOpts,
 			retrieval.WithQueryDecomposer(
-				retrieval.NewLLMQueryDecomposer(opts.llmClient, opts.decompositionMaxSubQueries),
+				retrieval.NewLLMQueryDecomposer(decomposeClient, opts.decompositionMaxSubQueries),
 			),
 		)
 	}

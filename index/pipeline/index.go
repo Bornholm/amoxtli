@@ -249,10 +249,20 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 	// query expanded by the semantic-only transformers (e.g. HyDE) while
 	// lexical indexes keep the raw (universally transformed) query, as query
 	// expansion tends to help vector search but degrade full-text search.
-	baseQuery, semanticQuery, err := i.transformQueries(ctx, query, opts)
+	baseQuery, err := i.transformBaseQuery(ctx, query, opts)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+
+	// The semantic variant is computed lazily and at most once, from inside the
+	// semantic legs: lexical indexes start searching baseQuery immediately
+	// instead of waiting for the LLM round-trip of HyDE, so the total latency
+	// is max(semantic transform + vector search, lexical search) rather than
+	// their sum. Lexical-only pipelines never invoke it at all, preserving the
+	// no-HyDE-without-semantic-index property.
+	semanticQueryOnce := sync.OnceValues(func() (string, error) {
+		return i.transformSemanticQuery(ctx, baseQuery, opts)
+	})
 
 	count := len(i.indexes)
 
@@ -297,6 +307,15 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 
 			indexQuery := baseQuery
 			if index.IsSemantic(identified.Index()) {
+				semanticQuery, err := semanticQueryOnce()
+				if err != nil {
+					err = errors.WithStack(err)
+					slog.ErrorContext(indexCtx, "could not transform query", slog.Any("error", err))
+					messages <- &Message{
+						Err: err,
+					}
+					return
+				}
 				indexQuery = semanticQuery
 			}
 
@@ -363,53 +382,40 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 	return transformed, nil
 }
 
-// transformQueries computes the two query variants dispatched to the underlying
-// indexes: baseQuery, obtained by applying the universal query transformers, is
-// sent to lexical indexes; semanticQuery, obtained by additionally applying the
-// semantic-only transformers (e.g. HyDE) on top of baseQuery, is sent to vector
-// indexes. The semantic variant — and thus any LLM call it entails — is only
-// computed when at least one index declares itself semantic, so lexical-only
-// pipelines never pay for HyDE.
-func (i *Index) transformQueries(ctx context.Context, query string, opts index.SearchOptions) (baseQuery string, semanticQuery string, err error) {
-	baseQuery = query
+// transformBaseQuery applies the universal (non semantic-only) query
+// transformers; the result is the query sent to lexical indexes and the input
+// of the semantic variant.
+func (i *Index) transformBaseQuery(ctx context.Context, query string, opts index.SearchOptions) (string, error) {
+	baseQuery := query
+	var err error
 	for _, t := range i.queryTransformers {
 		if isSemanticOnly(t) {
 			continue
 		}
 		baseQuery, err = t.TransformQuery(ctx, baseQuery, opts)
 		if err != nil {
-			return "", "", errors.WithStack(err)
+			return "", errors.WithStack(err)
 		}
 	}
+	return baseQuery, nil
+}
 
-	semanticQuery = baseQuery
-
-	if !i.hasSemanticIndex() {
-		return baseQuery, semanticQuery, nil
-	}
-
+// transformSemanticQuery applies the semantic-only transformers (e.g. HyDE, an
+// LLM call) on top of the already base-transformed query. It is only invoked —
+// lazily, from Search — when at least one semantic index needs it.
+func (i *Index) transformSemanticQuery(ctx context.Context, baseQuery string, opts index.SearchOptions) (string, error) {
+	semanticQuery := baseQuery
+	var err error
 	for _, t := range i.queryTransformers {
 		if !isSemanticOnly(t) {
 			continue
 		}
 		semanticQuery, err = t.TransformQuery(ctx, semanticQuery, opts)
 		if err != nil {
-			return "", "", errors.WithStack(err)
+			return "", errors.WithStack(err)
 		}
 	}
-
-	return baseQuery, semanticQuery, nil
-}
-
-// hasSemanticIndex reports whether at least one registered index declares the
-// index.Semantic capability.
-func (i *Index) hasSemanticIndex() bool {
-	for identified := range i.indexes {
-		if index.IsSemantic(identified.Index()) {
-			return true
-		}
-	}
-	return false
+	return semanticQuery, nil
 }
 
 func (i *Index) transformResults(ctx context.Context, query string, results []*index.SearchResult, opts index.SearchOptions) ([]*index.SearchResult, error) {

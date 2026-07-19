@@ -58,21 +58,71 @@ If no documents are relevant:
 {"relevant": [], "status": "invalid", "score": 0.0, "explanation": "Brief justification"}
 `
 
+// DefaultMaxSectionWords bounds, by default, how many words of each section are
+// included in the prompts of the LLM retrieval stages (evidence evaluator,
+// reranker, judge). Relevance can almost always be judged from the beginning of
+// a section, and the per-section cap keeps the prompt cost of a search bounded
+// even when the retrieved sections are long.
+const DefaultMaxSectionWords = 200
+
+// promptOptions configures how the LLM retrieval stages build their prompts.
+type promptOptions struct {
+	maxSectionWords int
+}
+
+// PromptOption configures the prompt construction of an LLM retrieval stage
+// (LLMEvidenceEvaluator, LLMReranker).
+type PromptOption func(*promptOptions)
+
+// WithMaxSectionWords bounds how many words of each section are included in the
+// prompt (default DefaultMaxSectionWords; <= 0 keeps the default).
+func WithMaxSectionWords(n int) PromptOption {
+	return func(o *promptOptions) {
+		if n > 0 {
+			o.maxSectionWords = n
+		}
+	}
+}
+
+func newPromptOptions(funcs ...PromptOption) promptOptions {
+	opts := promptOptions{maxSectionWords: DefaultMaxSectionWords}
+	for _, fn := range funcs {
+		fn(&opts)
+	}
+	return opts
+}
+
+// truncateSection returns the first words of content, bounded by both the
+// per-section cap and the remaining total budget, together with the number of
+// words consumed.
+func truncateSection(content string, maxSectionWords, remaining int) (string, int) {
+	words := strings.Fields(content)
+	limit := min(maxSectionWords, remaining)
+	if len(words) > limit {
+		words = words[:limit]
+	}
+	return strings.Join(words, " "), len(words)
+}
+
 // LLMEvidenceEvaluator implements EvidenceEvaluator with a single
 // structured-JSON LLM call.
 type LLMEvidenceEvaluator struct {
-	llm           llm.Client
-	store         SectionStore
-	maxTotalWords int
+	llm             llm.Client
+	store           SectionStore
+	maxTotalWords   int
+	maxSectionWords int
 }
 
 // NewLLMEvidenceEvaluator builds an EvidenceEvaluator backed by the given LLM
-// client. maxTotalWords bounds the evidence budget (defaults to 50000 when <= 0).
-func NewLLMEvidenceEvaluator(client llm.Client, store SectionStore, maxTotalWords int) *LLMEvidenceEvaluator {
+// client. maxTotalWords bounds the total evidence budget (defaults to 8000 when
+// <= 0); each section is additionally capped by WithMaxSectionWords.
+func NewLLMEvidenceEvaluator(client llm.Client, store SectionStore, maxTotalWords int, funcs ...PromptOption) *LLMEvidenceEvaluator {
+	opts := newPromptOptions(funcs...)
 	return &LLMEvidenceEvaluator{
-		llm:           client,
-		store:         store,
-		maxTotalWords: maxTotalWords,
+		llm:             client,
+		store:           store,
+		maxTotalWords:   maxTotalWords,
+		maxSectionWords: opts.maxSectionWords,
 	}
 }
 
@@ -238,14 +288,10 @@ func (e *LLMEvidenceEvaluator) getUserPrompt(ctx context.Context, query string, 
 			sb.WriteString(string(section.ID()))
 			sb.WriteString("\n\n")
 
-			words := strings.Fields(string(content))
-			remaining := maxTotalWords - totalWords
-			if len(words) > remaining {
-				words = words[:remaining]
-			}
-			totalWords += len(words)
+			text, consumed := truncateSection(string(content), e.maxSectionWords, maxTotalWords-totalWords)
+			totalWords += consumed
 
-			sb.WriteString(strings.Join(words, " "))
+			sb.WriteString(text)
 			sb.WriteString("\n\n")
 		}
 	}

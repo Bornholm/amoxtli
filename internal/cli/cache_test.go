@@ -14,55 +14,75 @@ import (
 	"testing"
 )
 
-// fakeEmbeddingsServer is an OpenAI-compatible /embeddings endpoint returning
-// deterministic vectors (derived from the input text), counting the requests
-// it serves so tests can assert cache hits never reach the endpoint.
-type fakeEmbeddingsServer struct {
+// fakeLLMServer is an OpenAI-compatible /embeddings + /chat/completions
+// endpoint returning deterministic answers, counting the requests it serves so
+// tests can assert cache hits never reach the endpoints.
+type fakeLLMServer struct {
 	*httptest.Server
-	requests atomic.Int64
+	requests     atomic.Int64
+	chatRequests atomic.Int64
 }
 
 const fakeVectorSize = 8
 
-func newFakeEmbeddingsServer(t *testing.T) *fakeEmbeddingsServer {
+// fakeChatAnswer parses as the judge/evaluator JSON verdict and doubles as a
+// plain HyDE answer.
+const fakeChatAnswer = `{"identifiers": [], "explanation": "none"}`
+
+func newFakeLLMServer(t *testing.T) *fakeLLMServer {
 	t.Helper()
 
-	s := &fakeEmbeddingsServer{}
+	s := &fakeLLMServer{}
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/embeddings") {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/embeddings"):
+			s.requests.Add(1)
+
+			var req struct {
+				Input []string `json:"input"`
+				Model string   `json:"model"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			type item struct {
+				Object    string    `json:"object"`
+				Index     int       `json:"index"`
+				Embedding []float64 `json:"embedding"`
+			}
+
+			data := make([]item, 0, len(req.Input))
+			for i, input := range req.Input {
+				data = append(data, item{Object: "embedding", Index: i, Embedding: fakeVector(input)})
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"data":   data,
+				"model":  req.Model,
+				"usage":  map[string]int{"prompt_tokens": 1, "total_tokens": 1},
+			})
+		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
+			s.chatRequests.Add(1)
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":     "cmpl-1",
+				"object": "chat.completion",
+				"model":  "test-chat",
+				"choices": []map[string]any{{
+					"index":         0,
+					"finish_reason": "stop",
+					"message":       map[string]any{"role": "assistant", "content": fakeChatAnswer},
+				}},
+				"usage": map[string]int{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			})
+		default:
 			http.NotFound(w, r)
-			return
 		}
-
-		s.requests.Add(1)
-
-		var req struct {
-			Input []string `json:"input"`
-			Model string   `json:"model"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		type item struct {
-			Object    string    `json:"object"`
-			Index     int       `json:"index"`
-			Embedding []float64 `json:"embedding"`
-		}
-
-		data := make([]item, 0, len(req.Input))
-		for i, input := range req.Input {
-			data = append(data, item{Object: "embedding", Index: i, Embedding: fakeVector(input)})
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"object": "list",
-			"data":   data,
-			"model":  req.Model,
-			"usage":  map[string]int{"prompt_tokens": 1, "total_tokens": 1},
-		})
 	}))
 	t.Cleanup(s.Close)
 
@@ -99,7 +119,7 @@ Goroutines and channels form the core of Go's concurrency model.
 // empties it.
 func TestCLIEmbeddingsCache(t *testing.T) {
 	root := t.TempDir()
-	server := newFakeEmbeddingsServer(t)
+	server := newFakeLLMServer(t)
 
 	docPath := filepath.Join(root, "go-intro.md")
 	if err := os.WriteFile(docPath, []byte(cacheTestDocument), 0600); err != nil {
@@ -127,12 +147,17 @@ index:
     weight: 1.0
     vector_size: %d
 llm:
+  chat:
+    provider: openai
+    base_url: %s
+    model: test-chat
+    api_key: test
   embeddings:
     provider: openai
     base_url: %s
     model: test-embed
     api_key: test
-`, fakeVectorSize, server.URL)
+`, fakeVectorSize, server.URL, server.URL)
 	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(configYAML), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -155,18 +180,26 @@ llm:
 		t.Errorf("expected no embeddings call on reindex of unchanged content, got %d", delta)
 	}
 
-	// A repeated identical query must reuse the cached query vector.
+	// A repeated identical query must reuse the cached query vector AND the
+	// cached seeded chat completions (HyDE expansion, Judge verdict).
 	mustRunCLI(t, "-C", root, "search", "concurrency goroutines")
+	if server.chatRequests.Load() == 0 {
+		t.Fatal("expected the first search to call the chat endpoint (HyDE/Judge)")
+	}
 	before = server.requests.Load()
+	chatBefore := server.chatRequests.Load()
 	mustRunCLI(t, "-C", root, "search", "concurrency goroutines")
 	if delta := server.requests.Load() - before; delta != 0 {
 		t.Errorf("expected no embeddings call on a repeated query, got %d", delta)
+	}
+	if delta := server.chatRequests.Load() - chatBefore; delta != 0 {
+		t.Errorf("expected no chat call on a repeated query (seeded completions are cached), got %d", delta)
 	}
 
 	// cache purge empties the cache directory; the next reindex hits the
 	// endpoint again.
 	output := mustRunCLI(t, "-C", root, "cache", "purge")
-	if !strings.Contains(output, "Purged embeddings cache") {
+	if !strings.Contains(output, "Purged LLM cache") {
 		t.Errorf("unexpected cache purge output: %s", output)
 	}
 	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {

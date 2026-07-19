@@ -47,14 +47,17 @@ d'embeddings est configuré sous `llm.embeddings`. Les fonctions pilotées par L
 `openrouter` et `mistral`. Le fournisseur `openai` couvre en outre tout endpoint
 compatible OpenAI (Ollama, vLLM…) via `base_url`.
 
-### Cache d'embeddings
+### Cache LLM
 
-Dès que `llm.embeddings` est configuré, un cache persistant sur disque
-(`llm.embeddings.cache`, activé par défaut, répertoire `cache/embeddings` dans
-`.amoxtli/`) mémorise les vecteurs calculés, clés par modèle : réindexer un
-contenu inchangé ou répéter une requête identique ne touche plus l'endpoint
-d'embeddings (ni sa facturation, ni son rate-limit). `amoxtli cache purge` vide
-le cache ; les statistiques hits/misses sont journalisées en mode `--verbose`.
+Dès que `llm.embeddings` ou `llm.chat` est configuré, un cache persistant sur
+disque (`llm.cache`, activé par défaut, répertoire `cache/` dans `.amoxtli/`)
+mémorise les vecteurs d'embeddings (`cache/embeddings`) et les complétions de
+chat déterministes — HyDE est seedé par requête (`cache/chat`) —, clés par
+modèle : réindexer un contenu inchangé ou répéter une requête identique ne
+touche plus les endpoints (ni leur facturation, ni leur rate-limit). Les
+clients par étage (`llm.stages`) bénéficient du même cache de chat. `amoxtli
+cache purge` vide le cache ; les statistiques hits/misses sont journalisées en
+mode `--verbose`.
 
 ### Convertisseurs de fichiers
 
@@ -101,7 +104,7 @@ extension→langage (ex. `.phtml: php`). Langages intégrés : `go`, `javascript
 | `collection create\|list\|show\|rename\|describe\|stats\|delete` | Gère les collections |
 | `task list\|show\|cancel` | Suit les tâches d'indexation |
 | `reindex [-c coll]` / `cleanup [-c coll]` | Maintenance de l'index |
-| `cache purge` | Vide le cache d'embeddings sur disque |
+| `cache purge` | Vide le cache LLM sur disque (embeddings + chat) |
 | `backup [-o fichier]` / `restore <fichier>` | Sauvegarde/restauration |
 | `mcp` | Serveur MCP sur stdio |
 

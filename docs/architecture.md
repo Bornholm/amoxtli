@@ -68,10 +68,17 @@ Chaque étage LLM optionnel ajoute un appel réseau (latence et facturation) à
 | Recherche itérative (`--deep`, décomposition + N sous-requêtes + reformulation) | 4 et plus | 1 + N |
 
 Le prompt du Judge / reranker / évaluateur est borné par `WithMaxTotalWords`
-(défaut 8000 mots, ≈ 14k tokens) — c'est le poste de coût dominant d'une
-recherche avec chat configuré. Les appels d'embeddings répétés sont absorbés
-par le cache persistant (`llmx.CachingClient`, activé par défaut dans la CLI) ;
-HyDE n'est appliqué qu'aux indexeurs sémantiques et est ignoré sans eux.
+(défaut 8000 mots, ≈ 14k tokens) et par section via
+`WithMaxWordsPerSectionInPrompt` (défaut 200 mots) — c'est le poste de coût
+dominant d'une recherche avec chat configuré. Trois leviers l'amortissent :
+
+- le **cache persistant** (`llmx.CachingClient`, activé par défaut dans la
+  CLI) absorbe les embeddings répétés *et* les complétions seedées (HyDE,
+  Judge) : répéter une requête identique ne coûte aucun appel ;
+- un **client par étage** (`WithStageLLMClient` / `llm.stages`) permet de
+  pointer HyDE et le Judge vers un petit modèle rapide ;
+- HyDE n'est appliqué qu'aux indexeurs sémantiques (ignoré sans eux) et
+  s'exécute **en parallèle** de la branche lexicale, pas avant elle.
 
 ### Runner de tâches persistant (`task/gorm`)
 

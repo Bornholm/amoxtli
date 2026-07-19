@@ -32,6 +32,14 @@ type Index struct {
 	model                 string
 	// rwLock allows concurrent Search operations while serializing Index/Delete
 	rwLock sync.RWMutex
+	// readers is the pool of dedicated read connections (NewIndexAtPath). When
+	// nil (NewIndex), searches share the single caller-owned connection under
+	// the read lock; with a pool, searches run on their own connection and rely
+	// on WAL snapshot isolation instead, so they neither serialize on the
+	// writer nor on each other.
+	readers chan *sqlite3.Conn
+	// ownedConns are the connections opened (and closed) by the index itself.
+	ownedConns []*sqlite3.Conn
 }
 
 // DefaultMaxWords bounds, by default, the number of words per chunk sent to the
@@ -44,6 +52,10 @@ const DefaultMaxWords int = 500
 // embeddings endpoint (rate limiting / 429s); lower it via config for stricter
 // endpoints.
 const DefaultEmbeddingsConcurrency int = 8
+
+// DefaultReadPoolSize is the default number of read connections opened by
+// NewIndexAtPath for concurrent searches.
+const DefaultReadPoolSize int = 4
 
 // Options configures a sqlite-vec Index.
 type Options struct {
@@ -63,6 +75,10 @@ type Options struct {
 	// simultaneous requests to the embeddings endpoint. Defaults to
 	// DefaultEmbeddingsConcurrency when <= 0.
 	EmbeddingsConcurrency int
+	// ReadPoolSize is the number of dedicated read connections opened by
+	// NewIndexAtPath (defaults to DefaultReadPoolSize when <= 0). Ignored by
+	// NewIndex, which uses the single caller-owned connection.
+	ReadPoolSize int
 }
 
 type OptionFunc func(opts *Options)
@@ -93,6 +109,14 @@ func WithMaxWords(maxWords int) OptionFunc {
 func WithEmbeddingsConcurrency(n int) OptionFunc {
 	return func(opts *Options) {
 		opts.EmbeddingsConcurrency = n
+	}
+}
+
+// WithReadPoolSize sets the number of dedicated read connections opened by
+// NewIndexAtPath (see Options.ReadPoolSize).
+func WithReadPoolSize(n int) OptionFunc {
+	return func(opts *Options) {
+		opts.ReadPoolSize = n
 	}
 }
 
@@ -651,11 +675,14 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 		return nil, errors.WithStack(err)
 	}
 
-	i.rwLock.RLock()
-	defer i.rwLock.RUnlock()
+	conn, release, err := i.acquireReader(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer release()
 
 	var searchResults []*index.SearchResult
-	err = i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+	err = retryOnConn(ctx, conn, func(ctx context.Context, conn *sqlite3.Conn) error {
 		// Use vec0 virtual table with HNSW index for fast KNN search
 		// IMPORTANT: vec0 uses <column> match <vector> syntax, not <column>.match
 		// Also requires k = <number> to specify number of nearest neighbors
@@ -791,12 +818,43 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 	return searchResults, nil
 }
 
+// acquireReader hands out a connection suitable for a read-only statement,
+// together with its release function. With a read pool (NewIndexAtPath) the
+// connection is one of the pooled readers — no lock is taken, WAL snapshot
+// isolation guarantees a consistent view during concurrent writes. Without a
+// pool (NewIndex) the single shared connection is returned under the read
+// lock, preserving the historical serialization against writers.
+func (i *Index) acquireReader(ctx context.Context) (*sqlite3.Conn, func(), error) {
+	if i.readers != nil {
+		select {
+		case conn := <-i.readers:
+			return conn, func() { i.readers <- conn }, nil
+		case <-ctx.Done():
+			return nil, nil, errors.WithStack(ctx.Err())
+		}
+	}
+
+	conn, err := i.getConn(ctx)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+
+	i.rwLock.RLock()
+	return conn, i.rwLock.RUnlock, nil
+}
+
 func (i *Index) withRetry(ctx context.Context, fn func(ctx context.Context, conn *sqlite3.Conn) error, codes ...sqlite3.ErrorCode) error {
 	conn, err := i.getConn(ctx)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
+	return retryOnConn(ctx, conn, fn, codes...)
+}
+
+// retryOnConn runs fn on the given connection inside a savepoint, retrying
+// with exponential backoff when it fails with one of the given SQLite codes.
+func retryOnConn(ctx context.Context, conn *sqlite3.Conn, fn func(ctx context.Context, conn *sqlite3.Conn) error, codes ...sqlite3.ErrorCode) error {
 	backoff := 500 * time.Millisecond
 	maxRetries := 10
 	retries := 0
@@ -864,6 +922,79 @@ func NewIndex(conn *sqlite3.Conn, client llm.Client, funcs ...OptionFunc) *Index
 	}
 }
 
+// NewIndexAtPath opens (and owns) a sqlite-vec index stored at path: one write
+// connection plus a pool of read connections (WithReadPoolSize, default
+// DefaultReadPoolSize), so concurrent searches run on their own connection
+// under WAL snapshot isolation instead of serializing on a single one. Unlike
+// NewIndex, migrations and the model/vector-size identity check run eagerly,
+// and the returned index must be Closed by the caller.
+func NewIndexAtPath(path string, client llm.Client, funcs ...OptionFunc) (*Index, error) {
+	opts := NewOptions(funcs...)
+
+	writer, err := sqlite3.Open(path)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	ownedConns := []*sqlite3.Conn{writer}
+	closeAll := func() {
+		for _, conn := range ownedConns {
+			_ = conn.Close()
+		}
+	}
+
+	if err := initializeConn(writer, opts.EmbeddingsModel, opts.VectorSize); err != nil {
+		closeAll()
+		return nil, errors.WithStack(err)
+	}
+
+	poolSize := opts.ReadPoolSize
+	if poolSize <= 0 {
+		poolSize = DefaultReadPoolSize
+	}
+
+	readers := make(chan *sqlite3.Conn, poolSize)
+	for range poolSize {
+		reader, err := sqlite3.Open(path)
+		if err == nil {
+			err = reader.Exec("PRAGMA busy_timeout=30000")
+		}
+		if err != nil {
+			closeAll()
+			return nil, errors.WithStack(err)
+		}
+		ownedConns = append(ownedConns, reader)
+		readers <- reader
+	}
+
+	return &Index{
+		maxWords:              opts.MaxWords,
+		vectorSize:            opts.VectorSize,
+		embeddingsConcurrency: opts.EmbeddingsConcurrency,
+		llm:                   client,
+		model:                 opts.EmbeddingsModel,
+		getConn: func(ctx context.Context) (*sqlite3.Conn, error) {
+			return writer, nil
+		},
+		readers:    readers,
+		ownedConns: ownedConns,
+	}, nil
+}
+
+// Close closes the connections owned by the index (NewIndexAtPath). An index
+// built with NewIndex owns nothing and Close is a no-op. In-flight operations
+// must have completed before calling it.
+func (i *Index) Close() error {
+	var firstErr error
+	for _, conn := range i.ownedConns {
+		if err := conn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	i.ownedConns = nil
+	return errors.WithStack(firstErr)
+}
+
 var (
 	_ index.Index    = &Index{}
 	_ index.Semantic = &Index{}
@@ -873,6 +1004,26 @@ var (
 // search and therefore benefits from query expansion such as HyDE.
 func (i *Index) Semantic() bool { return true }
 
+// initializeConn applies the connection pragmas, runs the schema migrations
+// and records/verifies the index identity (embeddings model + vector size).
+func initializeConn(conn *sqlite3.Conn, model string, vectorSize int) error {
+	if err := conn.Exec("PRAGMA journal_mode=wal; PRAGMA foreign_keys=on; PRAGMA busy_timeout=30000"); err != nil {
+		return errors.WithStack(err)
+	}
+
+	for _, sql := range migrations(vectorSize) {
+		if err := conn.Exec(sql); err != nil {
+			return errors.Wrapf(err, "could not execute migration '%s'", sql)
+		}
+	}
+
+	if err := checkMetadata(conn, model, vectorSize); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
+}
+
 func createGetConn(conn *sqlite3.Conn, model string, vectorSize int) func(ctx context.Context) (*sqlite3.Conn, error) {
 	var (
 		migrateOnce sync.Once
@@ -881,22 +1032,7 @@ func createGetConn(conn *sqlite3.Conn, model string, vectorSize int) func(ctx co
 
 	return func(ctx context.Context) (*sqlite3.Conn, error) {
 		migrateOnce.Do(func() {
-			if err := conn.Exec("PRAGMA journal_mode=wal; PRAGMA foreign_keys=on; PRAGMA busy_timeout=30000"); err != nil {
-				migrateErr = errors.WithStack(err)
-				return
-			}
-
-			for _, sql := range migrations(vectorSize) {
-				if err := conn.Exec(sql); err != nil {
-					migrateErr = errors.Wrapf(err, "could not execute migration '%s'", sql)
-					return
-				}
-			}
-
-			if err := checkMetadata(conn, model, vectorSize); err != nil {
-				migrateErr = errors.WithStack(err)
-				return
-			}
+			migrateErr = initializeConn(conn, model, vectorSize)
 		})
 		if migrateErr != nil {
 			return nil, errors.WithStack(migrateErr)

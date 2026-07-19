@@ -195,6 +195,21 @@ func TestParseErrors(t *testing.T) {
 			wantErr: "converter.genai.dsn",
 		},
 		{
+			name:    "stages without chat",
+			raw:     "llm:\n  stages:\n    hyde:\n      provider: openai\n      model: m",
+			wantErr: "llm.stages requires llm.chat",
+		},
+		{
+			name:    "unknown stage",
+			raw:     "llm:\n  chat:\n    provider: openai\n    model: m\n  stages:\n    hype:\n      provider: openai\n      model: m",
+			wantErr: "unknown stage",
+		},
+		{
+			name:    "stage without model",
+			raw:     "llm:\n  chat:\n    provider: openai\n    model: m\n  stages:\n    judge:\n      provider: openai",
+			wantErr: "llm.stages.judge.model is required",
+		},
+		{
 			name:    "genai without extensions",
 			raw:     "converter:\n  genai:\n    enabled: true\n    dsn: mistral://?apiKey=x",
 			wantErr: "converter.genai.extensions",

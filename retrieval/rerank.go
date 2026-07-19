@@ -21,9 +21,10 @@ import (
 // score reflect the LLM-assessed relevance. It reuses the same maxTotalWords
 // budget as the other LLM retrieval components to bound the prompt size.
 type LLMReranker struct {
-	llm           llm.Client
-	store         SectionStore
-	maxTotalWords int
+	llm             llm.Client
+	store           SectionStore
+	maxTotalWords   int
+	maxSectionWords int
 }
 
 const defaultRerankerPrompt = `
@@ -220,14 +221,10 @@ func (r *LLMReranker) getUserPrompt(ctx context.Context, query string, results [
 				return "", errors.WithStack(err)
 			}
 
-			words := strings.Fields(string(content))
-			remaining := maxTotalWords - totalWords
-			if len(words) > remaining {
-				words = words[:remaining]
-			}
-			totalWords += len(words)
+			text, consumed := truncateSection(string(content), r.maxSectionWords, maxTotalWords-totalWords)
+			totalWords += consumed
 
-			sb.WriteString(strings.Join(words, " "))
+			sb.WriteString(text)
 			sb.WriteString("\n\n")
 		}
 	}
@@ -235,12 +232,15 @@ func (r *LLMReranker) getUserPrompt(ctx context.Context, query string, results [
 	return sb.String(), nil
 }
 
-// NewLLMReranker builds an LLM-backed reranker. maxTotalWords bounds the prompt
-// budget (defaults to 50000 when <= 0).
-func NewLLMReranker(client llm.Client, store SectionStore, maxTotalWords int) *LLMReranker {
+// NewLLMReranker builds an LLM-backed reranker. maxTotalWords bounds the total
+// prompt budget (defaults to 8000 when <= 0); each section is additionally
+// capped by WithMaxSectionWords.
+func NewLLMReranker(client llm.Client, store SectionStore, maxTotalWords int, funcs ...PromptOption) *LLMReranker {
+	opts := newPromptOptions(funcs...)
 	return &LLMReranker{
-		llm:           client,
-		store:         store,
-		maxTotalWords: maxTotalWords,
+		llm:             client,
+		store:           store,
+		maxTotalWords:   maxTotalWords,
+		maxSectionWords: opts.maxSectionWords,
 	}
 }
