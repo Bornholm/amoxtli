@@ -103,6 +103,11 @@ retrieval:
   reranking: false
   grounding_check: false
   grounding_fail_open: true
+  # How the grounding verdict is applied: "demote" (default) keeps every
+  # document but ranks irrelevant ones last (preserves recall, improves
+  # ranking); "filter" drops irrelevant documents (high list precision, lower
+  # recall — for short-list RAG).
+  grounding_mode: demote
   # Prompt budget (in words) for the LLM retrieval stages (reranker, judge,
   # evidence evaluator). Words are a coarse proxy for tokens (~1.8 tokens/word),
   # so keep this well under your chat endpoint's context window. 0 uses the

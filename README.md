@@ -77,12 +77,12 @@ Voir [docs/cli.md](docs/cli.md) pour la configuration (`config.yaml`, interpolat
 
 - [Ligne de commande](docs/cli.md) — CLI `amoxtli` : espace de travail, configuration, commandes CRUD, serveur MCP
 - [Architecture](docs/architecture.md) — packages, indexeurs personnalisés et suite de conformité
-- [Grounding (récupération vérifiée)](docs/grounding.md) — `CheckGrounding`, `SearchIterative`, décomposition et re-retrieval itératif
+- [Grounding (récupération vérifiée)](docs/grounding.md) — `CheckGrounding`, `SearchIterative`, décomposition, re-retrieval itératif et modes d'application (`demote` par défaut / `filter`)
 - [Backend PostgreSQL](docs/postgres.md) — déploiement entièrement PostgreSQL (FTS + pgvector, fusion RRF)
 - [Convertisseurs de fichiers](docs/converters.md) — pandoc, LibreOffice, OCR/LLM
 - [Indexation de code source](docs/source-code.md) — tree-sitter pur Go, `WithSourceCode`, recherche croisée doc ↔ code, build tags
 - [Tests](docs/testing.md) — tests unitaires et d'intégration (Docker, Ollama, PostgreSQL)
-- [Évaluation de la pertinence](docs/evaluation.md) — Recall@k / MRR / nDCG@k, benchmark multilingue sur jeux QA Hugging Face
+- [Évaluation de la pertinence](docs/evaluation.md) — Recall@k / MRR / nDCG@k, benchmarks SQuAD/BEIR, profils de récupération et résultats de référence
 - [Stabilité de l'API](docs/stability.md) — politique de compatibilité (série `0.x`) et surface publique couverte
 - [CHANGELOG](CHANGELOG.md) — historique des versions
 

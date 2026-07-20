@@ -124,11 +124,33 @@ Comparer le rapport lexical et le rapport hybride sur le **même** jeu (mêmes
 | `AMOXTLI_EVAL_EMBED_BASE_URL` | Endpoint d'embeddings (active le backend vectoriel) | — |
 | `AMOXTLI_EVAL_EMBED_MODEL` | Modèle d'embeddings | — |
 | `AMOXTLI_EVAL_EMBED_API_KEY` | Clé d'API de l'endpoint | — |
+| `AMOXTLI_EVAL_EMBED_DIM` | Dimension des vecteurs | 768 |
+| `AMOXTLI_EVAL_EMBED_MAX_WORDS` | Taille max des chunks (à réduire pour les modèles à petite fenêtre, ex. mxbai 512 tokens → 300) | 500 |
+| `AMOXTLI_EVAL_EMBED_CACHE_DIR` | Cache d'embeddings persistant, clé par modèle (les re-runs coûtent zéro appel) | — |
 
 > Bornez toujours `MAX_DOCS`/`MAX_QUERIES` sur les gros jeux : l'ingestion
 > vectorielle appelle le service d'embeddings pour chaque passage. Les questions
 > dont le passage a été écarté par la troncature sont automatiquement retirées
 > (`Dataset.KeepAnswerable`), pour ne pas fausser le recall.
+
+### Étages LLM de récupération (chat)
+
+Pour évaluer les étages pilotés par LLM, configurez un client chat
+(`AMOXTLI_EVAL_CHAT_BASE_URL` + `AMOXTLI_EVAL_CHAT_MODEL` + `_API_KEY` ; repli
+sur l'endpoint d'embeddings si le base URL est omis) puis activez les étages :
+
+| Variable | Étage activé |
+|---|---|
+| `AMOXTLI_EVAL_HYDE=1` | HyDE (expansion de requête par réponse hypothétique) |
+| `AMOXTLI_EVAL_RERANK=1` | Reranker LLM |
+| `AMOXTLI_EVAL_GROUNDING=1` | Évaluateur de grounding sur `Search` (filtrage/demote de pertinence) |
+| `AMOXTLI_EVAL_GROUNDING_MODE=demote\|filter` | Mode d'application du grounding (défaut `demote`) |
+| `AMOXTLI_EVAL_ITERATIVE=1` | `SearchIterative` : HyDE + grounding + re-retrieval piloté |
+
+Ces étages reproduisent les profils CLI : *fast* = aucun (0 appel chat),
+*balanced* = `HYDE`, *precision* = `HYDE` + `GROUNDING`. Le coût des appels chat
+(HyDE, grounding, reranker) est reporté dans la section `LLM cost [evaluation]`
+du rapport, à côté des embeddings.
 
 ## Benchmarks BEIR (dont FEVER)
 
@@ -181,6 +203,37 @@ make eval-fever
 
 > Le même mode streaming sert à tous les gros jeux BEIR (HotpotQA, DBPedia,
 > Climate-FEVER, NQ) : `make eval-beir EVAL_BEIR=<jeu> EVAL_BEIR_STREAM=1`.
+
+## Résultats de référence (profils de récupération)
+
+Évaluation SciFact BEIR, corpus complet (5183 documents) et les 300 requêtes du
+test set, fusion hybride bleve+sqlite-vec (RRF 0,5/0,5), embeddings `bge-m3` +
+chat `mistral-small-24b` (OpenRouter). Chiffres indicatifs — ils dépendent du
+corpus et des modèles ; refaites-les sur votre configuration.
+
+| Profil | Étages | Recall@10 | nDCG@10 | MRR | Appels chat/req |
+|---|---|---|---|---|---|
+| fast | embeddings + RRF + dédup | 0,850 | 0,708 | 0,670 | 0 |
+| balanced | + HyDE | 0,871 | 0,723 | 0,684 | 1 |
+| precision (demote) | + grounding demote | 0,867 | **0,752** | **0,723** | 2 |
+| precision (filter) | + grounding filter | 0,649 | 0,618 | 0,612 | 2 |
+
+Enseignements (voir aussi [grounding.md](grounding.md)) :
+
+- **L'embedder domine la qualité.** Le choix du modèle d'embeddings pèse plus
+  que tous les étages LLM réunis — c'est le premier levier à optimiser.
+- **HyDE aide, modestement, et dépend du modèle chat.** Avec un modèle capable :
+  +0,02 Recall@10 / +0,015 nDCG@10. Avec un petit modèle : effet nul. Un
+  sous-échantillon de 40 requêtes surestimait fortement le gain — d'où
+  l'importance d'évaluer sur un jeu large.
+- **Grounding `demote` > `filter` pour le rappel.** `demote` améliore le
+  classement (nDCG@10, MRR) sans perdre de rappel ; `filter` échange le rappel
+  contre la précision de liste (P@10 0,10 → 0,55) et **peut effondrer le rappel
+  avec un modèle faible**. `demote` est le défaut.
+- **Le coût est facturé par recherche.** Chaque étage LLM ajoute un appel par
+  requête ; sur CPU la latence explose (grounding ~4 min/req contre ~10 s via
+  une API). Choisissez le profil selon le budget latence/coût, pas seulement la
+  qualité.
 
 ## Évaluation end-to-end : génération (reader)
 

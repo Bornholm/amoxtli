@@ -45,6 +45,7 @@ type Codex struct {
 	taskRunner        task.Runner
 	evaluator         retrieval.EvidenceEvaluator
 	groundingFailOpen bool
+	groundingMode     retrieval.GroundingMode
 	orchestrator      *retrieval.Orchestrator
 	snapshotBoundary  string
 	cancel            context.CancelFunc
@@ -207,6 +208,7 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 			retrieval.WithMaxSectionWords(opts.maxSectionWords))
 	}
 	codex.groundingFailOpen = opts.groundingFailOpen
+	codex.groundingMode = opts.groundingMode
 	codex.orchestrator = newOrchestrator(opts, manager, codex.evaluator)
 
 	codex.cancel = cancel
@@ -397,7 +399,15 @@ func (c *Codex) searchPage(ctx context.Context, query string, candidatePool int,
 			}
 			return nil, errors.WithStack(err)
 		}
-		results = retrieval.FilterRelevant(results, evaluation.Relevant)
+		// Honor the configured grounding mode (WithGroundingMode), consistent
+		// with the orchestrator used by SearchIterative: GroundingDemote keeps
+		// every retrieved document but ranks the irrelevant ones last
+		// (preserving recall@k), while GroundingFilter (default) drops them.
+		if c.groundingMode == retrieval.GroundingDemote {
+			results = retrieval.DemoteIrrelevant(results, evaluation.Relevant)
+		} else {
+			results = retrieval.FilterRelevant(results, evaluation.Relevant)
+		}
 		g := evaluation.Grounding
 		grounding = &g
 	}

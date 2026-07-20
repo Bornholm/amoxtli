@@ -103,6 +103,12 @@ dominant d'une recherche avec chat configuré. Trois leviers l'amortissent :
 - HyDE n'est appliqué qu'aux indexeurs sémantiques (ignoré sans eux) et
   s'exécute **en parallèle** de la branche lexicale, pas avant elle.
 
+Sur la **qualité** apportée par ces étages, voir les résultats de référence dans
+[evaluation.md](evaluation.md#résultats-de-référence-profils-de-récupération) :
+l'embedder domine, HyDE apporte un gain modeste et dépendant du modèle chat, et
+le grounding s'applique par défaut en mode `demote` (préserve le rappel) —
+détails dans [grounding.md](grounding.md#mode-dapplication--demote-défaut--filter).
+
 ### Runner de tâches persistant (`task/gorm`)
 
 L'ingestion (`IndexFile`, `Reindex`, `CleanupIndex`) est asynchrone : elle

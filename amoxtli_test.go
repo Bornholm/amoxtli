@@ -14,6 +14,7 @@ import (
 	"github.com/bornholm/amoxtli/ingest"
 	gormStore "github.com/bornholm/amoxtli/ingest/gorm"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/task"
 	taskGorm "github.com/bornholm/amoxtli/task/gorm"
 	"github.com/bornholm/genai/llm"
@@ -240,6 +241,186 @@ func TestSearchGroundingFailClosed(t *testing.T) {
 
 	if _, err := codex.Search(context.Background(), "recette bourguignon", WithSearchMaxResults(5)); err == nil {
 		t.Fatal("fail-closed Search should error when the evaluator fails")
+	}
+}
+
+// irrelevantLLM is a stub whose grounding evaluation marks every document
+// irrelevant (empty "relevant" list), so filter mode drops all evidence while
+// demote mode keeps it (reordered). Embeddings are unused (bleve is lexical).
+type irrelevantLLM struct{}
+
+func (irrelevantLLM) ChatCompletion(ctx context.Context, funcs ...llm.ChatCompletionOptionFunc) (llm.ChatCompletionResponse, error) {
+	return llm.NewChatCompletionResponse(
+		llm.NewMessage(llm.RoleAssistant, `{"relevant": [], "status": "invalid", "score": 0, "explanation": "none relevant"}`),
+		llm.NewChatCompletionUsage(0, 0, 0),
+	), nil
+}
+
+func (irrelevantLLM) ChatCompletionStream(ctx context.Context, funcs ...llm.ChatCompletionOptionFunc) (<-chan llm.StreamChunk, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (irrelevantLLM) Embeddings(ctx context.Context, inputs []string, funcs ...llm.EmbeddingsOptionFunc) (llm.EmbeddingsResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+// newGroundingModeCodex builds a bleve-backed Codex with grounding enabled, the
+// given grounding mode and an evaluator that judges every document irrelevant.
+func newGroundingModeCodex(t *testing.T, mode retrieval.GroundingMode) *Codex {
+	t.Helper()
+
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	bleveIdx, err := bleveIndex.OpenOrCreate(ctx, filepath.Join(dir, "index.bleve"))
+	if err != nil {
+		t.Fatalf("could not open bleve index: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { bleveIdx.Close() })
+
+	store, err := gormStore.NewSQLiteStore(filepath.Join(dir, "data.sqlite"))
+	if err != nil {
+		t.Fatalf("could not open store: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { store.Close() })
+
+	codex, err := New(ctx,
+		WithStore(store),
+		WithIndexers(Indexer{ID: "bleve", Index: bleveIdx, Weight: 1}),
+		WithLLMClient(irrelevantLLM{}),
+		WithGroundingCheck(),
+		WithGroundingMode(mode),
+	)
+	if err != nil {
+		t.Fatalf("could not create codex: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { codex.Close() })
+
+	collID, err := codex.CreateCollection(ctx, "test")
+	if err != nil {
+		t.Fatalf("could not create collection: %+v", errors.WithStack(err))
+	}
+
+	source, _ := url.Parse("https://example.net/boeuf.md")
+	taskID, err := codex.IndexFile(ctx, collID, "boeuf.md", strings.NewReader(testDocument), WithIndexFileSource(source))
+	if err != nil {
+		t.Fatalf("could not index file: %+v", errors.WithStack(err))
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		state, err := codex.TaskState(ctx, taskID)
+		if err != nil {
+			t.Fatalf("could not get task state: %+v", errors.WithStack(err))
+		}
+		if state.Status == task.StatusSucceeded {
+			break
+		}
+		if state.Status == task.StatusFailed {
+			t.Fatalf("indexing task failed: %+v", state.Error)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("indexing task did not finish in time (status: %s)", state.Status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	return codex
+}
+
+// TestSearchGroundingModeFilterDropsIrrelevant checks that filter mode drops
+// evidence the evaluator judged irrelevant.
+func TestSearchGroundingModeFilterDropsIrrelevant(t *testing.T) {
+	codex := newGroundingModeCodex(t, retrieval.GroundingFilter)
+
+	results, err := codex.Search(context.Background(), "recette bourguignon", WithSearchMaxResults(5))
+	if err != nil {
+		t.Fatalf("search failed: %+v", errors.WithStack(err))
+	}
+	if len(results) != 0 {
+		t.Errorf("filter mode kept %d results, want 0 (all judged irrelevant)", len(results))
+	}
+}
+
+// TestSearchGroundingDefaultsToDemote checks that grounding, enabled without an
+// explicit WithGroundingMode, defaults to demote (keeps evidence) rather than
+// filter (drops it) — the recall-preserving default.
+func TestSearchGroundingDefaultsToDemote(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	bleveIdx, err := bleveIndex.OpenOrCreate(ctx, filepath.Join(dir, "index.bleve"))
+	if err != nil {
+		t.Fatalf("could not open bleve index: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { bleveIdx.Close() })
+
+	store, err := gormStore.NewSQLiteStore(filepath.Join(dir, "data.sqlite"))
+	if err != nil {
+		t.Fatalf("could not open store: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { store.Close() })
+
+	// No WithGroundingMode — must use the demote default.
+	codex, err := New(ctx,
+		WithStore(store),
+		WithIndexers(Indexer{ID: "bleve", Index: bleveIdx, Weight: 1}),
+		WithLLMClient(irrelevantLLM{}),
+		WithGroundingCheck(),
+	)
+	if err != nil {
+		t.Fatalf("could not create codex: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { codex.Close() })
+
+	collID, err := codex.CreateCollection(ctx, "test")
+	if err != nil {
+		t.Fatalf("could not create collection: %+v", errors.WithStack(err))
+	}
+	source, _ := url.Parse("https://example.net/boeuf.md")
+	taskID, err := codex.IndexFile(ctx, collID, "boeuf.md", strings.NewReader(testDocument), WithIndexFileSource(source))
+	if err != nil {
+		t.Fatalf("could not index file: %+v", errors.WithStack(err))
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		state, err := codex.TaskState(ctx, taskID)
+		if err != nil {
+			t.Fatalf("could not get task state: %+v", errors.WithStack(err))
+		}
+		if state.Status == task.StatusSucceeded {
+			break
+		}
+		if state.Status == task.StatusFailed {
+			t.Fatalf("indexing task failed: %+v", state.Error)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("indexing task did not finish in time (status: %s)", state.Status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	results, err := codex.Search(ctx, "recette bourguignon", WithSearchMaxResults(5))
+	if err != nil {
+		t.Fatalf("search failed: %+v", errors.WithStack(err))
+	}
+	if len(results) == 0 {
+		t.Error("default grounding dropped all results — default should be demote (recall-preserving), not filter")
+	}
+}
+
+// TestSearchGroundingModeDemoteKeepsIrrelevant checks that demote mode keeps the
+// evidence (reordered) instead of dropping it — the fix that makes
+// WithGroundingMode take effect on the non-iterative Search path.
+func TestSearchGroundingModeDemoteKeepsIrrelevant(t *testing.T) {
+	codex := newGroundingModeCodex(t, retrieval.GroundingDemote)
+
+	results, err := codex.Search(context.Background(), "recette bourguignon", WithSearchMaxResults(5))
+	if err != nil {
+		t.Fatalf("search failed: %+v", errors.WithStack(err))
+	}
+	if len(results) == 0 {
+		t.Error("demote mode dropped all results, want them kept (reordered) — WithGroundingMode ignored by Search")
 	}
 }
 

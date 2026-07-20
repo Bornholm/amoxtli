@@ -97,9 +97,16 @@ func defaultOptions() *options {
 		// previous 12000-word default flirted with 22k tokens). It also bounds
 		// the cost of every LLM retrieval stage (judge, reranker, evidence
 		// evaluator), which is billed per search.
-		maxTotalWords:              8000,
-		taskParallelism:            5,
-		snapshotBoundary:           "amoxtli-snapshot-v1",
+		maxTotalWords:    8000,
+		taskParallelism:  5,
+		snapshotBoundary: "amoxtli-snapshot-v1",
+		// Grounding defaults to demote, not filter: SciFact evaluations (300
+		// queries, capable chat model) show demote preserves recall@k while
+		// improving ranking (nDCG@10 / MRR) by re-ordering the relevant
+		// evidence first, whereas filter trades most of the recall away for
+		// list precision — useful only for short-list RAG. Override with
+		// WithGroundingMode(GroundingFilter).
+		groundingMode:              retrieval.GroundingDemote,
 		groundingMinScore:          0.4,
 		iterativeMaxRounds:         1,
 		decompositionMaxSubQueries: 3,
@@ -278,10 +285,11 @@ func WithGroundingMinScore(minScore float64) Option {
 }
 
 // WithGroundingMode selects what the evaluator's relevance signal does to the
-// evidence: retrieval.GroundingFilter (default) drops the sections judged
-// irrelevant — maximising precision but truncating recall; retrieval.GroundingDemote
-// keeps them but ranks them last — preserving recall@k while still surfacing the
-// grounded evidence first. Only meaningful together with WithGroundingCheck.
+// evidence: retrieval.GroundingDemote (the default) keeps every retrieved
+// document but ranks the irrelevant ones last — preserving recall@k while
+// surfacing the grounded evidence first; retrieval.GroundingFilter drops the
+// sections judged irrelevant — maximising list precision but truncating recall,
+// which suits short-list RAG. Only meaningful together with WithGroundingCheck.
 func WithGroundingMode(mode retrieval.GroundingMode) Option {
 	return func(o *options) {
 		o.groundingMode = mode

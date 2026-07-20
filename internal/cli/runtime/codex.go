@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/bornholm/amoxtli"
 	bleveIndex "github.com/bornholm/amoxtli/index/bleve"
@@ -19,6 +20,7 @@ import (
 	"github.com/bornholm/amoxtli/internal/cli/workspace"
 	"github.com/bornholm/amoxtli/llmx"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/genai/llm"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -336,6 +338,11 @@ func retrievalOptions(cfg *config.Config, client llm.Client, stageClients map[st
 		opts = append(opts, amoxtli.WithGroundingCheck())
 		if cfg.Retrieval.GroundingFailOpen {
 			opts = append(opts, amoxtli.WithGroundingFailOpen())
+		}
+		if strings.EqualFold(cfg.Retrieval.GroundingMode, "filter") {
+			opts = append(opts, amoxtli.WithGroundingMode(retrieval.GroundingFilter))
+		} else if strings.EqualFold(cfg.Retrieval.GroundingMode, "demote") {
+			opts = append(opts, amoxtli.WithGroundingMode(retrieval.GroundingDemote))
 		}
 	}
 

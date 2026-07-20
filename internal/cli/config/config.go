@@ -182,6 +182,12 @@ type RetrievalConfig struct {
 	Reranking         bool   `yaml:"reranking"`
 	GroundingCheck    bool   `yaml:"grounding_check"`
 	GroundingFailOpen bool   `yaml:"grounding_fail_open"`
+	// GroundingMode is how the grounding verdict is applied to the evidence:
+	// "demote" (default) keeps every document but ranks irrelevant ones last —
+	// preserving recall@k while improving ranking; "filter" drops the
+	// irrelevant documents — high list precision but truncated recall, for
+	// short-list RAG. Empty defers to the library default (demote).
+	GroundingMode string `yaml:"grounding_mode"`
 	// MaxTotalWords bounds the prompt size (in words) of the LLM retrieval
 	// stages (reranker, judge, evidence evaluator). Keep it low enough that the
 	// resulting prompt fits your chat endpoint's context window: words are only
@@ -414,6 +420,10 @@ func (c *Config) Validate() error {
 
 	if p := c.Retrieval.Profile; p != "" && !slices.Contains(Profiles, p) {
 		return errors.Errorf("retrieval.profile: unknown profile %q (supported: %v)", p, Profiles)
+	}
+
+	if m := c.Retrieval.GroundingMode; m != "" && !strings.EqualFold(m, "demote") && !strings.EqualFold(m, "filter") {
+		return errors.Errorf("retrieval.grounding_mode: unknown mode %q (expected \"demote\" or \"filter\")", m)
 	}
 
 	if !c.HasChat() {

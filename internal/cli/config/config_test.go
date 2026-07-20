@@ -205,6 +205,11 @@ func TestParseErrors(t *testing.T) {
 			wantErr: "unknown profile",
 		},
 		{
+			name:    "unknown grounding mode",
+			raw:     "retrieval:\n  grounding_mode: rerank",
+			wantErr: "unknown mode",
+		},
+		{
 			name:    "balanced profile without chat",
 			raw:     "retrieval:\n  profile: balanced",
 			wantErr: "requires llm.chat",

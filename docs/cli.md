@@ -60,9 +60,17 @@ par-dessus :
 | `precision` | + évaluateur de grounding | 2 |
 | *(vide)* | défaut historique : HyDE + Judge | 2 |
 
-`fast` fonctionne sans `llm.chat` ; `balanced` et `precision` l'exigent. Les
-évals SciFact montrent que la qualité vient d'abord de l'embedder : `fast` est
-généralement compétitif pour une fraction du coût.
+`fast` fonctionne sans `llm.chat` ; `balanced` et `precision` l'exigent.
+
+Le grounding (`grounding_check`, ou le profil `precision`) applique son verdict
+selon `retrieval.grounding_mode` : **`demote` (défaut)** garde tous les
+documents mais relègue les non pertinents en fin de liste — il préserve le
+rappel *et* améliore le classement ; **`filter`** supprime les documents non
+pertinents — forte précision de liste mais rappel tronqué, pour du RAG à listes
+courtes. Sur SciFact (corpus complet, 300 requêtes, mistral-small-24b) : demote
+nDCG@10 0,752 / Recall@10 0,867 vs filter 0,618 / 0,649. Attention : avec un
+petit modèle chat, `filter` peut effondrer le rappel (sur-filtrage) — une raison
+de plus de garder demote.
 
 ### Cache LLM
 

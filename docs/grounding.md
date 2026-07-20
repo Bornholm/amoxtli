@@ -17,13 +17,32 @@ Trois mécanismes, activables indépendamment (client LLM requis) :
 
 Le filtrage de pertinence (auparavant le `Judge` du pipeline) et la vérification de grounding lisent tous deux la même évidence via le LLM. Pour éviter cet appel redondant, `WithGroundingCheck()` active un **évaluateur d'évidence unique** (`retrieval.EvidenceEvaluator`) qui, en **un seul appel LLM**, retourne à la fois les documents pertinents à conserver **et** le verdict de suffisance (calculé sur les documents retenus).
 
-Quand le grounding est activé, cet évaluateur **remplace le `Judge`** dans le pipeline : `Search` s'en sert pour le filtrage de pertinence, `CheckGrounding` pour le verdict, et `SearchIterative` pour les deux. Conséquences :
+Quand le grounding est activé, cet évaluateur **remplace le `Judge`** dans le pipeline : `Search` s'en sert pour appliquer le signal de pertinence, `CheckGrounding` pour le verdict, et `SearchIterative` pour les deux. Conséquences :
 
-- `Search` fait le même nombre d'appels qu'avec le `Judge` (filtrage), à granularité identique → **pertinence inchangée**.
+- `Search` fait un seul appel d'évaluation par recherche (comme le `Judge`), mais applique le résultat selon le **mode** ci-dessous (par défaut : ré-ordonnancement, pas suppression).
 - `SearchIterative` économise un appel LLM par round (le grounding n'est plus une passe séparée).
-- En mode décomposé, le filtrage devient **global** (une passe sur l'évidence fusionnée) au lieu de par-sous-question — neutre-à-positif (plus de contexte, déduplication naturelle), et le verdict porte sur l'évidence déjà filtrée (plus cohérent).
+- En mode décomposé, l'évaluation devient **globale** (une passe sur l'évidence fusionnée) au lieu de par-sous-question — neutre-à-positif (plus de contexte, déduplication naturelle), et le verdict porte sur l'évidence déjà traitée (plus cohérent).
 
 Quand le grounding est **désactivé**, le `Judge` reste dans le pipeline : comportement inchangé.
+
+## Mode d'application : `demote` (défaut) / `filter`
+
+`WithGroundingMode` (CLI : `retrieval.grounding_mode`) décide de ce que le signal de pertinence fait à l'évidence :
+
+- **`GroundingDemote` (défaut)** — garde **tous** les documents récupérés mais relègue les non pertinents en fin de liste (les pertinents remontent). Préserve le rappel@k **et** améliore le classement.
+- **`GroundingFilter`** — **supprime** les documents jugés non pertinents. Précision de liste maximale mais rappel tronqué : adapté au RAG qui n'alimente le générateur qu'avec quelques passages très pertinents.
+
+Le défaut est `demote` sur la foi d'une évaluation SciFact (corpus complet 5183 documents, 300 requêtes, embeddings bge-m3 + chat mistral-small-24b) :
+
+| Configuration | Recall@10 | nDCG@10 | MRR | P@10 |
+|---|---|---|---|---|
+| HyDE seul (pas de grounding) | 0,871 | 0,723 | 0,684 | 0,097 |
+| HyDE + grounding **demote** | 0,867 | **0,752** | **0,723** | 0,097 |
+| HyDE + grounding **filter** | 0,649 | 0,618 | 0,612 | **0,549** |
+
+`demote` est le meilleur profil sur le classement (nDCG@10, MRR) sans sacrifier le rappel — il exploite le verdict pour trier, pas pour jeter. `filter` échange l'essentiel du rappel contre une précision de liste élevée : à ne choisir que pour un usage RAG à listes courtes.
+
+> ⚠️ **Le grounding dépend de la qualité du modèle chat.** Avec un modèle faible, `filter` peut **effondrer le rappel** (l'évaluateur juge à tort la quasi-totalité de l'évidence non pertinente ; sur un run CPU avec un modèle 3B, Recall@10 est tombé à 0,05). Le fail-open ne protège pas de ce cas — l'évaluateur ne renvoie pas d'erreur, il sur-filtre — d'où l'intérêt de `demote` par défaut. Réservez `filter` (et le grounding en général) à un modèle chat capable, ou pointez l'étage grounding sur un bon modèle via `WithStageLLMClient`.
 
 ## Exemple
 

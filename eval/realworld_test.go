@@ -191,6 +191,11 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 	iterative := os.Getenv("AMOXTLI_EVAL_ITERATIVE") != ""
 	rerank := os.Getenv("AMOXTLI_EVAL_RERANK") != ""
 	hyde := iterative || os.Getenv("AMOXTLI_EVAL_HYDE") != ""
+	// grounding (non-iterative) applies the fused evidence evaluator as a
+	// relevance filter on a plain codex.Search — this is exactly the CLI
+	// "precision" retrieval profile. Iterative implies grounding on its own
+	// through the orchestrator, so this toggle only matters standalone.
+	grounding := os.Getenv("AMOXTLI_EVAL_GROUNDING") != ""
 
 	codexOpts := []amoxtli.Option{
 		amoxtli.WithStore(store),
@@ -202,11 +207,24 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 	}
 	// A single chat client feeds every LLM feature (HyDE, reranker, grounding
 	// evaluator, query reformulator). WithLLMClient must be set exactly once.
-	if hyde || rerank || iterative {
+	if hyde || rerank || iterative || grounding {
 		codexOpts = append(codexOpts, amoxtli.WithLLMClient(chatClient(t)))
 	}
 	if hyde {
 		mode += " + hyde"
+	}
+	// Standalone grounding (the orchestrator wires its own under iterative).
+	if grounding && !iterative {
+		codexOpts = append(codexOpts,
+			amoxtli.WithGroundingCheck(),
+			amoxtli.WithGroundingFailOpen(),
+		)
+		if strings.EqualFold(os.Getenv("AMOXTLI_EVAL_GROUNDING_MODE"), "demote") {
+			codexOpts = append(codexOpts, amoxtli.WithGroundingMode(retrieval.GroundingDemote))
+			mode += " + grounding(demote)"
+		} else {
+			mode += " + grounding(filter)"
+		}
 	}
 	if rerank {
 		codexOpts = append(codexOpts,
@@ -567,7 +585,11 @@ func chatClient(t *testing.T) llm.Client {
 	if err != nil {
 		t.Fatalf("create chat client: %+v", errors.WithStack(err))
 	}
-	return withRetry(t, client)
+	// Wrap with the observable decorator (outside retry, so retries count as one
+	// logical call) so the cost meter captures the chat calls of HyDE, the
+	// grounding evaluator and the reranker — otherwise the evaluation cost
+	// report only accounts for embeddings.
+	return llmx.NewObservableClient(withRetry(t, client))
 }
 
 func envFloat(t *testing.T, name string, def float64) float64 {
