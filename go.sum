@@ -57,8 +57,8 @@ github.com/blevesearch/zapx/v15 v15.4.1 h1:B5IoTMUCEzFdc9FSQbhVOxAY+BO17c05866fN
 github.com/blevesearch/zapx/v15 v15.4.1/go.mod h1:b/MreHjYeQoLjyY2+UaM0hGZZUajEbE0xhnr1A2/Q6Y=
 github.com/blevesearch/zapx/v16 v16.2.2 h1:MifKJVRTEhMTgSlle2bDRTb39BGc9jXFRLPZc6r0Rzk=
 github.com/blevesearch/zapx/v16 v16.2.2/go.mod h1:B9Pk4G1CqtErgQV9DyCSA9Lb7WZe4olYfGw7fVDZ4sk=
-github.com/bornholm/genai v0.17.1 h1:n7xjk5aoyrq36vUK1gnEuoj5HS5t4rMSV5z2FlUMq+I=
-github.com/bornholm/genai v0.17.1/go.mod h1:OmbuElbTAc78us9NFtktRIA7pb9QZnVk41zYtoHepqI=
+github.com/bornholm/genai v0.31.0 h1:nkMUtOxfXi1em0kWeMDHgUJASeQ+o8RIzBfzuAy41Qs=
+github.com/bornholm/genai v0.31.0/go.mod h1:ajuzZJvHAhy2SOsjxVNI1WUZaYKvGfabRE9UnLWirr0=
 github.com/bornholm/go-x v0.0.0-20260127104343-c6737ea35324 h1:urrNBFQGXI3uvAivANnjEBdZVMDfmWn/okKIwDDqJ/w=
 github.com/bornholm/go-x v0.0.0-20260127104343-c6737ea35324/go.mod h1:LrDsNbXXqkdlQ/tlcbWKUF/FoFA/WjUEtNDRa/Xl19c=
 github.com/cenkalti/backoff/v4 v4.3.0 h1:MyRJ/UdXutAwSAT+s3wNd7MfTIcy71VQueUuFK343L8=
@@ -203,8 +203,8 @@ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRI
 github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c h1:ncq/mPwQF4JjgDlrVEn3C11VoGHZN7m8qihwgMEtzYw=
 github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c/go.mod h1:OmDBASR4679mdNQnz2pUhc2G8CO2JrUAVFDRBDP/hJE=
-github.com/revrost/go-openrouter v1.1.5 h1:YkTxdRrkfTf5Y78Daa4a3k+WgX6KIKkLgDri2ZSndJ4=
-github.com/revrost/go-openrouter v1.1.5/go.mod h1:jZFcumFqvS25o8oEQc1/+4yeK7lHDSnwPMIJ/pKPdNc=
+github.com/revrost/go-openrouter v1.6.0 h1:A3++J/DypecvL6AcG3bZA/oBc7gs2zBBqD9haydxToE=
+github.com/revrost/go-openrouter v1.6.0/go.mod h1:xByLw2kG+6qcregvtIY8MB7xvmVHns8McC9B0lQJluY=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=
 github.com/rogpeppe/go-internal v1.14.1/go.mod h1:MaRKkUm5W0goXpeCfT7UZI6fk/L7L7so1lCWt35ZSgc=
 github.com/rs/xid v1.6.0 h1:fV591PaemRlL6JfRxGDEPl69wICngIQ3shQtzfy2gxU=
