@@ -34,7 +34,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 # Embed only the tree-sitter grammar blobs amoxtli actually routes
 # (sourcecode.DefaultRegistry); without these tags the gotreesitter registry
 # embeds all ~206 grammars (~23MB extra in the binary).
-GRAMMAR_TAGS := grammar_subset grammar_subset_go grammar_subset_javascript grammar_subset_typescript grammar_subset_tsx grammar_subset_python grammar_subset_php
+GRAMMAR_TAGS := grammar_subset grammar_subset_go grammar_subset_javascript grammar_subset_typescript grammar_subset_tsx grammar_subset_python grammar_subset_php grammar_subset_json grammar_subset_yaml
 
 .PHONY: build
 build: ## Build the amoxtli CLI into dist/amoxtli

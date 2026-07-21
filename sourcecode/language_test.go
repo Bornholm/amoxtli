@@ -21,6 +21,9 @@ func TestDefaultRegistryLookup(t *testing.T) {
 		{Extension: ".tsx", Language: "tsx"},
 		{Extension: ".py", Language: "python"},
 		{Extension: ".php", Language: "php"},
+		{Extension: ".json", Language: "json"},
+		{Extension: ".yaml", Language: "yaml"},
+		{Extension: ".yml", Language: "yaml"},
 	}
 
 	for _, tc := range testCases {
@@ -67,7 +70,7 @@ func TestRegistryRegisterOverride(t *testing.T) {
 func TestNames(t *testing.T) {
 	names := Names()
 
-	for _, expected := range []string{"go", "javascript", "typescript", "tsx", "python", "php"} {
+	for _, expected := range []string{"go", "javascript", "typescript", "tsx", "python", "php", "json", "yaml"} {
 		if !slices.Contains(names, expected) {
 			t.Errorf("Names(): expected to contain '%s' (got %v)", expected, names)
 		}

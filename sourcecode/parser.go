@@ -116,21 +116,22 @@ type declRange struct {
 // extractDeclarations parses the file and returns the byte ranges of the
 // declarations captured by the language query, extended over their leading
 // doc comments and decorators. The second return value is false when the
-// structural extraction was skipped or failed.
+// structural extraction was skipped or failed (e.g. the grammar was not
+// embedded because the matching grammar_subset_<lang> build tag is off).
 func extractDeclarations(lang *Language, data []byte, maxParseBytes int) ([]declRange, bool) {
 	if maxParseBytes > 0 && len(data) > maxParseBytes {
 		return nil, false
 	}
 
 	grammar, query, err := lang.load()
-	if err != nil {
+	if err != nil || grammar == nil {
 		return nil, false
 	}
 
 	parser := ts.NewParser(grammar)
 	parser.SetTimeoutMicros(parseTimeoutMicros)
 
-	tree, err := parser.Parse(data)
+	tree, err := parseTree(parser, lang, data)
 	if err != nil || tree == nil {
 		return nil, false
 	}
@@ -150,6 +151,21 @@ func extractDeclarations(lang *Language, data []byte, maxParseBytes int) ([]decl
 	}
 
 	return ranges, true
+}
+
+// parseTree routes a parse through either the DFA lexer or the language's
+// registered token source factory depending on what the grammar ships.
+func parseTree(parser *ts.Parser, lang *Language, data []byte) (*ts.Tree, error) {
+	if lang.backend() != parseBackendTokenSource {
+		return parser.Parse(data)
+	}
+
+	tokenSource := lang.TokenSource(data, lang.grammar)
+	if tokenSource == nil {
+		return parser.Parse(data)
+	}
+
+	return parser.ParseWithTokenSource(data, tokenSource)
 }
 
 // leadingTriviaTypes are the node types glued to the following declaration

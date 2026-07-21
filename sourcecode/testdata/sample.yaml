@@ -1,0 +1,24 @@
+name: amoxtli
+version: 0.1.0
+
+server:
+  host: localhost
+  port: 8080
+
+retrieval:
+  top_k: 10
+  hybrid:
+    lexical_weight: 0.5
+    semantic_weight: 0.5
+    rerank: true
+
+languages:
+  - en
+  - fr
+  - es
+
+documents:
+  - title: Getting started
+    path: docs/getting-started.md
+  - title: Reference
+    path: docs/reference.md

@@ -32,6 +32,8 @@ builds:
       - grammar_subset_tsx
       - grammar_subset_python
       - grammar_subset_php
+      - grammar_subset_json
+      - grammar_subset_yaml
     flags:
       - -trimpath
     ldflags:
