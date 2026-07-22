@@ -1,80 +1,70 @@
-package index
+package index_test
 
 import (
+	"context"
 	"testing"
-	"time"
+
+	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/index/filtertest"
+	"github.com/pkg/errors"
 )
 
-func TestFilterMatches(t *testing.T) {
-	meta := map[string]any{
-		"author": "william",
-		"lang":   "fr",
-		"year":   float64(2026), // JSON-decoded number
-		"count":  3,             // native int
-		"public": true,
-		"date":   "2026-07-13T00:00:00Z",
-	}
+// TestFilterConformance runs the shared semantics suite against the Go
+// evaluator. Every filterable backend must run the same suite against its SQL
+// translation: that pair of runs is what keeps push-down and fallback returning
+// the same documents.
+func TestFilterConformance(t *testing.T) {
+	filtertest.Run(t, func(_ context.Context, filter index.Filter, metadata map[string]any) (bool, error) {
+		return filter.Matches(metadata), nil
+	})
+}
 
+func TestFilterValidate(t *testing.T) {
 	testCases := []struct {
-		name   string
-		filter Filter
-		want   bool
+		name    string
+		filter  index.Filter
+		wantErr bool
 	}{
-		{"empty matches all", Filter{}, true},
-		{"eq string", Filter{Eq("author", "william")}, true},
-		{"eq string mismatch", Filter{Eq("author", "bob")}, false},
-		{"ne string", Filter{Ne("author", "bob")}, true},
-		{"ne on absent key", Filter{Ne("missing", "x")}, true},
-		{"eq on absent key", Filter{Eq("missing", "x")}, false},
-		{"conjunction ok", Filter{Eq("author", "william"), Eq("lang", "fr")}, true},
-		{"conjunction one fails", Filter{Eq("author", "william"), Eq("lang", "en")}, false},
-		{"eq number int vs float", Filter{Eq("year", 2026)}, true},
-		{"eq number float vs int", Filter{Eq("count", float64(3))}, true},
-		{"gt number", Filter{Gt("year", 2000)}, true},
-		{"gt number false", Filter{Gt("year", 2030)}, false},
-		{"gte number boundary", Filter{Gte("year", 2026)}, true},
-		{"lt number", Filter{Lt("count", 5)}, true},
-		{"lte boundary", Filter{Lte("count", 3)}, true},
-		{"in match", Filter{In("lang", "en", "fr", "de")}, true},
-		{"in no match", Filter{In("lang", "en", "de")}, false},
-		{"in numbers", Filter{In("count", 1, 2, 3)}, true},
-		{"bool eq", Filter{Eq("public", true)}, true},
-		{"bool ne", Filter{Ne("public", false)}, true},
-		{"ordered on non-comparable types", Filter{Gt("author", 3)}, false},
-		{"date gte string", Filter{Gte("date", "2026-01-01T00:00:00Z")}, true},
-		{"date lt string false", Filter{Lt("date", "2026-01-01T00:00:00Z")}, false},
+		{"empty", index.Filter{}, false},
+		{"simple key", index.Filter{index.Eq("author", "x")}, false},
+		{"digits, dash and underscore", index.Filter{index.Eq("created_at-2", "x")}, false},
+		{"empty key", index.Filter{index.Eq("", "x")}, true},
+		{"dotted key breaks sqlite json paths", index.Filter{index.Eq("a.b", "x")}, true},
+		{"quoted key", index.Filter{index.Eq(`a"b`, "x")}, true},
+		{"sql injection attempt", index.Filter{index.Eq("'; DROP TABLE documents; --", "x")}, true},
+		{"json path key", index.Filter{index.Eq(`$."a"[0]`, "x")}, true},
+		{"space in key", index.Filter{index.Eq("a b", "x")}, true},
+		{"unicode key", index.Filter{index.Eq("auteur_éric", "x")}, true},
+		{"second condition invalid", index.Filter{index.Eq("a", "x"), index.Eq("a b", "y")}, true},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.filter.Matches(meta); got != tc.want {
-				t.Fatalf("Matches() = %v, want %v", got, tc.want)
+			err := tc.filter.Validate()
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Validate() = nil, want an error")
+				}
+				if !errors.Is(err, index.ErrInvalidFilterKey) {
+					t.Fatalf("Validate() = %+v, want an ErrInvalidFilterKey", err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Validate() = %+v, want nil", err)
 			}
 		})
 	}
 }
 
-func TestFilterDateAgainstTimeValue(t *testing.T) {
-	// A time.Time condition value must compare against an RFC 3339 string meta.
-	meta := map[string]any{"date": "2026-07-13T12:00:00Z"}
-	cutoff := time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC)
+// A rejected key must never reach a backend, but an unvalidated filter must
+// still evaluate safely: a hostile key is a key that no document carries.
+func TestFilterMatchesIgnoresInvalidKeys(t *testing.T) {
+	filter := index.Filter{index.Eq("'; DROP TABLE documents; --", "x")}
 
-	if !(Filter{Gt("date", cutoff)}).Matches(meta) {
-		t.Fatal("expected date after cutoff to match Gt")
-	}
-	if (Filter{Lt("date", cutoff)}).Matches(meta) {
-		t.Fatal("expected date after cutoff to not match Lt")
-	}
-}
-
-func TestFilterNilMeta(t *testing.T) {
-	if !(Filter{Ne("k", "v")}).Matches(nil) {
-		t.Fatal("Ne on nil meta should match")
-	}
-	if (Filter{Eq("k", "v")}).Matches(nil) {
-		t.Fatal("Eq on nil meta should not match")
-	}
-	if !(Filter{}).Matches(nil) {
-		t.Fatal("empty filter on nil meta should match")
+	if filter.Matches(map[string]any{"a": "x"}) {
+		t.Fatal("expected a hostile key to match nothing")
 	}
 }

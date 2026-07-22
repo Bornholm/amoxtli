@@ -7,6 +7,7 @@ import (
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/pkg/errors"
 )
 
 // stubIndex implements index.Index, returning a canned result list. (The
@@ -137,6 +138,18 @@ func TestManagerSearchMetadataFilter(t *testing.T) {
 	}
 	if len(page.Results) != 2 {
 		t.Fatalf("expected 2 results with year>=2025, got %d", len(page.Results))
+	}
+}
+
+// Filter keys reach the manager from caller-facing surfaces, so an invalid one
+// must be rejected before it is evaluated — let alone handed to a backend.
+func TestManagerSearchRejectsInvalidFilterKey(t *testing.T) {
+	store := &stubStore{metadata: map[string]map[string]any{"test://a": {"lang": "fr"}}}
+	m := newSearchManager(&stubIndex{results: []*index.SearchResult{result("a", 1, "sa")}}, store)
+
+	_, err := m.Search(context.Background(), "q", WithSearchFilter(index.Filter{index.Eq("'; DROP TABLE documents; --", "x")}))
+	if !errors.Is(err, index.ErrInvalidFilterKey) {
+		t.Fatalf("expected an ErrInvalidFilterKey, got %+v", err)
 	}
 }
 

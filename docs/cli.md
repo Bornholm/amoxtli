@@ -111,7 +111,7 @@ métadonnées `type=code` et `language=<nom>`, filtrables à la recherche :
 ```bash
 amoxtli add -c code $(git ls-files '*.go')     # indexer le code d'un dépôt
 amoxtli search "parse configuration" --filter language=go   # code Go seul
-amoxtli search "parse configuration" --filter "type!=code"  # documentation seule
+amoxtli search "parse configuration" --filter '!type'       # documentation seule
 ```
 
 La table `indexing.code.extensions` étend ou remplace le routage
@@ -137,8 +137,17 @@ Options globales : `--json` (sortie machine), `-C <dir>`, `--config <fichier>`,
 `-v/--verbose` (journalisation debug sur stderr).
 
 Les filtres de métadonnées de `search --filter` et `doc` acceptent les
-opérateurs `=`, `!=`, `>`, `>=`, `<`, `<=` (ex. `--filter year>=2020`). Les
-valeurs sont typées automatiquement (booléen, nombre, sinon chaîne).
+opérateurs `=`, `!=`, `>`, `>=`, `<`, `<=` (ex. `--filter year>=2020`), plus
+deux formes de présence : `clé?` (le document porte la clé) et `!clé` (il ne la
+porte pas). Les valeurs sont typées automatiquement (`true`/`false` en booléen,
+nombre, sinon chaîne).
+
+⚠️ Tous les opérateurs **exigent que la clé soit présente**, `!=` compris :
+`--filter "type!=code"` ne remonte pas les documents dépourvus de `type`. C'est
+la sémantique « SQL NULL-like » (voir
+[docs/architecture.md](architecture.md#sémantique-du-filtre)) ; pour cibler
+l'absence, utiliser `--filter '!type'`. Les clés sont limitées à
+`[A-Za-z0-9_-]` (128 caractères max) ; une clé hors de ce jeu est rejetée.
 
 ### Ignorer des fichiers (`.amoxtlignore`)
 

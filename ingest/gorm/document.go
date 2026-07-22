@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/bornholm/amoxtli/internal/filternorm"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/pkg/errors"
 )
@@ -120,8 +121,12 @@ func fromDocument(d model.Document) (*Document, error) {
 		return nil, errors.WithStack(err)
 	}
 
+	// Metadata is canonicalized on the way in — notably every date to RFC 3339
+	// UTC with fixed precision — so that what is persisted compares identically
+	// whether the filter is evaluated in Go or pushed down into SQL, where a
+	// date is just text (see index.Filter semantics).
 	var metadata []byte
-	if m := model.Metadata(d); len(m) > 0 {
+	if m := filternorm.Metadata(model.Metadata(d)); len(m) > 0 {
 		metadata, err = json.Marshal(m)
 		if err != nil {
 			return nil, errors.WithStack(err)

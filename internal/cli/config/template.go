@@ -151,7 +151,8 @@ indexing:
   # Source-code indexing (tree-sitter, pure Go). Code files are split into
   # declaration-level sections and tagged with type=code and language=<name>
   # metadata, filterable at search time (e.g. --filter language=go, or
-  # --filter "type!=code" to search documentation only).
+  # --filter '!type' to search documents carrying no type, i.e. documentation
+  # only — every other operator requires the key to be present).
   code:
     # true, false or auto (auto enables it; no external tool required).
     enabled: auto

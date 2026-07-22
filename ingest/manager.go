@@ -193,6 +193,13 @@ const defaultCandidatePool = 100
 func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptionFunc) (*SearchResults, error) {
 	opts := NewSearchOptions(funcs...)
 
+	// Filter keys reach us from caller-facing surfaces (CLI flags, MCP tool
+	// arguments): reject the invalid ones here, before they are evaluated or
+	// translated into a backend query.
+	if err := opts.Filter.Validate(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	pageSize := opts.MaxResults
 	if pageSize <= 0 {
 		pageSize = 5

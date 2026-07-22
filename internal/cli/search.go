@@ -139,7 +139,7 @@ func newSearchCommand(opts *rootOptions) *cobra.Command {
 	flags := cmd.Flags()
 	flags.IntVarP(&maxResults, "max-results", "n", 5, "maximum number of results")
 	flags.StringArrayVarP(&collections, "collection", "c", nil, "restrict to collections (label or ID, repeatable)")
-	flags.StringArrayVar(&filters, "filter", nil, "metadata filter (key=value, key!=value, key>value..., repeatable)")
+	flags.StringArrayVar(&filters, "filter", nil, "metadata filter (key=value, key!=value, key>value..., key? if set, !key if unset, repeatable)")
 	flags.StringVar(&cursor, "cursor", "", "resume pagination from a previous next_cursor")
 	flags.BoolVar(&deep, "deep", false, "iterative retrieval driven by an LLM (requires llm.chat)")
 	flags.BoolVar(&noContent, "no-content", false, "do not fetch and display section contents")

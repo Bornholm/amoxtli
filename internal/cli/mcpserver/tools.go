@@ -18,7 +18,7 @@ type searchInput struct {
 	Query       string   `json:"query" jsonschema:"the search query"`
 	MaxResults  int      `json:"max_results,omitempty" jsonschema:"maximum number of results (default 5)"`
 	Collections []string `json:"collections,omitempty" jsonschema:"restrict to these collection labels or IDs"`
-	Filters     []string `json:"filters,omitempty" jsonschema:"metadata filter expressions (key=value, key!=value, key>=value...), e.g. type=code, language=go, or type!=code for documentation only"`
+	Filters     []string `json:"filters,omitempty" jsonschema:"metadata filter expressions (key=value, key!=value, key>=value..., key? if the key is set, !key if it is not), e.g. type=code, language=go, or !type for documents carrying no type. Every operator except !key requires the key to be present, so key!=value never matches a document lacking the key"`
 }
 
 type sectionResult struct {
@@ -92,7 +92,7 @@ type documentHeader struct {
 func (s *Server) registerTools(iterative, groundingEnabled bool) {
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name:        "search",
-		Description: "Search the local document corpus. Returns matching documents with their most relevant sections inline, plus the metadata each document carries — read it to learn which keys and values the filters parameter accepts. Indexed source code carries type=code and language=<name> metadata: use filters like [\"type=code\"] to search code only, or [\"type!=code\"] for documentation only.",
+		Description: "Search the local document corpus. Returns matching documents with their most relevant sections inline, plus the metadata each document carries — read it to learn which keys and values the filters parameter accepts. Indexed source code carries type=code and language=<name> metadata: use filters like [\"type=code\"] to search code only, or [\"!type\"] for documentation only (every operator but !key requires the key to be present, so type!=code skips documents carrying no type at all).",
 	}, s.handleSearch(iterative, groundingEnabled))
 
 	mcp.AddTool(s.mcp, &mcp.Tool{

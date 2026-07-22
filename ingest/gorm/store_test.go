@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/ingest"
 	"github.com/bornholm/amoxtli/markdown"
 	"github.com/bornholm/amoxtli/model"
@@ -85,7 +87,11 @@ func testStoreConformance(t *testing.T, ctx context.Context, store *Store) {
 	source, _ := url.Parse("https://example.net/test.md")
 	doc.SetSource(source)
 	doc.AddCollection(coll)
-	doc.SetMetadata(map[string]any{"author": "william", "year": float64(2026)})
+	// The date is deliberately given in a non-UTC zone: the write path must
+	// canonicalize it, since lexicographic comparison of stored dates is only
+	// chronological on a canonical format.
+	published := time.Date(2026, 7, 13, 14, 0, 0, 0, time.FixedZone("CEST", 2*3600))
+	doc.SetMetadata(map[string]any{"author": "william", "year": float64(2026), "published": published})
 
 	if err := store.SaveDocuments(ctx, doc); err != nil {
 		t.Fatalf("could not save document: %+v", errors.WithStack(err))
@@ -110,8 +116,18 @@ func testStoreConformance(t *testing.T, ctx context.Context, store *Store) {
 	if err != nil {
 		t.Fatalf("GetDocumentsMetadataBySources: %+v", errors.WithStack(err))
 	}
-	if got := bySource[source.String()]; got["author"] != "william" || got["year"].(float64) != 2026 {
-		t.Errorf("metadata by source: unexpected %+v", got)
+	stored := bySource[source.String()]
+	if stored["author"] != "william" || stored["year"].(float64) != 2026 {
+		t.Errorf("metadata by source: unexpected %+v", stored)
+	}
+	if e, g := "2026-07-13T12:00:00.000000000Z", stored["published"]; e != g {
+		t.Errorf("stored date should be canonicalized to %s, got %v", e, g)
+	}
+	// What was written must be filterable by the same instant expressed in any
+	// zone — the property the whole canonicalization exists for.
+	filter := index.Filter{index.Eq("published", published.UTC()), index.Gt("published", published.Add(-time.Hour))}
+	if !filter.Matches(stored) {
+		t.Errorf("stored metadata %+v should satisfy %#v", stored, filter)
 	}
 
 	if e, g := 1, len(persisted.Collections()); e != g {

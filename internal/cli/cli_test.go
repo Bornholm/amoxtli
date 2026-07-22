@@ -240,15 +240,32 @@ func TestCLILifecycle(t *testing.T) {
 		t.Fatalf("expected a language=go hit on greeting.go, got: %+v", searched.Results)
 	}
 
-	// documentation-only filter must exclude the code file
-	output = mustRunCLI(t, "-C", root, "--json", "search", "--filter", "type!=code", "parse greeting message")
+	// documentation-only filter: markdown documents carry no type at all, and
+	// every operator but !key requires the key to be present, so absence is
+	// what selects them. Re-index the markdown so the filter has something to
+	// keep as well as something to drop.
+	mustRunCLI(t, "-C", root, "--json", "add", docPath)
+
+	output = mustRunCLI(t, "-C", root, "--json", "search", "--filter", "!type", "concurrency goroutines")
 	if err := json.Unmarshal([]byte(output), &searched); err != nil {
 		t.Fatal(err)
 	}
+	if len(searched.Results) == 0 || !strings.Contains(searched.Results[0].Source, "go-intro") {
+		t.Fatalf("expected the untyped markdown to survive the !type filter, got: %+v", searched.Results)
+	}
 	for _, result := range searched.Results {
 		if strings.Contains(result.Source, "greeting.go") {
-			t.Errorf("type!=code returned the code file: %+v", result)
+			t.Errorf("!type returned the code file: %+v", result)
 		}
+	}
+
+	// The symmetric check: type!=code must NOT bring the untyped markdown back.
+	output = mustRunCLI(t, "-C", root, "--json", "search", "--filter", "type!=code", "concurrency goroutines")
+	if err := json.Unmarshal([]byte(output), &searched); err != nil {
+		t.Fatal(err)
+	}
+	if len(searched.Results) != 0 {
+		t.Errorf("type!=code must not match documents lacking the key, got: %+v", searched.Results)
 	}
 }
 

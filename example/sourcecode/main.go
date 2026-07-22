@@ -129,10 +129,11 @@ func run(storageDir string) error {
 		return err
 	}
 
-	// Documentation only: Markdown documents carry no type, and index.Ne
-	// matches absent keys, so type!=code selects the documentation.
+	// Documentation only: Markdown documents carry no type at all. index.Ne
+	// requires the key to be present (SQL NULL-like semantics), so absence is
+	// expressed with index.NotExists.
 	if err := search(ctx, codex, "documentation only", query,
-		amoxtli.WithSearchFilter(index.Ne("type", "code"))); err != nil {
+		amoxtli.WithSearchFilter(index.NotExists("type"))); err != nil {
 		return err
 	}
 

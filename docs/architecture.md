@@ -47,7 +47,51 @@ La transformation de requête est appliquée **par-index** : les transformers ma
 
 ### Métadonnées de documents et filtrage (`index.Filter`)
 
-Un document peut porter des métadonnées arbitraires (`map[string]any` : auteur, tags, dates, ...) via la capacité optionnelle `model.WithMetadata`, attachées à l'ingestion (`WithIndexFileMetadata`) et persistées par le store gorm (colonne JSON). À la recherche, `WithSearchFilter(...)` restreint les résultats aux documents dont les métadonnées satisfont toutes les conditions du filtre — une conjonction de `index.Condition` construites avec `index.Eq/Ne/Gt/Gte/Lt/Lte/In`. Les opérateurs ordonnés normalisent les types numériques (int/float) et reconnaissent les dates (`time.Time` / RFC 3339). Le filtrage est évalué en Go contre les métadonnées rechargées depuis le store (capacité `ingest.MetadataProvider`), donc uniformément quel que soit le backend d'index (les backends ignorent les métadonnées). Il s'applique après la fusion et avant la pagination.
+Un document peut porter des métadonnées arbitraires (`map[string]any` : auteur, tags, dates, ...) via la capacité optionnelle `model.WithMetadata`, attachées à l'ingestion (`WithIndexFileMetadata`) et persistées par le store gorm (colonne JSON). À la recherche, `WithSearchFilter(...)` restreint les résultats aux documents dont les métadonnées satisfont toutes les conditions du filtre — une conjonction de `index.Condition` construites avec `index.Eq/Ne/Gt/Gte/Lt/Lte/In/Exists/NotExists`. Le filtrage est évalué en Go contre les métadonnées rechargées depuis le store (capacité `ingest.MetadataProvider`), donc uniformément quel que soit le backend d'index (les backends ignorent les métadonnées). Il s'applique après la fusion et avant la pagination.
+
+#### Sémantique du filtre
+
+La sémantique est **normative** et spécifiée sur le type `index.Filter` : elle
+est le contrat que doit respecter toute implémentation, que le filtre soit
+évalué en Go ou (à terme) poussé dans la requête d'un backend. La suite de
+conformité partagée `index/filtertest` l'encode cas par cas ; c'est le test
+différentiel qui empêche deux implémentations de diverger silencieusement.
+
+- **Présence de clé** : une clé est présente dès qu'elle figure dans la map,
+  quelle que soit sa valeur (y compris `null`). Tous les opérateurs sauf
+  `Exists`/`NotExists` exigent la présence — **`Ne` compris** : `Ne("author",
+  "x")` ne matche pas un document sans clé `author`. C'est la lecture « SQL
+  NULL-like », choisie parce que c'est celle qu'un backend SQL peut exprimer
+  fidèlement ; l'absence s'exprime avec `NotExists`.
+- **Nombres** : tous les types numériques Go sont unifiés en `float64` des deux
+  côtés et pour tous les opérateurs, donc `Eq("count", 3)` matche le `float64(3)`
+  que produit le décodage JSON.
+- **Dates** : les `time.Time` et les chaînes RFC 3339 sont canonicalisées en UTC
+  à précision nanoseconde fixe, **à l'écriture comme sur l'opérande du filtre**.
+  L'égalité devient une comparaison de chaînes exacte et l'ordre une comparaison
+  lexicographique — qui, sur des dates canoniques, est l'ordre chronologique.
+  Sans cette normalisation, `2024-01-02T10:00:00+02:00` se compare *après*
+  `2024-01-02T09:00:00Z` alors qu'il lui est antérieur, et le push-down des
+  opérateurs ordonnés sur dates devient impossible de façon fiable.
+- **Chaînes** : comparaison exacte, sensible à la casse et aux accents. Le
+  `unaccent` du plein-texte ne s'étend pas aux métadonnées.
+- **Types mixtes** : comparer des valeurs de natures différentes ne matche
+  jamais, sans jamais produire d'erreur (évaluation totale).
+- **Conteneurs** : une valeur tableau ou objet est présente mais jamais égale ni
+  ordonnable — `Eq("tags", "go")` ne matche pas `tags: ["go", "db"]`.
+  L'appartenance à un tableau demanderait un opérateur `Contains` explicite,
+  volontairement hors périmètre pour l'instant.
+- **`In` vide** : `In(key)` sans valeur ne matche rien, comme `IN ()` en SQL.
+- **Clés** : restreintes à `index.KeyPattern` (`^[A-Za-z0-9_-]{1,128}$`) et
+  validées avant évaluation (`ErrInvalidFilterKey`). Les clés proviennent
+  souvent d'une surface exposée (flags CLI, outil MCP `search`) ; la restriction
+  garantit qu'elles restent exprimables sans risque comme chemin JSON dans
+  n'importe quel backend.
+
+Les règles de normalisation et de comparaison vivent dans un unique endroit,
+`internal/filternorm`, partagé par l'évaluateur Go et le chemin d'écriture des
+métadonnées, précisément pour qu'il n'y ait jamais deux implémentations à tenir
+d'accord.
 
 ### Reranking (`ingest.Reranker`)
 

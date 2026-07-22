@@ -198,19 +198,24 @@ func TestMCPSearch(t *testing.T) {
 		t.Errorf("expected language=go metadata on the result, got %+v", out.Results[0].Metadata)
 	}
 
-	// a type!=code filter must exclude the source file.
+	// a "!type" filter selects the documents carrying no type: the markdown
+	// documentation, never the source file. "type!=code" would not do, since
+	// every operator but !key requires the key to be present.
 	docsOnly, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name:      "search",
-		Arguments: map[string]any{"query": "parse greeting message", "filters": []string{"type!=code"}},
+		Arguments: map[string]any{"query": "concurrency goroutines", "filters": []string{"!type"}},
 	})
 	if err != nil {
 		t.Fatalf("call filtered search: %+v", err)
 	}
 
 	decodeStructured(t, docsOnly.StructuredContent, &out)
+	if len(out.Results) == 0 || !strings.Contains(out.Results[0].Source, "go-intro") {
+		t.Fatalf("expected the untyped markdown to survive the !type filter, got: %+v", out)
+	}
 	for _, result := range out.Results {
 		if strings.Contains(result.Source, "greeting.go") {
-			t.Errorf("type!=code returned the code file: %+v", result)
+			t.Errorf("!type returned the code file: %+v", result)
 		}
 	}
 

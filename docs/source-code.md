@@ -54,10 +54,11 @@ existante (`amoxtli.WithSearchFilter`, voir `index.Eq/Ne/...`) :
 codex.Search(ctx, "supported file extensions",
     amoxtli.WithSearchFilter(index.Eq("language", "go")))
 
-// Documentation uniquement (les documents markdown ne portent pas de `type`,
-// et index.Ne matche explicitement les clés absentes)
+// Documentation uniquement : les documents markdown ne portent pas de `type`,
+// et `index.Ne` exige que la clé soit présente — l'absence s'exprime avec
+// `index.NotExists` (voir la sémantique des filtres dans docs/architecture.md)
 codex.Search(ctx, "supported file extensions",
-    amoxtli.WithSearchFilter(index.Ne("type", "code")))
+    amoxtli.WithSearchFilter(index.NotExists("type")))
 ```
 
 C'est ce qui permet, par exemple, de confronter une même requête entre la
