@@ -127,17 +127,27 @@ func TestMCPSearch(t *testing.T) {
 	defer session.Close()
 
 	// The four read-only tools must be advertised.
-	tools := map[string]bool{}
+	tools := map[string]*mcp.Tool{}
 	for tool, err := range session.Tools(ctx, nil) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tools[tool.Name] = true
+		tools[tool.Name] = tool
 	}
 	for _, name := range []string{"search", "fetch_sections", "list_collections", "list_documents"} {
-		if !tools[name] {
+		if tools[name] == nil {
 			t.Errorf("tool %q not advertised", name)
 		}
+	}
+
+	// Search depth is a workspace configuration concern: the agent must not be
+	// offered a knob to opt into iterative retrieval per call.
+	schema, err := json.Marshal(tools["search"].InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(schema), "deep") {
+		t.Errorf("search must not advertise a deep parameter, got schema %s", schema)
 	}
 
 	// search must find the document and inline its section contents.
@@ -162,18 +172,6 @@ func TestMCPSearch(t *testing.T) {
 		t.Errorf("expected inline section content, got %+v", out.Results[0])
 	}
 
-	// deep search must be refused without a chat model.
-	deep, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "search",
-		Arguments: map[string]any{"query": "x", "deep": true},
-	})
-	if err != nil {
-		t.Fatalf("call deep search: %+v", err)
-	}
-	if !deep.IsError {
-		t.Error("expected deep search without a chat model to be an error")
-	}
-
 	// a type=code filter must return the source file only.
 	coded, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name:      "search",
@@ -189,6 +187,15 @@ func TestMCPSearch(t *testing.T) {
 	decodeStructured(t, coded.StructuredContent, &out)
 	if len(out.Results) == 0 || !strings.Contains(out.Results[0].Source, "greeting.go") {
 		t.Fatalf("expected a type=code hit on greeting.go, got: %+v", out)
+	}
+
+	// The metadata driving the filter must come back with the result, so the
+	// agent can discover the filterable keys instead of guessing them.
+	if got := out.Results[0].Metadata["type"]; got != "code" {
+		t.Errorf("expected type=code metadata on the result, got %+v", out.Results[0].Metadata)
+	}
+	if got := out.Results[0].Metadata["language"]; got != "go" {
+		t.Errorf("expected language=go metadata on the result, got %+v", out.Results[0].Metadata)
 	}
 
 	// a type!=code filter must exclude the source file.
@@ -229,6 +236,20 @@ func TestMCPSearch(t *testing.T) {
 	decodeStructured(t, listed.StructuredContent, &docs)
 	if docs.Total != 2 {
 		t.Errorf("expected two documents, got %d", docs.Total)
+	}
+
+	// The listing is header-only, but metadata is part of the header.
+	var code *documentHeader
+	for i, doc := range docs.Documents {
+		if strings.Contains(doc.Source, "greeting.go") {
+			code = &docs.Documents[i]
+		}
+	}
+	if code == nil {
+		t.Fatalf("greeting.go not listed: %+v", docs.Documents)
+	}
+	if got := code.Metadata["language"]; got != "go" {
+		t.Errorf("expected language=go metadata on the listed document, got %+v", code.Metadata)
 	}
 }
 

@@ -177,9 +177,24 @@ amoxtli search --deep "comment fonctionne le grounding ?"   # nécessite llm.cha
 ## Serveur MCP
 
 Le serveur MCP expose quatre outils en lecture seule : `search` (contenu des
-sections inline, options `deep` et `filters` — mêmes expressions que `--filter`,
+sections inline, option `filters` — mêmes expressions que `--filter`,
 ex. `["type=code", "language=go"]`), `fetch_sections`, `list_collections` et
-`list_documents`. Deux transports sont disponibles :
+`list_documents`.
+
+`search` et `list_documents` renvoient les métadonnées de chaque document dans
+un champ `metadata`. L'agent découvre ainsi les clés et valeurs réellement
+indexées, et peut les réinjecter dans `filters` au tour suivant sans les
+deviner.
+
+La profondeur de recherche n'est pas un paramètre d'outil : elle relève de la
+configuration de l'espace de travail. Avec `retrieval.iterative.enabled: true`,
+chaque appel à `search` emprunte l'orchestration itérative (reformulation pilotée
+par le grounding) et remonte le nombre de tours dans `rounds` ; sinon il s'agit
+d'une recherche paginée simple. Le verdict `grounding` est joint dès que
+l'évaluateur tourne (`retrieval.grounding_check`, `retrieval.iterative` ou
+`retrieval.profile: precision`).
+
+Deux transports sont disponibles :
 
 - `amoxtli mcp stdio` (ou simplement `amoxtli mcp`) sert le protocole sur
   stdin/stdout ; **tous les diagnostics vont sur stderr**. C'est le mode

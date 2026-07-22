@@ -306,7 +306,7 @@ func retrievalOptions(cfg *config.Config, client llm.Client, stageClients map[st
 		opts = append(opts, amoxtli.WithStageLLMClient(amoxtli.Stage(name), stageClient))
 	}
 
-	groundingCheck := cfg.Retrieval.GroundingCheck || cfg.Retrieval.Iterative.Enabled
+	groundingCheck := cfg.GroundingEnabled()
 
 	switch cfg.Retrieval.Profile {
 	case config.ProfileFast:
@@ -318,8 +318,8 @@ func retrievalOptions(cfg *config.Config, client llm.Client, stageClients map[st
 		// HyDE only (one seeded, cached chat call per distinct query).
 		opts = append(opts, amoxtli.WithDisableJudge())
 	case config.ProfilePrecision:
-		// HyDE + the fused grounding evaluator (which replaces the Judge).
-		groundingCheck = true
+		// HyDE + the fused grounding evaluator (which replaces the Judge, and
+		// which GroundingEnabled already accounts for).
 	}
 
 	if cfg.Retrieval.MaxTotalWords > 0 {

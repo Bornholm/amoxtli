@@ -18,7 +18,6 @@ type searchInput struct {
 	Query       string   `json:"query" jsonschema:"the search query"`
 	MaxResults  int      `json:"max_results,omitempty" jsonschema:"maximum number of results (default 5)"`
 	Collections []string `json:"collections,omitempty" jsonschema:"restrict to these collection labels or IDs"`
-	Deep        bool     `json:"deep,omitempty" jsonschema:"run iterative LLM-driven retrieval (requires a configured chat model)"`
 	Filters     []string `json:"filters,omitempty" jsonschema:"metadata filter expressions (key=value, key!=value, key>=value...), e.g. type=code, language=go, or type!=code for documentation only"`
 }
 
@@ -28,8 +27,12 @@ type sectionResult struct {
 }
 
 type documentResult struct {
-	Source   string          `json:"source"`
-	Score    float64         `json:"score"`
+	Source string  `json:"source"`
+	Score  float64 `json:"score"`
+	// Metadata is the indexed document's metadata, echoed back so the agent can
+	// see which keys and values are available to the filters parameter instead
+	// of guessing them.
+	Metadata map[string]any  `json:"metadata,omitempty"`
 	Sections []sectionResult `json:"sections"`
 }
 
@@ -75,19 +78,22 @@ type listDocumentsOutput struct {
 }
 
 type documentHeader struct {
-	ID     string `json:"id"`
-	Source string `json:"source"`
+	ID       string         `json:"id"`
+	Source   string         `json:"source"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // --- registration --------------------------------------------------------
 
-// registerTools wires the read-only tools. hasChat gates the deep-search
-// capability; groundingEnabled adds a confidence verdict to plain searches.
-func (s *Server) registerTools(hasChat, groundingEnabled bool) {
+// registerTools wires the read-only tools. Search depth is a workspace
+// decision, not an agent one: iterative selects the grounding-driven
+// re-retrieval orchestration and groundingEnabled surfaces the confidence
+// verdict, both derived from the configured retrieval profile.
+func (s *Server) registerTools(iterative, groundingEnabled bool) {
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name:        "search",
-		Description: "Search the local document corpus. Returns matching documents with their most relevant sections inline. Indexed source code carries type=code and language=<name> metadata: use filters like [\"type=code\"] to search code only, or [\"type!=code\"] for documentation only.",
-	}, s.handleSearch(hasChat, groundingEnabled))
+		Description: "Search the local document corpus. Returns matching documents with their most relevant sections inline, plus the metadata each document carries — read it to learn which keys and values the filters parameter accepts. Indexed source code carries type=code and language=<name> metadata: use filters like [\"type=code\"] to search code only, or [\"type!=code\"] for documentation only.",
+	}, s.handleSearch(iterative, groundingEnabled))
 
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name:        "fetch_sections",
@@ -105,13 +111,10 @@ func (s *Server) registerTools(hasChat, groundingEnabled bool) {
 	}, s.handleListDocuments)
 }
 
-func (s *Server) handleSearch(hasChat, groundingEnabled bool) mcp.ToolHandlerFor[searchInput, searchOutput] {
+func (s *Server) handleSearch(iterative, groundingEnabled bool) mcp.ToolHandlerFor[searchInput, searchOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, searchOutput, error) {
 		if in.Query == "" {
 			return nil, searchOutput{}, errors.New("query is required")
-		}
-		if in.Deep && !hasChat {
-			return nil, searchOutput{}, errors.New("deep search requires a chat model configured in the workspace (llm.chat)")
 		}
 
 		maxResults := in.MaxResults
@@ -140,7 +143,7 @@ func (s *Server) handleSearch(hasChat, groundingEnabled bool) mcp.ToolHandlerFor
 
 		out := searchOutput{}
 
-		if in.Deep {
+		if iterative {
 			result, err := s.rt.Codex.SearchIterative(ctx, in.Query, opts...)
 			if err != nil {
 				return nil, searchOutput{}, errors.WithStack(err)
@@ -258,7 +261,7 @@ func (s *Server) handleListDocuments(ctx context.Context, _ *mcp.CallToolRequest
 
 	out := listDocumentsOutput{Total: total, Documents: make([]documentHeader, 0, len(docs))}
 	for _, doc := range docs {
-		header := documentHeader{ID: string(doc.ID())}
+		header := documentHeader{ID: string(doc.ID()), Metadata: model.Metadata(doc)}
 		if doc.Source() != nil {
 			header.Source = doc.Source().String()
 		}
@@ -296,6 +299,13 @@ func (s *Server) renderResults(ctx context.Context, results []*index.SearchResul
 					return nil, errors.WithStack(err)
 				}
 				section.Content = string(content)
+
+				// Every section of a result belongs to the same document, so the
+				// first one that carries metadata settles it. Content() above
+				// already dereferences that same parent document.
+				if doc.Metadata == nil {
+					doc.Metadata = model.Metadata(s.Document())
+				}
 			}
 			doc.Sections = append(doc.Sections, section)
 		}

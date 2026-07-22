@@ -40,7 +40,7 @@ func New(ctx context.Context, ws *workspace.Workspace, cfg *config.Config) (*Ser
 	}, nil)
 
 	srv := &Server{rt: rt, mcp: mcpServer}
-	srv.registerTools(cfg.HasChat(), cfg.Retrieval.GroundingCheck)
+	srv.registerTools(cfg.IterativeRetrievalEnabled(), cfg.GroundingEnabled())
 
 	return srv, nil
 }

@@ -316,6 +316,28 @@ func (c *Config) HasChat() bool {
 	return c.LLM.Chat != nil && c.LLM.Chat.Model != ""
 }
 
+// IterativeRetrievalEnabled reports whether searches should run the
+// grounding-driven re-retrieval orchestration. It requires a chat client, so
+// callers can use it as the single decision point between SearchPage and
+// SearchIterative.
+func (c *Config) IterativeRetrievalEnabled() bool {
+	return c.HasChat() && c.Retrieval.Iterative.Enabled
+}
+
+// GroundingEnabled reports whether the evidence evaluator runs on every search,
+// and therefore whether a grounding verdict is available to surface. It mirrors
+// the option wiring in runtime.retrievalOptions: the iterative orchestration and
+// the precision profile both imply it.
+func (c *Config) GroundingEnabled() bool {
+	if !c.HasChat() {
+		return false
+	}
+
+	return c.Retrieval.GroundingCheck ||
+		c.Retrieval.Iterative.Enabled ||
+		c.Retrieval.Profile == ProfilePrecision
+}
+
 // HasEmbeddings reports whether an embeddings client is configured.
 func (c *Config) HasEmbeddings() bool {
 	return c.LLM.Embeddings != nil && c.LLM.Embeddings.Model != ""

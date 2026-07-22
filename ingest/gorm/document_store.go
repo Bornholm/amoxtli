@@ -495,7 +495,10 @@ func (s *Store) QueryDocuments(ctx context.Context, opts ingest.QueryDocumentsOp
 		if !opts.HeaderOnly {
 			query = query.Preload(clause.Associations).Preload("Sections")
 		} else {
-			query = query.Omit(clause.Associations).Select("ID", "CreatedAt", "UpdatedAt", "Source", "ETag")
+			// Metadata belongs to the header: it is a short JSON blob, unlike
+			// Content, and callers listing documents need it to know which keys
+			// are available for filtering.
+			query = query.Omit(clause.Associations).Select("ID", "CreatedAt", "UpdatedAt", "Source", "ETag", "Metadata")
 		}
 
 		if opts.MatchingSource != nil {
@@ -656,7 +659,10 @@ func (s *Store) QueryDocumentsByCollectionID(ctx context.Context, collectionID m
 		if !opts.HeaderOnly {
 			query = query.Preload(clause.Associations).Preload("Sections")
 		} else {
-			query = query.Omit(clause.Associations).Select("ID", "CreatedAt", "UpdatedAt", "Source", "ETag")
+			// Metadata belongs to the header: it is a short JSON blob, unlike
+			// Content, and callers listing documents need it to know which keys
+			// are available for filtering.
+			query = query.Omit(clause.Associations).Select("ID", "CreatedAt", "UpdatedAt", "Source", "ETag", "Metadata")
 		}
 
 		if err := query.Find(&documents).Error; err != nil {
