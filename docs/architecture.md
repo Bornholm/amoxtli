@@ -47,7 +47,7 @@ La transformation de requête est appliquée **par-index** : les transformers ma
 
 ### Métadonnées de documents et filtrage (`index.Filter`)
 
-Un document peut porter des métadonnées arbitraires (`map[string]any` : auteur, tags, dates, ...) via la capacité optionnelle `model.WithMetadata`, attachées à l'ingestion (`WithIndexFileMetadata`) et persistées par le store gorm (colonne JSON). À la recherche, `WithSearchFilter(...)` restreint les résultats aux documents dont les métadonnées satisfont toutes les conditions du filtre — une conjonction de `index.Condition` construites avec `index.Eq/Ne/Gt/Gte/Lt/Lte/In/Exists/NotExists`. Le filtrage est évalué en Go contre les métadonnées rechargées depuis le store (capacité `ingest.MetadataProvider`), donc uniformément quel que soit le backend d'index (les backends ignorent les métadonnées). Il s'applique après la fusion et avant la pagination.
+Un document peut porter des métadonnées arbitraires (`map[string]any` : auteur, tags, dates, ...) via la capacité optionnelle `model.WithMetadata`, attachées à l'ingestion (`WithIndexFileMetadata`) et persistées par le store gorm (colonne JSON). À la recherche, `WithSearchFilter(...)` restreint les résultats aux documents dont les métadonnées satisfont toutes les conditions du filtre — une conjonction de `index.Condition` construites avec `index.Eq/Ne/Gt/Gte/Lt/Lte/In/Exists/NotExists`. Le filtrage est évalué en Go contre les métadonnées rechargées depuis le store en une requête par lot (capacité `ingest.MetadataProvider`), donc uniformément quel que soit le backend d'index (les backends ignorent les métadonnées). Il s'applique après la fusion et avant la pagination.
 
 #### Sémantique du filtre
 
@@ -92,6 +92,133 @@ Les règles de normalisation et de comparaison vivent dans un unique endroit,
 `internal/filternorm`, partagé par l'évaluateur Go et le chemin d'écriture des
 métadonnées, précisément pour qu'il n'y ait jamais deux implémentations à tenir
 d'accord.
+
+#### Sur-échantillonnage et pagination sous filtre
+
+Le filtre étant évalué *après* la recherche, demander `k` candidats peut n'en
+laisser aucun. Le Manager sur-échantillonne donc, puis élargit la fenêtre tant
+qu'il n'a pas assez de survivants (`candidateFetchFactor = 3`, croissance ×3,
+borne dure `maxCandidateFetch = 500`).
+
+Deux propriétés gouvernent ce dimensionnement :
+
+- **Déterminisme.** La fenêtre ne dépend que de la cible — `offset + taille de
+  page + 1` — et jamais d'un état conservé entre les appels. Rejouer une page
+  refait donc exactement la même requête et rend le même ordre, ce qui est la
+  seule façon de garder une pagination stable en déploiement multi-instances
+  (aucun état serveur à partager). L'offset est transporté par le curseur ; le
+  « +1 » est le résultat de lookahead sans lequel une dernière page pleine
+  serait indiscernable d'une page suivie d'autres.
+- **Coût borné.** Une seule requête store par tour, pour les seuls documents pas
+  encore jugés : les verdicts du filtre sont mémoïsés par source pour la durée
+  de la recherche, si bien qu'élargir la fenêtre ne recharge jamais les
+  métadonnées déjà lues. Le cache est local à la recherche — pas de cache global
+  à invalider.
+
+Le curseur transporte aussi une **empreinte du filtre** (`index.Filter` →
+`CanonicalBytes` → SHA-256 tronqué). Un curseur repère une position dans *un*
+ordre filtré : le rejouer sous un autre filtre rendrait des doublons ou des
+trous, silencieusement. La reprise est donc refusée avec
+`ingest.ErrCursorFilterMismatch` (réexporté `amoxtli.ErrCursorFilterMismatch`),
+que le client traduit par « repartir de la première page ».
+
+L'empreinte identifie ce qu'un filtre *sélectionne*, pas la façon dont il a été
+écrit : conditions réordonnées, `3` au lieu de `3.0`, date exprimée dans un autre
+fuseau ou valeurs de `In` permutées donnent la même empreinte — même
+normalisation que l'évaluateur (`internal/filternorm`). Un filtre vide n'a pas
+d'empreinte, si bien que les curseurs des recherches non filtrées restent
+interchangeables.
+
+⚠️ **Compromis assumé** : au-delà de `maxCandidateFetch`, le rappel sous filtre
+très sélectif est **tronqué**. Un filtre ne retenant qu'un document sur mille
+peut rendre une page courte alors que d'autres documents correspondent. C'est le
+prix du filtrage hors de l'index : pour des filtres sélectifs sur de gros
+corpus, privilégier un backend qui saura pousser le filtre dans sa requête
+(`index.FilterableIndex`, ci-dessous). `WithSearchCandidatePoolSize` reste
+disponible pour forcer une fenêtre fixe, sans adaptation.
+
+#### Push-down du filtre (`index.FilterableIndex`, ⚠ expérimental)
+
+Filtrer après coup coûte la sémantique top-k, d'où le sur-échantillonnage
+ci-dessus. Les backends capables d'appliquer le filtre **dans** leur requête
+déclarent la capacité optionnelle
+`index.FilterableIndex` (méthode `SearchFiltered`), et rendent alors `k`
+résultats déjà filtrés.
+
+La capacité est **une méthode dédiée, pas un champ `Filter` sur
+`SearchOptions`** : un backend qui ignorerait silencieusement un tel champ
+retournerait des résultats non filtrés que l'appelant croirait filtrés. Le
+typage doit rendre cette corruption silencieuse impossible.
+
+Deux règles encadrent la capacité :
+
+- **Conformité obligatoire.** Un backend ne déclare `FilterableIndex` qu'après
+  avoir passé `index/filtertest` contre sa propre traduction. C'est le test
+  différentiel qui garantit que push-down et évaluation Go rendent les mêmes
+  documents ; sans lui, un désaccord sur une clé absente ou un décalage horaire
+  produirait des résultats dépendants du backend, sans rien faire échouer.
+- **Détection via `index.AsFilterable`, jamais par assertion de type directe.**
+  Une assertion `idx.(index.FilterableIndex)` échoue à travers un décorateur
+  (logging, métriques, retry) qui ne redéclare pas la méthode. Tout décorateur
+  d'`Index` doit donc soit redéclarer les méthodes de capacité qu'il veut
+  exposer, soit implémenter `index.Unwrapper` (`Unwrap() Index`) — la même
+  convention que `errors.Is`/`As`. `AsFilterable` et `IsSemantic` déballent
+  cette chaîne (bornée, pour qu'un décorateur cyclique dégrade en « capacité
+  absente » plutôt que de figer la recherche).
+
+**`index/sqlitevec` implémente la capacité** (schéma v3). Deux conséquences de
+conception :
+
+- **Copie locale des métadonnées.** L'index tient sa propre table
+  `document_metadata` (clé : la source), écrite à chaque (ré)indexation et
+  supprimée avec le document. Évaluer un filtre dans la requête impose que les
+  valeurs y soient lisibles : le store reste la source de vérité, l'index en
+  détient une copie dérivée. Les valeurs y sont canonicalisées par le **même**
+  `internal/filternorm` que le store, faute de quoi la comparaison de dates —
+  du texte, côté SQL — divergerait. Les documents indexés avant la v3 n'ont pas
+  de ligne, ce que la traduction lit comme « aucune clé présente » ; ils
+  redeviennent filtrables à leur prochaine réindexation.
+- **Pré-contrainte par `rowid`.** vec0 n'accepte pas de jointure externe dans sa
+  contrainte KNN, mais il honore `rowid IN (...)` *pendant* le scan. Le filtre
+  est donc traduit en une sous-requête de rowids éligibles injectée dans la
+  requête KNN : les k plus proches voisins sont choisis **parmi** les documents
+  éligibles. C'est ce qui en fait un vrai push-down et non un post-filtrage
+  déguisé.
+
+Chaque cast SQL est gardé par un `json_type` : sans la garde, comparer une
+valeur texte comme un nombre lèverait une erreur SQL là où la sémantique exige
+une simple absence de correspondance. Les clés sont toujours des paramètres liés,
+jamais interpolées.
+
+##### Intégration au pipeline : tout ou rien
+
+Le pipeline fusionne les listes de ses indexeurs. Il ne peut donc promettre une
+liste intégralement filtrée que si **chacune** de ses jambes applique le filtre :
+une seule jambe non filterable suffirait à faire remonter des résultats non
+filtrés que l'appelant croirait filtrés — exactement la corruption silencieuse
+que la capacité existe pour empêcher.
+
+`pipeline.Index` déclare donc `Filterable() bool`
+(`index.ConditionallyFilterable`, consultée par `AsFilterable` comme
+`Semantic()` l'est pour la transformation de requête) : vrai seulement si toutes
+les jambes sont filterables. Concrètement, une configuration **sqlitevec seul**
+pousse le filtre ; une configuration **bleve + sqlitevec** ne le pousse pas et
+retombe intégralement sur le filtrage Go, puisque bleve ne déclare pas la
+capacité (choix documenté : indexer des champs de métadonnées dans bleve
+imposerait de déclarer le mapping à la création et de réindexer à chaque
+changement de schéma).
+
+Quand le push-down est disponible, le Manager appelle `SearchFiltered` et **ne
+recharge aucune métadonnée** : ni sur-échantillonnage, ni second tour, ni requête
+store par page. C'est le contrat de `FilterableIndex` — garanti par la suite de
+conformité — qui autorise à faire confiance au backend plutôt qu'à revérifier
+son travail. Le résultat observable est identique aux deux chemins, ce que
+vérifie un test de parité (mêmes documents, même ordre, pour l'égalité, la clé
+absente, l'inégalité, les plages et les conjonctions).
+
+`FilterableIndex` n'est pas couverte par les garanties d'API tant que l'étape
+finale (parité de qualité mesurée sur le harnais `eval`) n'est pas franchie
+(voir [stability.md](stability.md)).
 
 ### Reranking (`ingest.Reranker`)
 

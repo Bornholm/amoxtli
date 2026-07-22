@@ -45,7 +45,15 @@ Ne font **pas** partie de la surface stable et peuvent changer à tout moment :
 - le format des snapshots `backup` au-delà de la frontière de version encodée
   (`snapshot-v1`) ;
 - le comportement exact des composants LLM (prompts, seuils), qui relève de la
-  qualité et non du contrat de type.
+  qualité et non du contrat de type ;
+- la capacité **expérimentale** `index.FilterableIndex`, ses helpers
+  (`index.AsFilterable`, `index.ConditionallyFilterable`) et la convention
+  `index.Unwrapper` pour les décorateurs : implémentées par `index/sqlitevec` et
+  intégrées au pipeline, elles restent hors garantie tant que la parité de
+  qualité entre push-down et filtrage Go n'a pas été mesurée sur le harnais
+  `eval`. Le schéma v3 de `index/sqlitevec` (table `document_metadata`) suit le
+  même statut : il se remplit à la (ré)indexation, un index antérieur reste
+  lisible mais ses documents ne sont filtrables qu'après réindexation.
 
 ## Contraintes de dépendances
 

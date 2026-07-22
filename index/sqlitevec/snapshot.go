@@ -29,6 +29,10 @@ type SnapshottedRecord struct {
 	ChunkIndex  int
 	Embeddings  []byte
 	Collections []string
+	// Metadata is the document's metadata JSON (schema v3), repeated on each of
+	// its chunks. Snapshots taken before v3 decode it as "", which restores a
+	// document without metadata — the same state an index had back then.
+	Metadata string
 }
 
 // GenerateSnapshot implements snapshot.Snapshotable.
@@ -63,10 +67,12 @@ func (i *Index) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
 						SELECT v.embedding FROM embeddings_vec2 v
 						WHERE v.rowid = ( SELECT MIN(m.id) FROM embeddings_vec_map m WHERE m.embeddings_id = e.id )
 					),
-					COALESCE(json_group_array(ec.collection_id) FILTER ( WHERE ec.collection_id IS NOT NULL ), '[]') AS collections
+					COALESCE(json_group_array(ec.collection_id) FILTER ( WHERE ec.collection_id IS NOT NULL ), '[]') AS collections,
+					COALESCE(dm.metadata, '') AS metadata
 				FROM embeddings e
 				LEFT JOIN embeddings_collections ec ON e.id = ec.embeddings_id
-				GROUP BY e.id, e.source, e.section_id, e.chunk_index
+				LEFT JOIN document_metadata dm ON dm.source = e.source
+				GROUP BY e.id, e.source, e.section_id, e.chunk_index, dm.metadata
 				;
 			`
 
@@ -87,6 +93,7 @@ func (i *Index) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
 				if err := json.Unmarshal(rawCollections, &record.Collections); err != nil {
 					return errors.WithStack(err)
 				}
+				record.Metadata = stmt.ColumnText(6)
 
 				if err := encoder.Encode(record); err != nil {
 					return errors.WithStack(err)
@@ -128,6 +135,7 @@ func (i *Index) RestoreSnapshot(ctx context.Context, r io.Reader) error {
 			"DELETE FROM embeddings_vec_map;",
 			"DELETE FROM embeddings_collections;",
 			"DELETE FROM embeddings;",
+			"DELETE FROM document_metadata;",
 		} {
 			if err := conn.Exec(sql); err != nil {
 				return errors.WithStack(err)
@@ -203,7 +211,34 @@ func (i *Index) restoreRecords(ctx context.Context, records ...*SnapshottedRecor
 		}
 		defer vecStmt.Close()
 
+		// The metadata is repeated on every chunk of a document, so the insert
+		// is an upsert: the first chunk writes it, the others rewrite the same
+		// value.
+		metadataStmt, _, err := conn.Prepare(`
+			INSERT INTO document_metadata ( source, metadata ) VALUES (?, ?)
+			ON CONFLICT (source) DO UPDATE SET metadata = excluded.metadata;
+		`)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		defer metadataStmt.Close()
+
 		restoreRecord := func(record *SnapshottedRecord) error {
+			if record.Metadata != "" {
+				if err := metadataStmt.BindText(1, record.Source); err != nil {
+					return errors.WithStack(err)
+				}
+				if err := metadataStmt.BindText(2, record.Metadata); err != nil {
+					return errors.WithStack(err)
+				}
+				if err := metadataStmt.Exec(); err != nil {
+					return errors.WithStack(err)
+				}
+				if err := metadataStmt.Reset(); err != nil {
+					return errors.WithStack(err)
+				}
+			}
+
 			if err := insertStmt.BindText(1, record.Source); err != nil {
 				return errors.WithStack(err)
 			}

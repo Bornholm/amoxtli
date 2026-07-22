@@ -12,12 +12,19 @@ import (
 const DefaultVectorSize int = 768
 
 // schemaVersion is the current on-disk schema version, recorded under the
-// amoxtli_meta "schema_version" key. v2 partitions the vec0 table by
-// collection (one row per chunk × collection) so KNN queries prune to the
-// filtered collection instead of scanning the whole corpus and filtering
-// afterwards — which both sped up filtered searches and silently returned
-// fewer than k results (the global top-k could live in other collections).
-const schemaVersion = "2"
+// amoxtli_meta "schema_version" key.
+//
+// v2 partitions the vec0 table by collection (one row per chunk × collection)
+// so KNN queries prune to the filtered collection instead of scanning the whole
+// corpus and filtering afterwards — which both sped up filtered searches and
+// silently returned fewer than k results (the global top-k could live in other
+// collections).
+//
+// v3 adds document_metadata, the copy of each document's metadata this index
+// needs to evaluate a metadata filter inside its own KNN query
+// (index.FilterableIndex). Upgrading is a no-op on existing data: the table
+// starts empty and documents fill it as they are (re)indexed.
+const schemaVersion = "3"
 
 // supportsCoarse reports whether the vector dimension allows the binary
 // quantization column (sqlite-vec requires a multiple of 8).
@@ -46,6 +53,18 @@ func migrations() []string {
 		// used to reject opening an existing index with an incompatible
 		// configuration and to drive schema upgrades.
 		"CREATE TABLE IF NOT EXISTS amoxtli_meta ( key TEXT PRIMARY KEY, value TEXT NOT NULL );",
+		// Per-document metadata (schema v3), keyed by source like the
+		// embeddings rows. It is this index's own copy of what the store holds:
+		// pushing a metadata filter into the KNN query requires the values to
+		// be readable from here. A document indexed before v3 — or carrying no
+		// metadata — simply has no row, which the filter translation reads as
+		// an empty object.
+		`
+			CREATE TABLE IF NOT EXISTS document_metadata (
+				source TEXT NOT NULL PRIMARY KEY,
+				metadata TEXT NOT NULL
+			);
+		`,
 	}
 }
 

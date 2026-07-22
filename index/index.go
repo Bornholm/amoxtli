@@ -66,8 +66,9 @@ type Semantic interface {
 }
 
 // IsSemantic reports whether idx declares itself as a semantic (vector) index
-// via the Semantic capability.
+// via the Semantic capability, unwrapping decorators along the way (see
+// Unwrapper).
 func IsSemantic(idx Index) bool {
-	s, ok := idx.(Semantic)
+	s, ok := capability[Semantic](idx)
 	return ok && s.Semantic()
 }

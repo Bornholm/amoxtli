@@ -108,6 +108,9 @@ func newSearchCommand(opts *rootOptions) *cobra.Command {
 				output.Rounds = result.Rounds
 			} else {
 				page, err := rt.Codex.SearchPage(ctx, query, searchOpts...)
+				if errors.Is(err, amoxtli.ErrCursorFilterMismatch) {
+					return errors.Errorf("--cursor was issued for a different --filter; drop --cursor to restart from the first page")
+				}
 				if err != nil {
 					return errors.WithStack(err)
 				}

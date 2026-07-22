@@ -2,7 +2,9 @@ package ingest
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -122,10 +124,10 @@ type SearchOptions struct {
 	// Cursor resumes pagination after a previous page. Empty means the first
 	// page. Use the NextCursor returned by the previous call.
 	Cursor string
-	// CandidatePoolSize bounds how many fused candidates are fetched before
-	// filtering, reranking and pagination. 0 lets the Manager pick a sensible
-	// default (the page size for plain searches, a larger pool when a filter,
-	// a reranker or a cursor is in play).
+	// CandidatePoolSize pins how many fused candidates are fetched before
+	// filtering, reranking and pagination, disabling the adaptive sizing. 0
+	// (the default) lets the Manager size the window from the requested page,
+	// widening it while a filter leaves too few survivors.
 	CandidatePoolSize int
 }
 
@@ -185,10 +187,47 @@ type SearchResults struct {
 	NextCursor string
 }
 
-// defaultCandidatePool bounds the fused candidate window used when filtering,
-// reranking or cursor pagination is active. Pagination is stable within this
-// window; paging past it returns no further results.
+// defaultCandidatePool is the fused candidate window used when reranking or
+// cursor pagination is active without a metadata filter.
 const defaultCandidatePool = 100
+
+const (
+	// candidateFetchFactor over-fetches relative to the number of results the
+	// requested page actually needs, so that a moderately selective filter
+	// still yields a full page in a single round-trip.
+	candidateFetchFactor = 3
+
+	// candidateFetchGrowth multiplies the window on each round that did not
+	// gather enough surviving results.
+	candidateFetchGrowth = 3
+
+	// maxCandidateFetch hard-bounds the over-fetch. Past it, recall under a very
+	// selective filter is degraded rather than unbounded: a filter matching one
+	// document in a thousand may return a short page even though more documents
+	// would match. This is the price of filtering outside the index; backends
+	// implementing index.FilterableIndex will not pay it.
+	maxCandidateFetch = 500
+)
+
+// candidateWindow returns the number of fused candidates to fetch in order to
+// serve `target` results after filtering.
+//
+// It depends only on target — itself derived from the cursor's offset plus the
+// page size — never on state carried between calls. Replaying the same page
+// therefore fetches the same window and yields the same ordering, which is what
+// keeps pagination stable across a multi-instance deployment.
+func candidateWindow(target, factor int) int {
+	if target <= 0 {
+		return 0
+	}
+
+	// Guard against a forged or absurd cursor offset overflowing the product.
+	if target > maxCandidateFetch {
+		return maxCandidateFetch
+	}
+
+	return min(target*factor, maxCandidateFetch)
+}
 
 func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptionFunc) (*SearchResults, error) {
 	opts := NewSearchOptions(funcs...)
@@ -205,15 +244,17 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 		pageSize = 5
 	}
 
-	// Over-fetch only when filtering, reranking or paginating: a plain search
-	// keeps fetching just the page size, as before.
-	pool := pageSize
-	switch {
-	case opts.CandidatePoolSize > 0:
-		pool = opts.CandidatePoolSize
-	case len(opts.Filter) > 0 || m.reranker != nil || opts.Cursor != "":
-		pool = max(pool, defaultCandidatePool)
+	// The number of results the requested page needs: everything skipped by the
+	// cursor, plus the page itself, plus one more — without that extra result
+	// there is no way to tell a full last page from a page followed by others,
+	// and pagination would stop one page early.
+	fingerprint := filterFingerprint(opts.Filter)
+
+	resumeOffset, err := resumeCursor(opts.Cursor, fingerprint)
+	if err != nil {
+		return nil, errors.WithStack(err)
 	}
+	target := resumeOffset + pageSize + 1
 
 	collections := make([]model.CollectionID, 0)
 	for _, c := range opts.Collections {
@@ -225,19 +266,9 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 		collections = append(collections, coll.ID())
 	}
 
-	results, err := m.index.Search(ctx, query, index.SearchOptions{
-		MaxResults:  pool,
-		Collections: collections,
-	})
+	results, err := m.searchCandidates(ctx, query, collections, opts, target)
 	if err != nil {
 		return nil, errors.WithStack(err)
-	}
-
-	if len(opts.Filter) > 0 {
-		results, err = m.applyMetadataFilter(ctx, results, opts.Filter)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
 	}
 
 	if m.reranker != nil {
@@ -247,7 +278,7 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 		}
 	}
 
-	page, nextCursor, err := paginate(results, opts.Cursor, pageSize)
+	page, nextCursor, err := paginate(results, opts.Cursor, pageSize, fingerprint)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -283,38 +314,169 @@ func rerankTop(ctx context.Context, reranker Reranker, query string, results []*
 	return append(head, results[window:]...), nil
 }
 
-// applyMetadataFilter drops results whose document metadata does not satisfy the
-// filter. It requires the Store to implement MetadataProvider.
-func (m *Manager) applyMetadataFilter(ctx context.Context, results []*index.SearchResult, filter index.Filter) ([]*index.SearchResult, error) {
+// searchCandidates fetches the fused candidates backing the requested page,
+// applying the metadata filter when there is one.
+//
+// Filtering happens outside the index, so asking for `target` candidates may
+// leave fewer than `target` once the filter has run. The window therefore grows
+// until enough results survive, the backend runs out of candidates, or the hard
+// bound is reached. The growth is deterministic — it depends only on target —
+// so replaying a page fetches the same window and returns the same ordering.
+func (m *Manager) searchCandidates(ctx context.Context, query string, collections []model.CollectionID, opts *SearchOptions, target int) ([]*index.SearchResult, error) {
+	// When the index applies the filter inside its own query, its top-k is
+	// already k matching results: no over-fetching, no metadata reload, no
+	// second round. The contract of index.FilterableIndex — enforced by the
+	// shared conformance suite — is what allows skipping the Go filter entirely
+	// rather than re-checking its work.
+	if filterable, ok := index.AsFilterable(m.index); ok && len(opts.Filter) > 0 {
+		limit := target
+		if opts.CandidatePoolSize > 0 {
+			limit = opts.CandidatePoolSize
+		}
+
+		results, err := filterable.SearchFiltered(ctx, query, opts.Filter, index.SearchOptions{
+			MaxResults:  min(limit, maxCandidateFetch),
+			Collections: collections,
+		})
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		return results, nil
+	}
+
+	search := func(limit int) ([]*index.SearchResult, error) {
+		results, err := m.index.Search(ctx, query, index.SearchOptions{
+			MaxResults:  limit,
+			Collections: collections,
+		})
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		return results, nil
+	}
+
+	// An explicit pool size is an override: honour it verbatim, no adaptation.
+	if opts.CandidatePoolSize > 0 {
+		results, err := search(opts.CandidatePoolSize)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		if len(opts.Filter) == 0 {
+			return results, nil
+		}
+
+		filter, err := m.newMetadataFilter(opts.Filter)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		return filter.apply(ctx, results)
+	}
+
+	// Without a filter nothing is dropped after the fact, so one round always
+	// suffices; the wider window only serves reranking and cursor pagination.
+	if len(opts.Filter) == 0 {
+		window := target
+		if m.reranker != nil || target > 1 {
+			window = max(window, min(defaultCandidatePool, maxCandidateFetch))
+		}
+
+		return search(min(window, maxCandidateFetch))
+	}
+
+	filter, err := m.newMetadataFilter(opts.Filter)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	fetch := candidateWindow(target, candidateFetchFactor)
+
+	for {
+		results, err := search(fetch)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		kept, err := filter.apply(ctx, results)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		// Enough survivors, backend exhausted, or window maxed out: this is as
+		// good as it gets.
+		if len(kept) >= target || len(results) < fetch || fetch >= maxCandidateFetch {
+			return kept, nil
+		}
+
+		fetch = min(fetch*candidateFetchGrowth, maxCandidateFetch)
+	}
+}
+
+// metadataFilter evaluates a metadata filter against search results, caching
+// each document's verdict for the lifetime of one search.
+//
+// The cache matters because the over-fetch loop re-queries the index with a
+// wider window: without it, every round would reload the metadata of the
+// documents already judged in the previous one.
+type metadataFilter struct {
+	provider MetadataProvider
+	filter   index.Filter
+	verdicts map[string]bool
+}
+
+// newMetadataFilter fails when the Store cannot supply document metadata, which
+// is a configuration error rather than an empty result set.
+func (m *Manager) newMetadataFilter(filter index.Filter) (*metadataFilter, error) {
 	provider, ok := m.Store.(MetadataProvider)
 	if !ok {
 		return nil, errors.New("ingest: search metadata filter requires a Store implementing MetadataProvider")
 	}
 
-	sources := make([]string, 0, len(results))
-	seen := map[string]struct{}{}
+	return &metadataFilter{
+		provider: provider,
+		filter:   filter,
+		verdicts: map[string]bool{},
+	}, nil
+}
+
+// apply returns the results whose document satisfies the filter, in order. The
+// metadata of every not-yet-judged document is loaded in a single batch query.
+func (f *metadataFilter) apply(ctx context.Context, results []*index.SearchResult) ([]*index.SearchResult, error) {
+	unjudged := make([]string, 0, len(results))
 	for _, r := range results {
 		key := sourceKey(r.Source)
-		if _, dup := seen[key]; dup {
+		if _, known := f.verdicts[key]; known {
 			continue
 		}
-		seen[key] = struct{}{}
-		sources = append(sources, key)
+
+		// Mark it now so that several sections of the same document do not
+		// queue their source twice.
+		f.verdicts[key] = false
+		unjudged = append(unjudged, key)
 	}
 
-	metaBySource, err := provider.GetDocumentsMetadataBySources(ctx, sources)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
+	if len(unjudged) > 0 {
+		metaBySource, err := f.provider.GetDocumentsMetadataBySources(ctx, unjudged)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
 
-	filtered := make([]*index.SearchResult, 0, len(results))
-	for _, r := range results {
-		if filter.Matches(metaBySource[sourceKey(r.Source)]) {
-			filtered = append(filtered, r)
+		for _, key := range unjudged {
+			f.verdicts[key] = f.filter.Matches(metaBySource[key])
 		}
 	}
 
-	return filtered, nil
+	kept := make([]*index.SearchResult, 0, len(results))
+	for _, r := range results {
+		if f.verdicts[sourceKey(r.Source)] {
+			kept = append(kept, r)
+		}
+	}
+
+	return kept, nil
 }
 
 // sourceKey normalizes a result source to the key under which its document is
@@ -337,14 +499,71 @@ func sourceKey(source *url.URL) string {
 type searchCursor struct {
 	Source string  `json:"s"`
 	Score  float64 `json:"c"`
+	// Offset is the 0-based rank of the anchored result in the candidate list.
+	// It lets the next call size its candidate window from offset+pageSize
+	// without keeping any server-side state — a hard requirement for a
+	// multi-instance deployment. Resolving the page still anchors on Source:
+	// the offset only sizes the fetch, it never selects the results.
+	Offset int `json:"o,omitempty"`
+	// Filter fingerprints the metadata filter the cursor was issued for. A
+	// cursor is a position inside one filtered ordering; resuming it under a
+	// different filter would silently duplicate or skip results, so the
+	// mismatch is reported instead (ErrCursorFilterMismatch).
+	Filter string `json:"f,omitempty"`
 }
 
-func encodeCursor(r *index.SearchResult) (string, error) {
-	data, err := json.Marshal(searchCursor{Source: r.Source.String(), Score: r.Score})
+func encodeCursor(r *index.SearchResult, offset int, fingerprint string) (string, error) {
+	data, err := json.Marshal(searchCursor{
+		Source: r.Source.String(),
+		Score:  r.Score,
+		Offset: offset,
+		Filter: fingerprint,
+	})
 	if err != nil {
 		return "", errors.WithStack(err)
 	}
 	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+// filterFingerprint identifies a filter by what it selects rather than by how it
+// was written: reordered conditions, an int where a float was used or a date in
+// another timezone all fingerprint identically. An empty filter has no
+// fingerprint, so cursors issued for unfiltered searches stay interchangeable.
+func filterFingerprint(filter index.Filter) string {
+	if len(filter) == 0 {
+		return ""
+	}
+
+	sum := sha256.Sum256(filter.CanonicalBytes())
+
+	return hex.EncodeToString(sum[:8])
+}
+
+// resumeCursor reports how many results the given cursor skips, rejecting a
+// cursor issued for another filter. An empty cursor starts at the beginning.
+//
+// A cursor predating this check carries no fingerprint, so it resumes an
+// unfiltered search as before, and is rejected against a filtered one — the
+// safe direction, since its ordering cannot be reconstructed.
+func resumeCursor(cursor string, fingerprint string) (int, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+
+	anchor, err := decodeCursor(cursor)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	if anchor.Filter != fingerprint {
+		return 0, errors.WithStack(ErrCursorFilterMismatch)
+	}
+
+	if anchor.Offset < 0 {
+		return 0, errors.Errorf("invalid search cursor: negative offset %d", anchor.Offset)
+	}
+
+	return anchor.Offset + 1, nil
 }
 
 func decodeCursor(cursor string) (searchCursor, error) {
@@ -363,7 +582,7 @@ func decodeCursor(cursor string) (searchCursor, error) {
 // plus the cursor for the next page (empty when exhausted). Because each result
 // has a unique source, the cursor anchors on the last returned source; if that
 // anchor is no longer present (the underlying data changed) pagination stops.
-func paginate(results []*index.SearchResult, cursor string, pageSize int) ([]*index.SearchResult, string, error) {
+func paginate(results []*index.SearchResult, cursor string, pageSize int, fingerprint string) ([]*index.SearchResult, string, error) {
 	start := 0
 	if cursor != "" {
 		anchor, err := decodeCursor(cursor)
@@ -393,7 +612,7 @@ func paginate(results []*index.SearchResult, cursor string, pageSize int) ([]*in
 	nextCursor := ""
 	if end < len(results) && len(page) > 0 {
 		var err error
-		nextCursor, err = encodeCursor(page[len(page)-1])
+		nextCursor, err = encodeCursor(page[len(page)-1], end-1, fingerprint)
 		if err != nil {
 			return nil, "", errors.WithStack(err)
 		}

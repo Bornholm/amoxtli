@@ -1,7 +1,11 @@
 package index
 
 import (
+	"fmt"
 	"regexp"
+	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/bornholm/amoxtli/internal/filternorm"
 	"github.com/pkg/errors"
@@ -119,6 +123,81 @@ func (f Filter) Validate() error {
 	return nil
 }
 
+// CanonicalBytes returns a stable encoding of the filter, independent of the
+// order in which the conditions were declared and of the Go types used for the
+// operands.
+//
+// Two filters that select the same documents encode identically: conditions are
+// sorted, numeric operands collapse to float64 and dates to their canonical
+// layout — the same normalization the evaluator applies — and the operand of
+// OpIn is treated as the set it is. Callers use it to fingerprint a filter, for
+// instance to detect that a paginated search was resumed with a different one.
+//
+// An empty filter encodes to nil, not to an empty non-nil slice, so that "no
+// filter" is unambiguous.
+func (f Filter) CanonicalBytes() []byte {
+	if len(f) == 0 {
+		return nil
+	}
+
+	conditions := make([]string, 0, len(f))
+	for _, c := range f {
+		conditions = append(conditions, c.canonical())
+	}
+
+	slices.Sort(conditions)
+
+	return []byte(strings.Join(conditions, "\n"))
+}
+
+func (c Condition) canonical() string {
+	// Keys and string operands are quoted so that a value containing the
+	// separators cannot forge the encoding of a different condition.
+	return strconv.Quote(c.Key) + "\x00" + string(c.Op) + "\x00" + canonicalOperand(c.Op, c.Value)
+}
+
+func canonicalOperand(op FilterOp, value any) string {
+	if op != OpIn {
+		return canonicalScalar(value)
+	}
+
+	// OpIn's operand is a set: the declaration order carries no meaning.
+	elements := toSlice(value)
+
+	tokens := make([]string, 0, len(elements))
+	for _, e := range elements {
+		tokens = append(tokens, canonicalScalar(e))
+	}
+
+	slices.Sort(tokens)
+
+	return "[" + strings.Join(tokens, ",") + "]"
+}
+
+// canonicalScalar renders an operand the way the evaluator compares it, so that
+// operands comparing equal encode equal.
+func canonicalScalar(value any) string {
+	value = filternorm.Value(value)
+
+	if number, ok := filternorm.Float(value); ok {
+		return "n" + strconv.FormatFloat(number, 'g', -1, 64)
+	}
+
+	switch v := value.(type) {
+	case string:
+		return "s" + strconv.Quote(v)
+	case bool:
+		return "b" + strconv.FormatBool(v)
+	case nil:
+		return "z"
+	default:
+		// Operand kinds the evaluator never matches (slices, maps, structs)
+		// still have to encode deterministically. fmt sorts map keys, so this
+		// is stable.
+		return "?" + strconv.Quote(fmt.Sprintf("%#v", v))
+	}
+}
+
 // Matches reports whether meta satisfies every condition. An empty filter
 // always matches; a nil meta has no key present, so it only satisfies
 // NotExists conditions.
@@ -179,6 +258,11 @@ func (c Condition) matches(meta map[string]any) bool {
 
 	return false
 }
+
+// InValues normalizes the operand of an OpIn condition into the candidate
+// values it stands for. Backends translating a filter need it to expand the
+// membership test the same way the Go evaluator does.
+func InValues(v any) []any { return toSlice(v) }
 
 // toSlice normalizes the operand of OpIn. A non-slice value is treated as a
 // single candidate so that a hand-built Condition{Op: OpIn, Value: "x"} behaves

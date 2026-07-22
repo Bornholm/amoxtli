@@ -142,6 +142,12 @@ deux formes de présence : `clé?` (le document porte la clé) et `!clé` (il ne
 porte pas). Les valeurs sont typées automatiquement (`true`/`false` en booléen,
 nombre, sinon chaîne).
 
+Un `--cursor` est lié au `--filter` avec lequel il a été émis : le rejouer sous
+un filtre différent est refusé (il désignerait une position dans un autre
+classement, d'où doublons et trous). Reprendre sans `--cursor` repart de la
+première page. Un filtre équivalent mais écrit autrement (conditions
+réordonnées, `2020` au lieu de `2020.0`) reste accepté.
+
 ⚠️ Tous les opérateurs **exigent que la clé soit présente**, `!=` compris :
 `--filter "type!=code"` ne remonte pas les documents dépourvus de `type`. C'est
 la sémantique « SQL NULL-like » (voir

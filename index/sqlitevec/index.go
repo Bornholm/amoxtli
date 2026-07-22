@@ -254,6 +254,14 @@ func deleteVecRows(conn *sqlite3.Conn, embeddingsIDs []int) error {
 // Callers must hold i.rwLock before calling this method.
 func (i *Index) deleteBySourceLocked(ctx context.Context, source *url.URL) error {
 	return i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		// Drop the metadata copy first, and before the early return below: a
+		// document whose chunks are already gone may still have a metadata row,
+		// and leaving it behind would let a filter match a document this index
+		// no longer holds.
+		if err := deleteDocumentMetadata(conn, source.String()); err != nil {
+			return errors.WithStack(err)
+		}
+
 		// First, get the embeddings IDs to delete
 		getIDsStmt, _, err := conn.Prepare("SELECT id FROM embeddings WHERE source = ?;")
 		if err != nil {
@@ -370,6 +378,14 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 	}
 
 	return i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		// Keep this index's own copy of the document metadata, so a filter can
+		// be evaluated inside the KNN query rather than after it.
+		if source != nil {
+			if err := writeDocumentMetadata(conn, source.String(), model.Metadata(document)); err != nil {
+				return errors.WithStack(err)
+			}
+		}
+
 		// Insert into main embeddings table (metadata only - vectors go to vec0)
 		stmt, _, err := conn.Prepare(`
 			INSERT INTO embeddings (source, section_id, chunk_index)
@@ -722,6 +738,29 @@ func (i *Index) insertCollection(ctx context.Context, conn *sqlite3.Conn, embedd
 
 // Search implements index.Index.
 func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	return i.search(ctx, query, nil, opts)
+}
+
+// SearchFiltered implements index.FilterableIndex: the metadata filter is
+// evaluated inside the KNN query, so the k results returned are k results that
+// already satisfy it — instead of k results from which the filter may leave
+// nothing.
+//
+// The translation is validated against the shared conformance suite
+// (index/filtertest), which is what allows this index to advertise the
+// capability: filtering here and filtering in Go must keep the same documents.
+func (i *Index) SearchFiltered(ctx context.Context, query string, filter index.Filter, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	return i.search(ctx, query, filter, opts)
+}
+
+func (i *Index) search(ctx context.Context, query string, filter index.Filter, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	// Reject invalid keys before any SQL is built. index.Filter restricts them
+	// to a character set that keeps '$.' || key a valid JSON path; an invalid
+	// path would raise a SQL error where the semantics require no match.
+	if err := filter.Validate(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	// Embed the query BEFORE taking the read lock and outside the retry loop:
 	// a SQLITE_BUSY/LOCKED retry must repeat only the SQL, never the billable
 	// network round-trip, and the call must not extend the lock's critical
@@ -765,14 +804,14 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 
 		if len(opts.Collections) > 0 {
 			for _, collection := range opts.Collections {
-				legMatches, err := i.knnLeg(conn, queryVec, maxResults, string(collection))
+				legMatches, err := i.knnLeg(conn, queryVec, maxResults, string(collection), filter)
 				if err != nil {
 					return errors.WithStack(err)
 				}
 				matches = append(matches, legMatches...)
 			}
 		} else {
-			matches, err = i.knnLeg(conn, queryVec, maxResults*unfilteredOversample, allPartitions)
+			matches, err = i.knnLeg(conn, queryVec, maxResults*unfilteredOversample, allPartitions, filter)
 			if err != nil {
 				return errors.WithStack(err)
 			}
@@ -817,15 +856,20 @@ const coarseOversample = 8
 // partition is allPartitions. Note vec0 performs an exhaustive scan (there is
 // no ANN index); partitioning and coarse quantization are the two levers that
 // bound its cost.
-func (i *Index) knnLeg(conn *sqlite3.Conn, queryVec []byte, k int, partition string) ([]vecMatch, error) {
+func (i *Index) knnLeg(conn *sqlite3.Conn, queryVec []byte, k int, partition string, filter index.Filter) ([]vecMatch, error) {
 	if i.coarse && i.hasCoarse() {
-		return i.knnCoarse(conn, queryVec, k, partition)
+		return i.knnCoarse(conn, queryVec, k, partition, filter)
 	}
-	return i.knnDirect(conn, queryVec, k, partition)
+	return i.knnDirect(conn, queryVec, k, partition, filter)
 }
 
 // knnDirect is the single-stage KNN on the float vectors.
-func (i *Index) knnDirect(conn *sqlite3.Conn, queryVec []byte, k int, partition string) ([]vecMatch, error) {
+func (i *Index) knnDirect(conn *sqlite3.Conn, queryVec []byte, k int, partition string, filter index.Filter) ([]vecMatch, error) {
+	prefilter, filterArgs, err := rowidPrefilter(filter)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	sql := fmt.Sprintf(`
 		SELECT v.rowid, v.distance
 		FROM embeddings_vec2 v
@@ -834,6 +878,7 @@ func (i *Index) knnDirect(conn *sqlite3.Conn, queryVec []byte, k int, partition 
 	if partition != allPartitions {
 		sql += ` AND v.collection_id = ?`
 	}
+	sql += prefilter
 	sql += ` ORDER BY v.distance ASC;`
 
 	stmt, _, err := conn.Prepare(sql)
@@ -848,10 +893,16 @@ func (i *Index) knnDirect(conn *sqlite3.Conn, queryVec []byte, k int, partition 
 	if err := stmt.BindInt(2, k); err != nil {
 		return nil, errors.WithStack(err)
 	}
+
+	next := 3
 	if partition != allPartitions {
-		if err := stmt.BindText(3, partition); err != nil {
+		if err := stmt.BindText(next, partition); err != nil {
 			return nil, errors.WithStack(err)
 		}
+		next++
+	}
+	if _, err := bindArgs(stmt, next, filterArgs); err != nil {
+		return nil, errors.WithStack(err)
 	}
 
 	var matches []vecMatch
@@ -867,7 +918,12 @@ func (i *Index) knnDirect(conn *sqlite3.Conn, queryVec []byte, k int, partition 
 
 // knnCoarse is the two-stage KNN: Hamming preselection on the binary-quantized
 // column, then float re-scoring of the candidates.
-func (i *Index) knnCoarse(conn *sqlite3.Conn, queryVec []byte, k int, partition string) ([]vecMatch, error) {
+func (i *Index) knnCoarse(conn *sqlite3.Conn, queryVec []byte, k int, partition string, filter index.Filter) ([]vecMatch, error) {
+	prefilter, filterArgs, err := rowidPrefilter(filter)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	sql := fmt.Sprintf(`
 		SELECT v.rowid
 		FROM embeddings_vec2 v
@@ -876,6 +932,7 @@ func (i *Index) knnCoarse(conn *sqlite3.Conn, queryVec []byte, k int, partition 
 	if partition != allPartitions {
 		sql += ` AND v.collection_id = ?`
 	}
+	sql += prefilter
 	sql += ` ORDER BY distance ASC;`
 
 	stmt, _, err := conn.Prepare(sql)
@@ -891,11 +948,18 @@ func (i *Index) knnCoarse(conn *sqlite3.Conn, queryVec []byte, k int, partition 
 		stmt.Close()
 		return nil, errors.WithStack(err)
 	}
+
+	next := 3
 	if partition != allPartitions {
-		if err := stmt.BindText(3, partition); err != nil {
+		if err := stmt.BindText(next, partition); err != nil {
 			stmt.Close()
 			return nil, errors.WithStack(err)
 		}
+		next++
+	}
+	if _, err := bindArgs(stmt, next, filterArgs); err != nil {
+		stmt.Close()
+		return nil, errors.WithStack(err)
 	}
 
 	var candidates []int64

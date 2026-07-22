@@ -69,6 +69,10 @@ var (
 
 // Cases covers each operator against each value kind, plus the edge cases where
 // implementations are most likely to drift apart.
+//
+// Every case uses a key inside index.KeyPattern: invalid keys are rejected
+// before evaluation (ErrInvalidFilterKey), so they belong to validation tests,
+// not to a suite describing what a filter selects.
 var Cases = []Case{
 	// --- Empty filter -------------------------------------------------------
 	{"empty-filter-matches", index.Filter{}, map[string]any{"a": "x"}, true},
@@ -188,8 +192,12 @@ var Cases = []Case{
 	{"and-one-missing-key", index.Filter{index.Eq("a", "x"), index.Eq("b", "y")}, map[string]any{"a": "x"}, false},
 	{"and-exists-and-ne", index.Filter{index.Exists("a"), index.Ne("a", "x")}, map[string]any{"a": "y"}, true},
 
-	// --- Hostile keys and values (no interpolation, no error) ---------------
-	{"hostile-key-treated-as-literal", index.Filter{index.Eq("'; DROP TABLE documents; --", "x")}, map[string]any{"a": "x"}, false},
+	// --- Hostile values (no interpolation, no error) ------------------------
+	//
+	// Keys are not exercised here: index.Filter restricts them to KeyPattern
+	// and the pipeline rejects the others with ErrInvalidFilterKey before any
+	// evaluation, so "what does this filter select" is not a question a hostile
+	// key ever reaches. Values carry no such restriction, hence these cases.
 	{"hostile-value-treated-as-literal", index.Filter{index.Eq("a", "'; DROP TABLE documents; --")}, map[string]any{"a": "x"}, false},
 	{"hostile-value-matches-itself", index.Filter{index.Eq("a", "' OR 1=1 --")}, map[string]any{"a": "' OR 1=1 --"}, true},
 	{"json-path-value", index.Filter{index.Eq("a", `$."a"[0]`)}, map[string]any{"a": `$."a"[0]`}, true},

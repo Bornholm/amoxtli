@@ -245,6 +245,42 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 
 // Search implements index.Index.
 func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	return i.search(ctx, query, nil, opts)
+}
+
+// SearchFiltered implements index.FilterableIndex by pushing the filter into
+// every leg. Callers must detect the capability with index.AsFilterable, which
+// consults Filterable below: a pipeline can only honour the contract when all
+// of its legs can.
+func (i *Index) SearchFiltered(ctx context.Context, query string, filter index.Filter, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	if len(filter) > 0 && !i.Filterable() {
+		return nil, errors.New("pipeline: cannot push a metadata filter down, some indexes do not support it")
+	}
+
+	return i.search(ctx, query, filter, opts)
+}
+
+// Filterable implements index.ConditionallyFilterable: the pipeline merges the
+// legs' results, so it can only guarantee that everything it returns satisfies
+// the filter when every leg applies it. With a single non-filterable leg the
+// merged list would carry unfiltered results that the caller believes filtered
+// — the silent corruption the capability exists to prevent — so the pipeline
+// declines the capability and the caller falls back to filtering in Go.
+func (i *Index) Filterable() bool {
+	if len(i.indexes) == 0 {
+		return false
+	}
+
+	for identified := range i.indexes {
+		if _, ok := index.AsFilterable(identified.Index()); !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (i *Index) search(ctx context.Context, query string, filter index.Filter, opts index.SearchOptions) ([]*index.SearchResult, error) {
 	// Query transformation is per-index: semantic (vector) indexes receive the
 	// query expanded by the semantic-only transformers (e.g. HyDE) while
 	// lexical indexes keep the raw (universally transformed) query, as query
@@ -319,10 +355,24 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 				indexQuery = semanticQuery
 			}
 
-			results, err := identified.Index().Search(indexCtx, indexQuery, index.SearchOptions{
+			legOpts := index.SearchOptions{
 				MaxResults:  maxResults * 2,
 				Collections: collections,
-			})
+			}
+
+			// Push the filter into the leg when it can apply it inside its own
+			// query: its top-k is then k *matching* results, instead of a top-k
+			// the filter may empty afterwards. Filterable above guarantees every
+			// leg can, so there is no unfiltered leg to reconcile here.
+			var (
+				results []*index.SearchResult
+				err     error
+			)
+			if filterable, ok := index.AsFilterable(identified.Index()); ok && len(filter) > 0 {
+				results, err = filterable.SearchFiltered(indexCtx, indexQuery, filter, legOpts)
+			} else {
+				results, err = identified.Index().Search(indexCtx, indexQuery, legOpts)
+			}
 			if err != nil {
 				err = errors.WithStack(err)
 				slog.ErrorContext(indexCtx, "could not search documents", slog.Any("error", err))
