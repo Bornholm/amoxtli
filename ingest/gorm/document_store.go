@@ -69,7 +69,7 @@ func (s *Store) ListDocumentDigests(ctx context.Context, sourcePrefix string, pa
 	var rows []row
 
 	err := s.withRetry(ctx, false, func(ctx context.Context, db *gorm.DB) error {
-		q := db.Model(&Document{}).Select("id, source, etag")
+		q := db.Model(&Document{}).Select("id, source, e_tag")
 		if sourcePrefix != "" {
 			q = q.Where("source LIKE ?", sourcePrefix+"%")
 		}

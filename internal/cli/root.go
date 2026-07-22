@@ -89,6 +89,7 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddCommand(
 		newInitCommand(opts),
 		newAddCommand(opts),
+		newSyncCommand(opts),
 		newSearchCommand(opts),
 		newDocCommand(opts),
 		newCollectionCommand(opts),
