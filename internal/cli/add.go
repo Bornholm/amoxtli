@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -32,6 +31,7 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 	var (
 		collection string
 		metaPairs  []string
+		baseDir    string
 		noWait     bool
 		noIgnore   bool
 		timeout    time.Duration
@@ -45,6 +45,13 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 			ctx := cmd.Context()
 
 			metadata, err := filterexpr.ParseMetadata(metaPairs)
+			if err != nil {
+				return err
+			}
+
+			// Sources are stored relative to --base-dir when set, so an indexed
+			// document never carries the host's absolute paths.
+			sources, err := newSourceMapper(baseDir)
 			if err != nil {
 				return err
 			}
@@ -85,7 +92,7 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 						continue
 					}
 				}
-				scheduled[i] = scheduleFile(cmd, rt, collID, path, supported, metadata)
+				scheduled[i] = scheduleFile(cmd, rt, collID, path, supported, sources, metadata)
 			}
 
 			// Phase 2: resolve results in input order. Because the tasks are
@@ -130,6 +137,7 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 	flags := cmd.Flags()
 	flags.StringVarP(&collection, "collection", "c", "default", "target collection (label or ID, created if missing)")
 	flags.StringArrayVar(&metaPairs, "meta", nil, "attach metadata to the documents (key=value, repeatable)")
+	flags.StringVar(&baseDir, "base-dir", "", "store sources relative to this directory instead of their absolute path")
 	flags.BoolVar(&noWait, "no-wait", false, "schedule indexing without waiting for completion")
 	flags.BoolVar(&noIgnore, "no-ignore", false, "index files even if they match a .amoxtlignore rule")
 	flags.DurationVar(&timeout, "timeout", 5*time.Minute, "maximum time to wait per file (0 = no timeout)")
@@ -169,7 +177,8 @@ func ignoredFile(path, source string) scheduledFile {
 // for completion, so a batch of files can be indexed concurrently by the task
 // runner. IndexFile copies the file synchronously before returning, so the
 // handle can be closed here even though indexing continues asynchronously.
-func scheduleFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.CollectionID, path string, supported []string, metadata map[string]any) scheduledFile {
+// sources derives the stored source URL from the file's absolute path.
+func scheduleFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.CollectionID, path string, supported []string, sources *sourceMapper, metadata map[string]any) scheduledFile {
 	sf := scheduledFile{started: time.Now(), result: addResult{File: path}}
 
 	fail := func(err error) scheduledFile {
@@ -204,7 +213,11 @@ func scheduleFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.Collecti
 	}
 	defer file.Close()
 
-	source := &url.URL{Scheme: "file", Path: abs}
+	source, err := sources.Source(abs)
+	if err != nil {
+		return fail(err)
+	}
+
 	// mtime+size based ETag: re-adding an unchanged file is a cheap no-op.
 	etag := fmt.Sprintf("%x-%x", info.ModTime().Unix(), info.Size())
 

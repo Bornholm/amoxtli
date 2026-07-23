@@ -65,6 +65,7 @@ go install github.com/bornholm/amoxtli/cmd/amoxtli@latest   # ou : make build
 amoxtli init
 amoxtli add ./docs/*.md                              # documentation
 amoxtli add $(git ls-files '*.go')                   # code source (type=code, language=go)
+amoxtli sync --base-dir . ./docs                     # arborescence, sources relatives (pas de chemin absolu indexé)
 amoxtli search "modèle de concurrence"               # doc ET code
 amoxtli search "modèle de concurrence" --filter '!type'        # documentation seule
 amoxtli mcp stdio             # serveur MCP sur stdio (un processus par client)

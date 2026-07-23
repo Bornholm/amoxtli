@@ -30,6 +30,7 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 	var (
 		collection string
 		filters    []string
+		baseDir    string
 		noWait     bool
 		noIgnore   bool
 		dryRun     bool
@@ -37,9 +38,9 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "sync <base_dir>",
+		Use:   "sync <dir>",
 		Short: "Synchronize the index with a directory tree",
-		Long: "Recursively indexes the files under <base_dir> that match --filter,\n" +
+		Long: "Recursively indexes the files under <dir> that match --filter,\n" +
 			"skipping files whose content is unchanged since the last sync. Files\n" +
 			"that were indexed from this tree but have since disappeared from disk\n" +
 			"are removed from the index. Files still present but excluded by the\n" +
@@ -48,16 +49,24 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
-			baseAbs, err := filepath.Abs(args[0])
+			treeAbs, err := filepath.Abs(args[0])
 			if err != nil {
 				return err
 			}
-			info, err := os.Stat(baseAbs)
+			info, err := os.Stat(treeAbs)
 			if err != nil {
 				return err
 			}
 			if !info.IsDir() {
 				return errors.Errorf("%q is not a directory", args[0])
+			}
+
+			// Sources are stored relative to --base-dir when set, so an indexed
+			// document never carries the host's absolute paths. The synced tree
+			// must sit below it, otherwise no source could be derived.
+			sources, err := newSourceMapper(baseDir)
+			if err != nil {
+				return err
 			}
 
 			ws, cfg, err := opts.loadConfig()
@@ -86,10 +95,11 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 			}
 
 			// Current index state for this subtree, keyed by source URL. Serves
-			// both the ETag skip and the deletion detection below. The trailing
-			// slash keeps sibling directories (e.g. "/x/proj2" for "/x/proj")
-			// out of the prefix match.
-			prefix := (&url.URL{Scheme: "file", Path: baseAbs}).String() + "/"
+			// both the ETag skip and the deletion detection below.
+			prefix, err := sources.DirPrefix(treeAbs)
+			if err != nil {
+				return err
+			}
 			indexed, err := loadIndexedDigests(ctx, rt, prefix)
 			if err != nil {
 				return err
@@ -102,7 +112,7 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 			var toSchedule []string
 			skipped := 0
 
-			walkErr := filepath.WalkDir(baseAbs, func(path string, d fs.DirEntry, err error) error {
+			walkErr := filepath.WalkDir(treeAbs, func(path string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
@@ -135,7 +145,12 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 					return ierr
 				}
 
-				source := (&url.URL{Scheme: "file", Path: path}).String()
+				sourceURL, serr := sources.Source(path)
+				if serr != nil {
+					return serr
+				}
+
+				source := sourceURL.String()
 				seen[source] = struct{}{}
 
 				// mtime+size ETag, identical to "amoxtli add": an unchanged file
@@ -166,7 +181,7 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 				if perr != nil {
 					continue
 				}
-				if _, serr := os.Stat(u.Path); os.IsNotExist(serr) {
+				if _, serr := os.Stat(sources.Path(u)); os.IsNotExist(serr) {
 					toDelete = append(toDelete, source)
 				}
 			}
@@ -187,17 +202,17 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 						_, _ = fmt.Fprintf(out, "%s: would %s\n", r.File, r.Action)
 					}
 					_, _ = fmt.Fprintf(out, "\nDry run for %s: would index %d, would delete %d, %d unchanged.\n",
-						baseAbs, len(toSchedule), len(toDelete), skipped)
+						treeAbs, len(toSchedule), len(toDelete), skipped)
 				}
 
-				return syncOutput(cmd, opts, baseAbs, results, len(toSchedule), skipped, len(toDelete), 0)
+				return syncOutput(cmd, opts, treeAbs, results, len(toSchedule), skipped, len(toDelete), 0)
 			}
 
 			// Phase 2: schedule the new/modified files so the task runner indexes
 			// them concurrently, then resolve the results in order.
 			scheduled := make([]scheduledFile, len(toSchedule))
 			for i, path := range toSchedule {
-				scheduled[i] = scheduleFile(cmd, rt, collID, path, supported, nil)
+				scheduled[i] = scheduleFile(cmd, rt, collID, path, supported, sources, nil)
 			}
 
 			indexedCount := 0
@@ -249,10 +264,10 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 
 			if !opts.json {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\nSynced %s: %d indexed, %d skipped, %d deleted, %d failed.\n",
-					baseAbs, indexedCount, skipped, deleted, failures)
+					treeAbs, indexedCount, skipped, deleted, failures)
 			}
 
-			if err := syncOutput(cmd, opts, baseAbs, results, indexedCount, skipped, deleted, failures); err != nil {
+			if err := syncOutput(cmd, opts, treeAbs, results, indexedCount, skipped, deleted, failures); err != nil {
 				return err
 			}
 
@@ -267,6 +282,7 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 	flags := cmd.Flags()
 	flags.StringVarP(&collection, "collection", "c", "default", "target collection (label or ID, created if missing)")
 	flags.StringArrayVar(&filters, "filter", nil, "only index files whose name matches this glob (e.g. '*.go', repeatable)")
+	flags.StringVar(&baseDir, "base-dir", "", "store sources relative to this directory instead of their absolute path (must contain <dir>)")
 	flags.BoolVar(&noWait, "no-wait", false, "schedule indexing without waiting for completion")
 	flags.BoolVar(&noIgnore, "no-ignore", false, "index files even if they match a .amoxtlignore rule")
 	flags.BoolVar(&dryRun, "dry-run", false, "report what would be indexed and deleted without changing anything")
@@ -311,14 +327,16 @@ func loadIndexedDigests(ctx context.Context, rt *runtime.Runtime, prefix string)
 	}
 }
 
-// syncOutput emits the machine-readable JSON summary when --json is set.
-func syncOutput(cmd *cobra.Command, opts *rootOptions, baseDir string, results []syncResult, indexed, skipped, deleted, failed int) error {
+// syncOutput emits the machine-readable JSON summary when --json is set. dir is
+// the synchronized tree, reported as-is: it describes the local run, not what
+// the index stores.
+func syncOutput(cmd *cobra.Command, opts *rootOptions, dir string, results []syncResult, indexed, skipped, deleted, failed int) error {
 	if !opts.json {
 		return nil
 	}
 
 	return printJSON(cmd.OutOrStdout(), map[string]any{
-		"base_dir": baseDir,
+		"base_dir": dir,
 		"indexed":  indexed,
 		"skipped":  skipped,
 		"deleted":  deleted,

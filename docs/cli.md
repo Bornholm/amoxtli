@@ -123,7 +123,8 @@ extension→langage (ex. `.phtml: php`). Langages intégrés : `go`, `javascript
 | Commande | Rôle |
 |----------|------|
 | `init [--force]` | Initialise l'espace de travail |
-| `add <fichier>... [-c collection] [--meta k=v] [--no-wait] [--no-ignore] [--timeout d]` | Indexe des fichiers |
+| `add <fichier>... [-c collection] [--meta k=v] [--base-dir d] [--no-wait] [--no-ignore] [--timeout d]` | Indexe des fichiers |
+| `sync <dir> [-c collection] [--filter glob] [--base-dir d] [--dry-run] [--no-wait] [--no-ignore] [--timeout d]` | Synchronise l'index avec une arborescence (indexe, ignore l'inchangé, supprime les disparus) |
 | `search <requête> [-n N] [-c coll] [--filter k=v] [--cursor c] [--deep] [--no-content]` | Recherche (—`--deep` = itérative LLM) |
 | `doc list\|show\|delete` | Inspecte et supprime des documents (suppression par lot via filtres) |
 | `collection create\|list\|show\|rename\|describe\|stats\|delete` | Gère les collections |
@@ -154,6 +155,39 @@ la sémantique « SQL NULL-like » (voir
 [docs/architecture.md](architecture.md#sémantique-du-filtre)) ; pour cibler
 l'absence, utiliser `--filter '!type'`. Les clés sont limitées à
 `[A-Za-z0-9_-]` (128 caractères max) ; une clé hors de ce jeu est rejetée.
+
+### Chemins sources (`--base-dir`)
+
+Par défaut, `add` et `sync` enregistrent chaque document avec le chemin **absolu**
+du fichier indexé (`file:///home/alice/projets/kb/docs/cli.md`). Ce chemin
+ressort tel quel dans `doc list`, dans les résultats de recherche et dans les
+outils MCP `search` / `list_documents` : il révèle la topologie du système de
+fichiers de la machine qui indexe.
+
+`--base-dir <dir>` retire ce préfixe et ne conserve que le chemin relatif :
+
+```bash
+amoxtli add --base-dir . ./docs/cli.md     # source : file:///docs/cli.md
+amoxtli sync --base-dir . ./docs           # idem sur toute l'arborescence
+```
+
+- Le chemin stocké garde son `/` initial : il reste une URL `file://` bien
+  formée (sans quoi le premier segment serait relu comme un hôte). Ce `/`
+  désigne le répertoire de base, pas la racine du système de fichiers.
+- Un fichier situé **hors** du répertoire de base est refusé (`… is outside the
+  base directory …`) plutôt qu'indexé avec un chemin absolu : aucune fuite ne
+  peut passer au travers une fois l'option posée. Pour `sync`, c'est
+  l'arborescence passée en argument qui doit se trouver sous `--base-dir`.
+- L'option est un drapeau par commande, et non un réglage de `config.yaml` :
+  plusieurs racines peuvent cohabiter dans le même index (une invocation par
+  racine, chacune avec son propre `--base-dir`).
+- Le choix engage la durée : `sync` reconnaît les documents déjà indexés par
+  leur source. Passer une arborescence de l'absolu au relatif (ou changer de
+  `--base-dir`) la fait réindexer sous ses nouvelles sources ; les anciennes
+  entrées restent en place jusqu'à un `amoxtli doc delete --source-like`.
+- La sortie des commandes (`sync … : 3 indexed`, statut par fichier) continue
+  d'afficher les chemins locaux : elle décrit l'exécution en cours, elle n'est
+  pas indexée.
 
 ### Ignorer des fichiers (`.amoxtlignore`)
 

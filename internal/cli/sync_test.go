@@ -65,6 +65,92 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
+// TestSyncBaseDir checks that --base-dir strips the prefix from the stored
+// sources — the index never discloses the host's absolute paths — while the
+// ETag skip and the deletion of vanished files keep working on them.
+func TestSyncBaseDir(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+
+	aGo := filepath.Join(src, "a.go")
+	bGo := filepath.Join(src, "sub", "b.go")
+
+	writeFile(t, aGo, "package main\n\nfunc main() {}\n")
+	writeFile(t, bGo, "package sub\n\nfunc B() {}\n")
+
+	mustRunCLI(t, "-C", root, "init")
+
+	summary := mustSync(t, root, "--base-dir", root, src)
+	if summary.Indexed != 2 || summary.Failed != 0 {
+		t.Fatalf("unexpected first sync summary: %+v", summary)
+	}
+
+	sources := listedSources(t, root)
+	for _, want := range []string{"file:///src/a.go", "file:///src/sub/b.go"} {
+		if _, ok := sources[want]; !ok {
+			t.Errorf("missing relative source %q: %v", want, sources)
+		}
+	}
+	for source := range sources {
+		if strings.Contains(source, root) {
+			t.Errorf("source %q leaks the base directory %q", source, root)
+		}
+	}
+
+	// The relative sources are matched back on re-sync: everything is skipped.
+	summary = mustSync(t, root, "--base-dir", root, src)
+	if summary.Indexed != 0 || summary.Skipped != 2 {
+		t.Fatalf("expected every file skipped on re-sync, got: %+v", summary)
+	}
+
+	// A vanished file is resolved back against the base directory and purged.
+	if err := os.Remove(bGo); err != nil {
+		t.Fatal(err)
+	}
+
+	summary = mustSync(t, root, "--base-dir", root, src)
+	if summary.Deleted != 1 || summary.Skipped != 1 {
+		t.Fatalf("expected sub/b.go to be deleted, got: %+v", summary)
+	}
+	if _, ok := listedSources(t, root)["file:///src/sub/b.go"]; ok {
+		t.Error("sub/b.go should have been deleted from the index")
+	}
+
+	// Synchronizing a tree that does not sit below the base directory has no
+	// derivable source, and is refused up front.
+	output, err := runCLI(t, "-C", root, "sync", "--base-dir", src, t.TempDir())
+	if err == nil {
+		t.Errorf("expected sync outside the base directory to fail, got: %s", output)
+	}
+}
+
+// TestAddBaseDir checks the same source rewriting on explicit "add" arguments,
+// including the refusal of a file outside the base directory.
+func TestAddBaseDir(t *testing.T) {
+	root := t.TempDir()
+	docPath := filepath.Join(root, "docs", "go-intro.md")
+
+	writeFile(t, docPath, testDocument)
+
+	mustRunCLI(t, "-C", root, "init")
+	mustRunCLI(t, "-C", root, "add", "--base-dir", root, docPath)
+
+	if _, ok := listedSources(t, root)["file:///docs/go-intro.md"]; !ok {
+		t.Errorf("expected a relative source, got: %v", listedSources(t, root))
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	writeFile(t, outside, testDocument)
+
+	output, err := runCLI(t, "-C", root, "add", "--base-dir", filepath.Join(root, "docs"), outside)
+	if err == nil {
+		t.Errorf("expected add outside the base directory to fail, got: %s", output)
+	}
+	if !strings.Contains(output, "outside the base directory") {
+		t.Errorf("unexpected failure reason: %s", output)
+	}
+}
+
 // TestSyncCommand drives the sync workflow: recursive indexing with a glob
 // filter, ETag-based skipping of unchanged files, deletion of files that
 // disappeared from disk, and preservation of files that are still present but
