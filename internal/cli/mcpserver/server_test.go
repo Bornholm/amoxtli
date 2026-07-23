@@ -244,13 +244,17 @@ func TestMCPSearch(t *testing.T) {
 	}
 
 	// The listing is header-only, but metadata is part of the header.
-	var code *documentHeader
-	for i, doc := range docs.Documents {
+	var (
+		code  documentHeader
+		found bool
+	)
+	for _, doc := range docs.Documents {
 		if strings.Contains(doc.Source, "greeting.go") {
-			code = &docs.Documents[i]
+			code = doc
+			found = true
 		}
 	}
-	if code == nil {
+	if !found {
 		t.Fatalf("greeting.go not listed: %+v", docs.Documents)
 	}
 	if got := code.Metadata["language"]; got != "go" {
