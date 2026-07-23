@@ -1349,7 +1349,9 @@ func (i *Index) Semantic() bool { return true }
 // (including the versioned vec0 schema upgrade) and records/verifies the
 // index identity (embeddings model + vector size).
 func initializeConn(conn *sqlite3.Conn, model string, vectorSize int) error {
-	if err := conn.Exec("PRAGMA journal_mode=wal; PRAGMA foreign_keys=on; PRAGMA busy_timeout=30000"); err != nil {
+	// See ingest/gorm/sqlite.go for the rationale behind synchronous=NORMAL:
+	// one fsync per indexed document is the dominant write cost otherwise.
+	if err := conn.Exec("PRAGMA journal_mode=wal; PRAGMA synchronous=normal; PRAGMA foreign_keys=on; PRAGMA busy_timeout=30000"); err != nil {
 		return errors.WithStack(err)
 	}
 

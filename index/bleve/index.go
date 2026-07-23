@@ -46,12 +46,21 @@ func (i *Index) DeleteBySource(ctx context.Context, source *url.URL) error {
 			return errors.WithStack(err)
 		}
 
+		// No hit left: the source is gone from the index. Also guards against
+		// looping forever should Total disagree with the returned hits.
+		if len(result.Hits) == 0 {
+			break
+		}
+
+		batch := i.index.NewBatch()
 		for _, r := range result.Hits {
 			slog.DebugContext(ctx, "deleting resource", slog.String("source", source.String()), slog.String("id", r.ID))
 
-			if err := i.index.Delete(r.ID); err != nil {
-				return errors.WithStack(err)
-			}
+			batch.Delete(r.ID)
+		}
+
+		if err := i.index.Batch(batch); err != nil {
+			return errors.WithStack(err)
 		}
 
 		if result.Total <= uint64(req.Size) {
@@ -61,6 +70,13 @@ func (i *Index) DeleteBySource(ctx context.Context, source *url.URL) error {
 
 	return nil
 }
+
+// batchFlushSize bounds how many section updates accumulate before the batch
+// is applied. Indexing section by section would create one scorch segment per
+// section: the segment count — and the background merges it triggers — would
+// then grow with the corpus, making each new document slower to index than the
+// previous one. Batching keeps the per-document cost flat.
+const batchFlushSize = 500
 
 // Index implements index.Index.
 func (i *Index) Index(ctx context.Context, document model.Document, funcs ...index.OptionFunc) error {
@@ -87,18 +103,35 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 		opts.OnProgress(progress)
 	}
 
+	batch := i.index.NewBatch()
+	flush := func() error {
+		if batch.Size() == 0 {
+			return nil
+		}
+
+		if err := i.index.Batch(batch); err != nil {
+			return errors.WithStack(err)
+		}
+
+		batch.Reset()
+
+		return nil
+	}
+
 	for _, s := range document.Sections() {
-		if err := i.indexSection(ctx, s, onSectionIndexed); err != nil {
+		if err := i.indexSection(ctx, batch, flush, s, onSectionIndexed); err != nil {
 			return errors.WithStack(err)
 		}
 	}
 
-	return nil
+	return flush()
 }
 
-func (i *Index) indexSection(ctx context.Context, section model.Section, onSectionIndexed func()) error {
+// indexSection adds the section and its children to batch, flushing it
+// whenever it reaches batchFlushSize.
+func (i *Index) indexSection(ctx context.Context, batch *bleve.Batch, flush func() error, section model.Section, onSectionIndexed func()) error {
 	for _, s := range section.Sections() {
-		if err := i.indexSection(ctx, s, onSectionIndexed); err != nil {
+		if err := i.indexSection(ctx, batch, flush, s, onSectionIndexed); err != nil {
 			return errors.WithStack(err)
 		}
 	}
@@ -115,11 +148,17 @@ func (i *Index) indexSection(ctx context.Context, section model.Section, onSecti
 
 	slog.DebugContext(ctx, "indexing section", slog.String("sectionID", string(section.ID())))
 
-	if err := i.index.Index(id, resource); err != nil {
+	if err := batch.Index(id, resource); err != nil {
 		return errors.WithStack(err)
 	}
 
 	onSectionIndexed()
+
+	if batch.Size() >= batchFlushSize {
+		if err := flush(); err != nil {
+			return errors.WithStack(err)
+		}
+	}
 
 	return nil
 }

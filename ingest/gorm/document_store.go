@@ -533,10 +533,48 @@ func (s *Store) QueryDocuments(ctx context.Context, opts ingest.QueryDocumentsOp
 	return wrappedDocuments, total, nil
 }
 
-// SaveDocuments implements ingest.Store.
+// SaveDocuments implements ingest.Store. The whole batch is written in a
+// single transaction: one commit — and, on SQLite, one WAL sync — instead of
+// one per document.
 func (s *Store) SaveDocuments(ctx context.Context, documents ...model.Document) error {
-	for _, doc := range documents {
-		err := s.withRetry(ctx, true, func(ctx context.Context, db *gorm.DB) error {
+	if len(documents) == 0 {
+		return nil
+	}
+
+	err := s.withRetry(ctx, true, func(ctx context.Context, db *gorm.DB) error {
+		var createSection func(s *Section) error
+		createSection = func(s *Section) error {
+			err := db.
+				Clauses(clause.OnConflict{
+					Columns:   []clause.Column{{Name: "id"}},
+					UpdateAll: true,
+				}).
+				Omit("Sections", "Parent", "Document").Create(s).Error
+			if err != nil {
+				return errors.WithStack(err)
+			}
+
+			for _, ss := range s.Sections {
+				if err := createSection(ss); err != nil {
+					return errors.WithStack(err)
+				}
+
+				err := db.Model(&Section{}).
+					Where("id = ?", ss.ID).
+					Updates(map[string]any{
+						"parent_id":   s.ID,
+						"document_id": s.DocumentID,
+					}).
+					Error
+				if err != nil {
+					return errors.WithStack(err)
+				}
+			}
+
+			return nil
+		}
+
+		for _, doc := range documents {
 			source := doc.Source()
 			if source == nil {
 				return errors.WithStack(ErrMissingSource)
@@ -562,49 +600,17 @@ func (s *Store) SaveDocuments(ctx context.Context, documents ...model.Document) 
 				return errors.WithStack(res.Error)
 			}
 
-			var createSection func(s *Section) error
-			createSection = func(s *Section) error {
-				err := db.
-					Clauses(clause.OnConflict{
-						Columns:   []clause.Column{{Name: "id"}},
-						UpdateAll: true,
-					}).
-					Omit("Sections", "Parent", "Document").Create(s).Error
-				if err != nil {
-					return errors.WithStack(err)
-				}
-
-				for _, ss := range s.Sections {
-					if err := createSection(ss); err != nil {
-						return errors.WithStack(err)
-					}
-
-					err := db.Model(&Section{}).
-						Where("id = ?", ss.ID).
-						Updates(map[string]any{
-							"parent_id":   s.ID,
-							"document_id": s.DocumentID,
-						}).
-						Error
-					if err != nil {
-						return errors.WithStack(err)
-					}
-				}
-
-				return nil
-			}
-
 			for _, s := range document.Sections {
 				if err := createSection(s); err != nil {
 					return errors.WithStack(err)
 				}
 			}
-
-			return nil
-		}, sqlite3.LOCKED, sqlite3.BUSY)
-		if err != nil {
-			return errors.WithStack(err)
 		}
+
+		return nil
+	}, sqlite3.LOCKED, sqlite3.BUSY)
+	if err != nil {
+		return errors.WithStack(err)
 	}
 
 	return nil

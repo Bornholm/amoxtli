@@ -33,7 +33,11 @@ func NewSQLiteStore(dsn string) (*Store, error) {
 	// locked" contention.
 	internalDB.SetMaxOpenConns(1)
 
-	if err := db.Exec("PRAGMA journal_mode=wal; PRAGMA foreign_keys=on; PRAGMA busy_timeout=5000").Error; err != nil {
+	// synchronous=NORMAL is the standard companion of WAL: commits no longer
+	// fsync individually (the WAL is fsynced at checkpoint time), which is what
+	// makes an ingestion of many documents affordable. Durability is preserved
+	// across process crashes; only a power loss can cost the last transactions.
+	if err := db.Exec("PRAGMA journal_mode=wal; PRAGMA synchronous=normal; PRAGMA foreign_keys=on; PRAGMA busy_timeout=5000").Error; err != nil {
 		return nil, errors.WithStack(err)
 	}
 

@@ -11,6 +11,19 @@ import (
 // RestoreDocuments implements service.Restorable.
 func (i *Index) RestoreDocuments(ctx context.Context, documents []model.Document) error {
 	batch := i.index.NewBatch()
+	flush := func() error {
+		if batch.Size() == 0 {
+			return nil
+		}
+
+		if err := i.index.Batch(batch); err != nil {
+			return errors.WithStack(err)
+		}
+
+		batch.Reset()
+
+		return nil
+	}
 
 	for _, d := range documents {
 		err := model.WalkSections(d, func(s model.Section) error {
@@ -27,6 +40,13 @@ func (i *Index) RestoreDocuments(ctx context.Context, documents []model.Document
 				return errors.WithStack(err)
 			}
 
+			// Cap the in-flight batch: a restore can carry far more sections
+			// than a single document, and holding them all in memory before
+			// the first apply is unnecessary.
+			if batch.Size() >= batchFlushSize {
+				return flush()
+			}
+
 			return nil
 		})
 		if err != nil {
@@ -34,11 +54,7 @@ func (i *Index) RestoreDocuments(ctx context.Context, documents []model.Document
 		}
 	}
 
-	if err := i.index.Batch(batch); err != nil {
-		return errors.WithStack(err)
-	}
-
-	return nil
+	return flush()
 }
 
 var _ backup.Restorable = &Index{}

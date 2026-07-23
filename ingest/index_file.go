@@ -214,10 +214,17 @@ func (h *IndexFileHandler) Handle(ctx context.Context, tsk task.Task, events cha
 
 				ext := filepath.Ext(indexFileTask.originalName)
 				if ext == ".md" || h.isSourceCode(ext) || h.fileConverter == nil {
+					// The handle is the reader of the next step, which closes it.
 					reader = file
 					events <- task.NewEvent(task.WithProgress(0.05))
 					return nil
 				}
+
+				// Past this point the file is only the converter's input: the
+				// reader handed to the next step is the converter's own. Closing
+				// here — on the error paths as well as on success — is what keeps
+				// a large sync from leaking one descriptor per converted file.
+				defer file.Close()
 
 				supportedExtensions := h.fileConverter.SupportedExtensions()
 
