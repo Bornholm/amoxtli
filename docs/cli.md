@@ -123,8 +123,8 @@ extension→langage (ex. `.phtml: php`). Langages intégrés : `go`, `javascript
 | Commande | Rôle |
 |----------|------|
 | `init [--force]` | Initialise l'espace de travail |
-| `add <fichier>... [-c collection] [--meta k=v] [--base-dir d] [--no-wait] [--no-ignore] [--timeout d]` | Indexe des fichiers |
-| `sync <dir> [-c collection] [--filter glob] [--base-dir d] [--dry-run] [--no-wait] [--no-ignore] [--timeout d]` | Synchronise l'index avec une arborescence (indexe, ignore l'inchangé, supprime les disparus) |
+| `add <fichier>... [-c collection] [--meta k=v] [--base-dir d] [--no-wait] [--no-ignore] [--no-file-metadata] [--timeout d]` | Indexe des fichiers |
+| `sync <dir> [-c collection] [--filter glob] [--base-dir d] [--dry-run] [--no-wait] [--no-ignore] [--no-file-metadata] [--timeout d]` | Synchronise l'index avec une arborescence (indexe, ignore l'inchangé, supprime les disparus) |
 | `search <requête> [-n N] [-c coll] [--filter k=v] [--cursor c] [--deep] [--no-content]` | Recherche (—`--deep` = itérative LLM) |
 | `doc list\|show\|delete` | Inspecte et supprime des documents (suppression par lot via filtres) |
 | `collection create\|list\|show\|rename\|describe\|stats\|delete` | Gère les collections |
@@ -155,6 +155,44 @@ la sémantique « SQL NULL-like » (voir
 [docs/architecture.md](architecture.md#sémantique-du-filtre)) ; pour cibler
 l'absence, utiliser `--filter '!type'`. Les clés sont limitées à
 `[A-Za-z0-9_-]` (128 caractères max) ; une clé hors de ce jeu est rejetée.
+
+### Métadonnées de fichier
+
+`add` et `sync` attachent par défaut à chaque document les attributs du fichier
+indexé, directement utilisables comme clés de `--filter` :
+
+| Clé | Valeur | Exemple de filtre |
+|-----|--------|-------------------|
+| `filename` | Nom du fichier, extension comprise | `--filter filename=cli.md` |
+| `extension` | Extension en minuscules, sans le point | `--filter extension=md` |
+| `size` | Taille en octets | `--filter size>100000` |
+| `mtime` | Date de dernière modification sur disque | `--filter mtime>=2026-01-01T00:00:00Z` |
+| `dirname` | Répertoire du fichier, exprimé comme la source (relatif à `--base-dir` s'il est posé, absolu sinon) | `--filter dirname=/docs` |
+| `indexed_at` | Date de passage à l'indexation | `--filter indexed_at<2026-01-01T00:00:00Z` |
+
+```bash
+amoxtli sync --base-dir . ./docs
+amoxtli search "authentification" --filter dirname=/docs/guides --filter extension=md
+amoxtli doc list --filter indexed_at'<'2026-01-01T00:00:00Z   # documents jamais rafraîchis depuis
+```
+
+- Les dates sont stockées au format canonique (RFC 3339, UTC, précision
+  nanoseconde) : leur comparaison lexicographique est chronologique, quel que
+  soit le backend. Un opérande de filtre écrit en RFC 3339 est canonicalisé de
+  la même façon.
+- `--meta k=v` l'emporte sur la valeur dérivée de la même clé : c'est la
+  soupape quand l'attribut déduit ne convient pas.
+- Ces clés s'ajoutent à celles injectées par les analyseurs (`type=code`,
+  `language=<nom>`) sans les remplacer.
+- `--no-file-metadata` les désactive ; seul ce qui est passé par `--meta` est
+  alors enregistré.
+- Elles ne sont posées qu'au moment où le fichier est lu sur le disque : les
+  documents déjà présents dans l'index ne les portent pas. Comme `sync` ignore
+  les fichiers inchangés (ETag mtime+taille) et que `reindex` reconstruit
+  l'index à partir des documents **stockés**, rattraper un fonds existant
+  demande de le réingérer depuis le disque — `amoxtli doc delete
+  --source-like 'file:///docs/%'` puis `amoxtli sync`, ou un `add` sur les
+  fichiers concernés (une source déjà connue est remplacée).
 
 ### Chemins sources (`--base-dir`)
 

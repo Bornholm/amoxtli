@@ -68,6 +68,7 @@ amoxtli add $(git ls-files '*.go')                   # code source (type=code, l
 amoxtli sync --base-dir . ./docs                     # arborescence, sources relatives (pas de chemin absolu indexé)
 amoxtli search "modèle de concurrence"               # doc ET code
 amoxtli search "modèle de concurrence" --filter '!type'        # documentation seule
+amoxtli search "modèle de concurrence" --filter dirname=/docs  # métadonnées de fichier (filename, extension, size, mtime, dirname, indexed_at)
 amoxtli mcp stdio             # serveur MCP sur stdio (un processus par client)
 amoxtli mcp http --addr :8080 # serveur MCP HTTP (processus partagé, multi-sessions)
 ```

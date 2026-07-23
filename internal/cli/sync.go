@@ -28,13 +28,14 @@ type syncResult struct {
 
 func newSyncCommand(opts *rootOptions) *cobra.Command {
 	var (
-		collection string
-		filters    []string
-		baseDir    string
-		noWait     bool
-		noIgnore   bool
-		dryRun     bool
-		timeout    time.Duration
+		collection     string
+		filters        []string
+		baseDir        string
+		noWait         bool
+		noIgnore       bool
+		noFileMetadata bool
+		dryRun         bool
+		timeout        time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -210,9 +211,11 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 
 			// Phase 2: schedule the new/modified files so the task runner indexes
 			// them concurrently, then resolve the results in order.
+			metadata := docMetadata{file: !noFileMetadata}
+
 			scheduled := make([]scheduledFile, len(toSchedule))
 			for i, path := range toSchedule {
-				scheduled[i] = scheduleFile(cmd, rt, collID, path, supported, sources, nil)
+				scheduled[i] = scheduleFile(cmd, rt, collID, path, supported, sources, metadata)
 			}
 
 			indexedCount := 0
@@ -285,6 +288,7 @@ func newSyncCommand(opts *rootOptions) *cobra.Command {
 	flags.StringVar(&baseDir, "base-dir", "", "store sources relative to this directory instead of their absolute path (must contain <dir>)")
 	flags.BoolVar(&noWait, "no-wait", false, "schedule indexing without waiting for completion")
 	flags.BoolVar(&noIgnore, "no-ignore", false, "index files even if they match a .amoxtlignore rule")
+	flags.BoolVar(&noFileMetadata, "no-file-metadata", false, "do not attach the file's own attributes (filename, extension, size, mtime, dirname, indexed_at) as metadata")
 	flags.BoolVar(&dryRun, "dry-run", false, "report what would be indexed and deleted without changing anything")
 	flags.DurationVar(&timeout, "timeout", 5*time.Minute, "maximum time to wait per file (0 = no timeout)")
 

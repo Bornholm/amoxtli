@@ -29,12 +29,13 @@ type addResult struct {
 
 func newAddCommand(opts *rootOptions) *cobra.Command {
 	var (
-		collection string
-		metaPairs  []string
-		baseDir    string
-		noWait     bool
-		noIgnore   bool
-		timeout    time.Duration
+		collection     string
+		metaPairs      []string
+		baseDir        string
+		noWait         bool
+		noIgnore       bool
+		noFileMetadata bool
+		timeout        time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -44,10 +45,12 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
-			metadata, err := filterexpr.ParseMetadata(metaPairs)
+			userMetadata, err := filterexpr.ParseMetadata(metaPairs)
 			if err != nil {
 				return err
 			}
+
+			metadata := docMetadata{user: userMetadata, file: !noFileMetadata}
 
 			// Sources are stored relative to --base-dir when set, so an indexed
 			// document never carries the host's absolute paths.
@@ -140,6 +143,7 @@ func newAddCommand(opts *rootOptions) *cobra.Command {
 	flags.StringVar(&baseDir, "base-dir", "", "store sources relative to this directory instead of their absolute path")
 	flags.BoolVar(&noWait, "no-wait", false, "schedule indexing without waiting for completion")
 	flags.BoolVar(&noIgnore, "no-ignore", false, "index files even if they match a .amoxtlignore rule")
+	flags.BoolVar(&noFileMetadata, "no-file-metadata", false, "do not attach the file's own attributes (filename, extension, size, mtime, dirname, indexed_at) as metadata")
 	flags.DurationVar(&timeout, "timeout", 5*time.Minute, "maximum time to wait per file (0 = no timeout)")
 
 	return cmd
@@ -178,7 +182,7 @@ func ignoredFile(path, source string) scheduledFile {
 // runner. IndexFile copies the file synchronously before returning, so the
 // handle can be closed here even though indexing continues asynchronously.
 // sources derives the stored source URL from the file's absolute path.
-func scheduleFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.CollectionID, path string, supported []string, sources *sourceMapper, metadata map[string]any) scheduledFile {
+func scheduleFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.CollectionID, path string, supported []string, sources *sourceMapper, metadata docMetadata) scheduledFile {
 	sf := scheduledFile{started: time.Now(), result: addResult{File: path}}
 
 	fail := func(err error) scheduledFile {
@@ -225,8 +229,8 @@ func scheduleFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.Collecti
 		amoxtli.WithIndexFileSource(source),
 		amoxtli.WithIndexFileETag(etag),
 	}
-	if metadata != nil {
-		indexOpts = append(indexOpts, amoxtli.WithIndexFileMetadata(metadata))
+	if attached := metadata.build(abs, info, source); len(attached) > 0 {
+		indexOpts = append(indexOpts, amoxtli.WithIndexFileMetadata(attached))
 	}
 
 	taskID, err := rt.Codex.IndexFile(cmd.Context(), collID, filepath.Base(abs), file, indexOpts...)
