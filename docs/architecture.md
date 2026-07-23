@@ -166,29 +166,61 @@ Deux règles encadrent la capacité :
   cette chaîne (bornée, pour qu'un décorateur cyclique dégrade en « capacité
   absente » plutôt que de figer la recherche).
 
-**`index/sqlitevec` implémente la capacité** (schéma v3). Deux conséquences de
-conception :
+**`index/sqlitevec` et `index/postgres` implémentent la capacité.** Les deux
+tiennent leur **propre copie des métadonnées** des documents (table dédiée,
+clé : la source), écrite à chaque (ré)indexation et supprimée avec le document :
+évaluer un filtre dans la requête impose que les valeurs y soient lisibles. Le
+store reste la source de vérité, l'index en détient une copie dérivée,
+canonicalisée par le **même** `internal/filternorm` — faute de quoi la
+comparaison de dates, du texte côté SQL, divergerait. Les documents indexés
+avant ces tables n'ont pas de ligne, ce que la traduction lit comme « aucune clé
+présente » ; ils redeviennent filtrables à leur prochaine réindexation.
 
-- **Copie locale des métadonnées.** L'index tient sa propre table
-  `document_metadata` (clé : la source), écrite à chaque (ré)indexation et
-  supprimée avec le document. Évaluer un filtre dans la requête impose que les
-  valeurs y soient lisibles : le store reste la source de vérité, l'index en
-  détient une copie dérivée. Les valeurs y sont canonicalisées par le **même**
-  `internal/filternorm` que le store, faute de quoi la comparaison de dates —
-  du texte, côté SQL — divergerait. Les documents indexés avant la v3 n'ont pas
-  de ligne, ce que la traduction lit comme « aucune clé présente » ; ils
-  redeviennent filtrables à leur prochaine réindexation.
-- **Pré-contrainte par `rowid`.** vec0 n'accepte pas de jointure externe dans sa
-  contrainte KNN, mais il honore `rowid IN (...)` *pendant* le scan. Le filtre
-  est donc traduit en une sous-requête de rowids éligibles injectée dans la
-  requête KNN : les k plus proches voisins sont choisis **parmi** les documents
-  éligibles. C'est ce qui en fait un vrai push-down et non un post-filtrage
-  déguisé.
+Chaque cast SQL est gardé par un test de type (`json_type` / `jsonb_typeof`) :
+sans la garde, comparer une valeur texte comme un nombre lèverait une erreur SQL
+là où la sémantique exige une simple absence de correspondance. Les clés sont
+toujours des paramètres liés, jamais interpolées.
 
-Chaque cast SQL est gardé par un `json_type` : sans la garde, comparer une
-valeur texte comme un nombre lèverait une erreur SQL là où la sémantique exige
-une simple absence de correspondance. Les clés sont toujours des paramètres liés,
-jamais interpolées.
+##### `index/postgres` (JSONB)
+
+Le filtre est injecté dans **les deux jambes** — plein-texte et pgvector — avant
+leur `LIMIT`, donc avant la fusion RRF interne. L'appliquer après la fusion
+laisserait un filtre sélectif vider le top-k de chaque jambe, ce que la capacité
+existe précisément pour éviter.
+
+Deux pièges spécifiques à PostgreSQL, tranchés ici :
+
+- **Pas de cast sur la donnée.** PostgreSQL ne garantit pas l'ordre d'évaluation
+  des opérandes d'un `AND` : un `(metadata->>k)::numeric` pourrait s'exécuter
+  *avant* la garde `jsonb_typeof` censée le protéger, et lever une erreur. La
+  traduction compare donc du `jsonb` à du `jsonb` (`metadata->k > to_jsonb($n::numeric)`),
+  ce qui déplace le cast sur le paramètre lié — le nôtre, toujours bien typé.
+- **Collation binaire obligatoire.** PostgreSQL compare le texte avec la
+  collation de la base ; une collation `en_US.UTF-8` ignore la ponctuation au
+  niveau primaire, et une collation ICU non déterministe peut rendre `'a' = 'A'`.
+  L'évaluateur Go compare des octets. Toutes les comparaisons de texte portent
+  donc un `COLLATE "C"` explicite — c'est aussi ce qui rend l'ordre
+  lexicographique des dates canoniques chronologique.
+
+Le `LEFT JOIN` porte sur `dm.metadata` sans `COALESCE` : une ligne absente donne
+`NULL`, tout opérateur JSON sur `NULL` donne `NULL`, et un prédicat `NULL` n'est
+pas vrai — la sémantique « aucune clé présente » sort gratuitement, et l'index
+GIN reste utilisable. Seul `NotExists` a besoin d'une branche `IS NULL`
+explicite.
+
+Un index GIN `jsonb_path_ops` couvre l'opérateur de containment ; les opérateurs
+ordonnés scannent, ce qui est acceptable puisqu'ils s'appliquent aux lignes déjà
+restreintes par la jambe plein-texte ou vectorielle.
+
+##### `index/sqlitevec` (JSON1, schéma v3)
+
+vec0 n'accepte pas de jointure externe dans sa contrainte KNN, mais il honore
+`rowid IN (...)` **pendant** le scan. Le filtre est donc traduit en une
+sous-requête de rowids éligibles injectée dans la requête KNN : les k plus
+proches voisins sont choisis *parmi* les documents éligibles. C'est ce qui en
+fait un vrai push-down et non un post-filtrage déguisé. La table
+`document_metadata` fait partie du snapshot (`backup`/`restore`), sans quoi une
+restauration rendrait l'index non filtrable.
 
 ##### Intégration au pipeline : tout ou rien
 
@@ -202,23 +234,35 @@ que la capacité existe pour empêcher.
 (`index.ConditionallyFilterable`, consultée par `AsFilterable` comme
 `Semantic()` l'est pour la transformation de requête) : vrai seulement si toutes
 les jambes sont filterables. Concrètement, une configuration **sqlitevec seul**
-pousse le filtre ; une configuration **bleve + sqlitevec** ne le pousse pas et
-retombe intégralement sur le filtrage Go, puisque bleve ne déclare pas la
-capacité (choix documenté : indexer des champs de métadonnées dans bleve
-imposerait de déclarer le mapping à la création et de réindexer à chaque
-changement de schéma).
+ou **postgres seul** pousse le filtre ; une configuration **bleve + sqlitevec**
+ne le pousse pas et retombe intégralement sur le filtrage Go, puisque bleve ne
+déclare pas la capacité (choix documenté : indexer des champs de métadonnées
+dans bleve imposerait de déclarer le mapping à la création et de réindexer à
+chaque changement de schéma).
 
 Quand le push-down est disponible, le Manager appelle `SearchFiltered` et **ne
 recharge aucune métadonnée** : ni sur-échantillonnage, ni second tour, ni requête
 store par page. C'est le contrat de `FilterableIndex` — garanti par la suite de
 conformité — qui autorise à faire confiance au backend plutôt qu'à revérifier
-son travail. Le résultat observable est identique aux deux chemins, ce que
-vérifie un test de parité (mêmes documents, même ordre, pour l'égalité, la clé
-absente, l'inégalité, les plages et les conjonctions).
+son travail.
 
-`FilterableIndex` n'est pas couverte par les garanties d'API tant que l'étape
-finale (parité de qualité mesurée sur le harnais `eval`) n'est pas franchie
-(voir [stability.md](stability.md)).
+##### Parité de qualité mesurée (`eval`)
+
+Le résultat observable ne doit pas dépendre de l'endroit où le filtre est
+appliqué. `TestPushdownEvalParity` (dans `eval/`) le mesure sur le harnais
+d'évaluation : un corpus de 120 documents, six filtres (dont clé absente,
+inégalité, plage, conjonction), et **le même backend parcouru deux fois** — une
+fois tel quel, une fois enveloppé dans un décorateur opaque qui masque la
+capacité et force ainsi le repli Go.
+
+Envelopper le même index plutôt que comparer deux backends est ce qui isole la
+variable : moteur, classement et jeu de données identiques, seule change la voie
+du filtrage. L'exigence est donc l'**égalité stricte** des nDCG et des rappels —
+pas seulement leur proximité — agrégés *et* par requête, deux écarts opposés
+pouvant s'annuler dans une moyenne.
+
+Le test a été validé par mutation : inverser la traduction SQL de `NotExists`
+le fait échouer en désignant les requêtes fautives.
 
 ### Reranking (`ingest.Reranker`)
 

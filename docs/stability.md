@@ -10,8 +10,6 @@ Tant que la version majeure est `0`, l'API n'est **pas figée** : une version
 mineure (`0.1 → 0.2`) peut introduire des changements incompatibles. Ils seront
 toujours :
 
-- annoncés dans le [CHANGELOG](../CHANGELOG.md) sous une section **Modifié** ou
-  **Supprimé** ;
 - accompagnés, quand c'est raisonnable, d'une période de dépréciation (l'ancienne
   API reste, marquée `Deprecated:`, pendant au moins une version mineure).
 
@@ -46,14 +44,17 @@ Ne font **pas** partie de la surface stable et peuvent changer à tout moment :
   (`snapshot-v1`) ;
 - le comportement exact des composants LLM (prompts, seuils), qui relève de la
   qualité et non du contrat de type ;
-- la capacité **expérimentale** `index.FilterableIndex`, ses helpers
-  (`index.AsFilterable`, `index.ConditionallyFilterable`) et la convention
-  `index.Unwrapper` pour les décorateurs : implémentées par `index/sqlitevec` et
-  intégrées au pipeline, elles restent hors garantie tant que la parité de
-  qualité entre push-down et filtrage Go n'a pas été mesurée sur le harnais
-  `eval`. Le schéma v3 de `index/sqlitevec` (table `document_metadata`) suit le
-  même statut : il se remplit à la (ré)indexation, un index antérieur reste
-  lisible mais ses documents ne sont filtrables qu'après réindexation.
+- la capacité `index.FilterableIndex`, ses helpers (`index.AsFilterable`,
+  `index.ConditionallyFilterable`) et la convention `index.Unwrapper` pour les
+  décorateurs. Elles sont implémentées par `index/sqlitevec` et `index/postgres`,
+  intégrées au pipeline et couvertes par la suite de conformité partagée
+  (`index/filtertest`) ainsi que par une parité de qualité mesurée sur le
+  harnais `eval` ; elles restent néanmoins **hors garantie** jusqu'à la
+  prochaine version mineure, le temps d'un usage réel. Les tables de métadonnées
+  ajoutées par ces deux backends (`document_metadata`,
+  `amoxtli_document_metadata`) suivent le même statut : elles se remplissent à
+  la (ré)indexation, un index antérieur reste lisible mais ses documents ne sont
+  filtrables qu'après réindexation.
 
 ## Contraintes de dépendances
 

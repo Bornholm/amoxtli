@@ -113,7 +113,7 @@ func resetDatabase(t *testing.T, ctx context.Context, connectionStr string) (*pg
 
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS amoxtli_chunk_collections, amoxtli_chunks CASCADE;`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS amoxtli_chunk_collections, amoxtli_chunks, amoxtli_document_metadata CASCADE;`); err != nil {
 		return nil, errors.Wrap(err, "failed to reset database")
 	}
 

@@ -41,6 +41,23 @@ func migrations(vectorSize int) []string {
 			);
 		`,
 		`CREATE INDEX IF NOT EXISTS amoxtli_chunk_collections_collection_idx ON amoxtli_chunk_collections (collection_id);`,
+		// This index's own copy of each document's metadata, needed to evaluate
+		// a metadata filter inside the search queries (index.FilterableIndex).
+		// A document indexed before this table existed — or carrying no
+		// metadata — simply has no row, which the filter translation reads as
+		// "no key present".
+		`
+			CREATE TABLE IF NOT EXISTS amoxtli_document_metadata (
+				source TEXT PRIMARY KEY,
+				metadata JSONB NOT NULL
+			);
+		`,
+		// jsonb_path_ops is the smaller, faster GIN variant; it only supports
+		// the containment operator, which is what equality on a string value
+		// translates to. Ordered comparisons are not indexed and scan — an
+		// acceptable trade-off, since they run on the rows already restricted
+		// by the full-text or vector leg.
+		`CREATE INDEX IF NOT EXISTS amoxtli_document_metadata_idx ON amoxtli_document_metadata USING GIN (metadata jsonb_path_ops);`,
 	}
 }
 

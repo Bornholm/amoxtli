@@ -160,6 +160,16 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 		return errors.WithStack(err)
 	}
 
+	// Refresh this index's copy of the document metadata in the same
+	// transaction as its chunks, so the two can never disagree. The delete
+	// covers the case of a document re-indexed without metadata.
+	if _, err := tx.Exec(ctx, `DELETE FROM amoxtli_document_metadata WHERE source = $1`, source.String()); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := writeDocumentMetadata(ctx, tx, source.String(), model.Metadata(document)); err != nil {
+		return errors.WithStack(err)
+	}
+
 	totalIndexed := 0
 	onChunkIndexed := func() {
 		if opts.OnProgress == nil {
@@ -359,6 +369,12 @@ func (i *Index) DeleteBySource(ctx context.Context, source *url.URL) error {
 		return errors.WithStack(err)
 	}
 
+	// A stale metadata row would let a filter match a document this index no
+	// longer holds.
+	if _, err := pool.Exec(ctx, `DELETE FROM amoxtli_document_metadata WHERE source = $1`, source.String()); err != nil {
+		return errors.WithStack(err)
+	}
+
 	return nil
 }
 
@@ -392,6 +408,27 @@ const rrfK = 60
 
 // Search implements index.Index.
 func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	return i.search(ctx, query, nil, opts)
+}
+
+// SearchFiltered implements index.FilterableIndex: the metadata filter is
+// applied inside both legs, before their fusion. Filtering after the fusion
+// would let a selective filter empty a leg's top-k — the very problem the
+// capability exists to solve — so each leg returns its own k matching rows.
+//
+// The translation is validated against the shared conformance suite
+// (index/filtertest), which is what allows this index to advertise the
+// capability.
+func (i *Index) SearchFiltered(ctx context.Context, query string, filter index.Filter, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	return i.search(ctx, query, filter, opts)
+}
+
+func (i *Index) search(ctx context.Context, query string, filter index.Filter, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	// Reject invalid keys before any SQL is built.
+	if err := filter.Validate(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	pool, err := i.getPool(ctx)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -402,14 +439,14 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 		limit = 10
 	}
 
-	ftsHits, err := i.ftsSearch(ctx, pool, query, opts, limit)
+	ftsHits, err := i.ftsSearch(ctx, pool, query, filter, opts, limit)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
 	var vecHits []chunkHit
 	if i.llm != nil {
-		vecHits, err = i.vecSearch(ctx, pool, query, opts, limit)
+		vecHits, err = i.vecSearch(ctx, pool, query, filter, opts, limit)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -479,8 +516,12 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 // stemming for the detected language and the 'simple' config) then rewritten
 // as a disjunction of lexemes, mirroring the OR semantics of a bleve match
 // query; ts_rank orders the hits.
-func (i *Index) ftsSearch(ctx context.Context, pool *pgxpool.Pool, query string, opts index.SearchOptions, limit int) ([]chunkHit, error) {
+func (i *Index) ftsSearch(ctx context.Context, pool *pgxpool.Pool, query string, filter index.Filter, opts index.SearchOptions, limit int) ([]chunkHit, error) {
 	config := detectTextSearchConfig(query, i.defaultConfig)
+
+	a := &args{}
+	configParam := a.bind(config)
+	queryParam := a.bind(query)
 
 	sql := `
 		WITH q AS (
@@ -488,31 +529,44 @@ func (i *Index) ftsSearch(ctx context.Context, pool *pgxpool.Pool, query string,
 			FROM (
 				SELECT '''' || replace(lexeme, '''', '''''') || '''' AS quoted
 				FROM unnest(tsvector_to_array(
-					to_tsvector($1::regconfig, unaccent($2)) || to_tsvector('simple', unaccent($2))
+					to_tsvector(` + configParam + `::regconfig, unaccent(` + queryParam + `)) || to_tsvector('simple', unaccent(` + queryParam + `))
 				)) AS lexeme
 			) lexemes
 		)
 		SELECT c.id, c.source, c.section_id
-		FROM amoxtli_chunks c, q
-		WHERE q.query IS NOT NULL AND c.tsv @@ q.query`
+		FROM amoxtli_chunks c
+		CROSS JOIN q`
 
-	args := []any{config, query}
+	if len(filter) > 0 {
+		sql += metadataJoin
+	}
+
+	sql += ` WHERE q.query IS NOT NULL AND c.tsv @@ q.query`
 
 	if len(opts.Collections) > 0 {
 		sql += ` AND EXISTS (
 			SELECT 1 FROM amoxtli_chunk_collections cc
-			WHERE cc.chunk_id = c.id AND cc.collection_id = ANY($3)
+			WHERE cc.chunk_id = c.id AND cc.collection_id = ANY(` + a.bind(collectionIDs(opts.Collections)) + `)
 		)`
-		args = append(args, collectionIDs(opts.Collections))
+	}
+
+	// The filter restricts the rows *before* LIMIT, so the leg returns its own
+	// top-k among matching documents rather than a top-k the filter may empty.
+	if len(filter) > 0 {
+		clause, err := buildFilterSQL(filter, a)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		sql += ` AND (` + clause + `)`
 	}
 
 	sql += fmt.Sprintf(` ORDER BY ts_rank(c.tsv, q.query) DESC LIMIT %d`, limit)
 
-	return queryChunkHits(ctx, pool, sql, args...)
+	return queryChunkHits(ctx, pool, sql, a.values...)
 }
 
 // vecSearch runs the vector leg (cosine KNN over the pgvector column).
-func (i *Index) vecSearch(ctx context.Context, pool *pgxpool.Pool, query string, opts index.SearchOptions, limit int) ([]chunkHit, error) {
+func (i *Index) vecSearch(ctx context.Context, pool *pgxpool.Pool, query string, filter index.Filter, opts index.SearchOptions, limit int) ([]chunkHit, error) {
 	res, err := i.llm.Embeddings(ctx, []string{query})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -523,24 +577,39 @@ func (i *Index) vecSearch(ctx context.Context, pool *pgxpool.Pool, query string,
 		return nil, errors.WithStack(err)
 	}
 
+	a := &args{}
+	vecParam := a.bind(vectorLiteral(vec))
+
 	sql := `
 		SELECT c.id, c.source, c.section_id
-		FROM amoxtli_chunks c
-		WHERE c.embedding IS NOT NULL`
+		FROM amoxtli_chunks c`
 
-	args := []any{vectorLiteral(vec)}
+	if len(filter) > 0 {
+		sql += metadataJoin
+	}
+
+	sql += ` WHERE c.embedding IS NOT NULL`
 
 	if len(opts.Collections) > 0 {
 		sql += ` AND EXISTS (
 			SELECT 1 FROM amoxtli_chunk_collections cc
-			WHERE cc.chunk_id = c.id AND cc.collection_id = ANY($2)
+			WHERE cc.chunk_id = c.id AND cc.collection_id = ANY(` + a.bind(collectionIDs(opts.Collections)) + `)
 		)`
-		args = append(args, collectionIDs(opts.Collections))
 	}
 
-	sql += fmt.Sprintf(` ORDER BY c.embedding <=> $1::vector LIMIT %d`, limit)
+	// Same reasoning as the full-text leg: filtering before LIMIT keeps the
+	// KNN's k slots for matching documents.
+	if len(filter) > 0 {
+		clause, err := buildFilterSQL(filter, a)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		sql += ` AND (` + clause + `)`
+	}
 
-	return queryChunkHits(ctx, pool, sql, args...)
+	sql += fmt.Sprintf(` ORDER BY c.embedding <=> %s::vector LIMIT %d`, vecParam, limit)
+
+	return queryChunkHits(ctx, pool, sql, a.values...)
 }
 
 func queryChunkHits(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) ([]chunkHit, error) {
