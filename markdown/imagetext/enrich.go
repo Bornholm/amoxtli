@@ -176,7 +176,7 @@ func collectImages(data []byte) []*imageOccurrence {
 // blockRange returns the source range of the closest enclosing block owning
 // source lines (the paragraph or heading carrying the image).
 func blockRange(n ast.Node) (start, end int, ok bool) {
-	for current := ast.Node(n); current != nil; current = current.Parent() {
+	for current := n; current != nil; current = current.Parent() {
 		if current.Type() != ast.TypeBlock {
 			continue
 		}

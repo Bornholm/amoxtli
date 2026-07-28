@@ -239,19 +239,19 @@ func writeAtomically(path string, data []byte) error {
 
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name())
 
 		return errors.WithStack(err)
 	}
 
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name())
 
 		return errors.WithStack(err)
 	}
 
 	if err := os.Rename(tmp.Name(), path); err != nil {
-		os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name())
 
 		return errors.WithStack(err)
 	}
