@@ -1,0 +1,17 @@
+name: Integration
+
+# Container-backed integration tests (docker + model pull): manual trigger only.
+on:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - run: AMOXTLI_TEST_OLLAMA=1 go test ./index/sqlitevec/ -timeout 20m
+      - run: AMOXTLI_TEST_POSTGRES=1 AMOXTLI_TEST_OLLAMA=1 go test ./index/postgres/ -timeout 20m
+      - run: AMOXTLI_TEST_POSTGRES=1 go test ./ingest/gorm/ -timeout 10m
