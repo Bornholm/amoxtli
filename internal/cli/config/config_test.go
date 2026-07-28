@@ -275,3 +275,227 @@ func TestLoadWithDotEnv(t *testing.T) {
 		t.Errorf("expected api key from environment, got %q", cfg.LLM.Chat.APIKey)
 	}
 }
+
+func TestVisionConverterConfig(t *testing.T) {
+	raw := `
+version: 1
+converter:
+  vision:
+    enabled: true
+    chat:
+      provider: openrouter
+      model: qwen/qwen2.5-vl-72b-instruct
+      api_key: ${API_KEY}
+    extensions: [.png, .webp]
+    max_image_size: 1048576
+`
+
+	cfg, err := Parse(raw, func(string) (string, bool) { return "secret", true })
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %+v", err)
+	}
+
+	if !cfg.VisionEnabled() {
+		t.Error("expected the vision converter to be enabled")
+	}
+
+	chat := cfg.VisionChat()
+	if chat == nil || chat.Model != "qwen/qwen2.5-vl-72b-instruct" {
+		t.Errorf("VisionChat(): expected the dedicated client, got %+v", chat)
+	}
+
+	if e, g := 2, len(cfg.VisionExtensions()); e != g {
+		t.Errorf("len(VisionExtensions()): expected %d, got %d", e, g)
+	}
+}
+
+func TestVisionConverterFallsBackToChatClient(t *testing.T) {
+	raw := `
+version: 1
+llm:
+  chat:
+    provider: openai
+    model: gpt-image-reader
+converter:
+  vision:
+    enabled: true
+`
+
+	cfg, err := Parse(raw, noEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %+v", err)
+	}
+
+	if chat := cfg.VisionChat(); chat == nil || chat.Model != "gpt-image-reader" {
+		t.Errorf("VisionChat(): expected the llm.chat fallback, got %+v", chat)
+	}
+
+	// No explicit extensions: the built-in image list applies.
+	if len(cfg.VisionExtensions()) == 0 {
+		t.Error("VisionExtensions(): expected the built-in defaults")
+	}
+}
+
+func TestVisionConverterRequiresChatClient(t *testing.T) {
+	raw := `
+version: 1
+converter:
+  vision:
+    enabled: true
+`
+
+	// Parse validates: the misconfiguration is caught at load time.
+	_, err := Parse(raw, noEnv)
+	if err == nil {
+		t.Fatal("expected a validation error when no chat client is available")
+	}
+
+	if !strings.Contains(err.Error(), "converter.vision") {
+		t.Errorf("expected the error to mention converter.vision, got %q", err)
+	}
+}
+
+func TestVisionConverterRejectsExtensionWithoutDot(t *testing.T) {
+	raw := `
+version: 1
+llm:
+  chat:
+    provider: openai
+    model: some-model
+converter:
+  vision:
+    enabled: true
+    extensions: [png]
+`
+
+	if _, err := Parse(raw, noEnv); err == nil {
+		t.Fatal("expected a validation error for an extension without a leading dot")
+	}
+}
+
+func TestEmbeddedVisionConfig(t *testing.T) {
+	raw := `
+version: 1
+llm:
+  chat:
+    provider: openai
+    model: some-vision-model
+converter:
+  vision:
+    enabled: true
+    embedded:
+      enabled: true
+      min_dimensions: 96
+      max_images_per_document: 8
+      concurrency: 4
+`
+
+	cfg, err := Parse(raw, noEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	if !cfg.EmbeddedVisionEnabled() {
+		t.Error("expected the embedded image enrichment to be enabled")
+	}
+
+	embedded := cfg.Converter.Vision.Embedded
+	if embedded.MinDimensions != 96 || embedded.MaxImagesPerDocument != 8 || embedded.Concurrency != 4 {
+		t.Errorf("embedded config: got %+v", embedded)
+	}
+}
+
+func TestEmbeddedVisionRequiresVisionConverter(t *testing.T) {
+	raw := `
+version: 1
+llm:
+  chat:
+    provider: openai
+    model: some-model
+converter:
+  vision:
+    enabled: false
+    embedded:
+      enabled: true
+`
+
+	_, err := Parse(raw, noEnv)
+	if err == nil {
+		t.Fatal("expected a validation error when the vision converter is disabled")
+	}
+
+	if !strings.Contains(err.Error(), "converter.vision.embedded") {
+		t.Errorf("expected the error to mention converter.vision.embedded, got %q", err)
+	}
+}
+
+func TestImagesConfig(t *testing.T) {
+	testCases := []struct {
+		Name           string
+		Raw            string
+		ExpectedDriver string
+		Enabled        bool
+	}{
+		{
+			Name:           "auto with sqlite store and vision",
+			Raw:            "version: 1\nllm:\n  chat:\n    provider: openai\n    model: m\nconverter:\n  vision:\n    enabled: true\n",
+			ExpectedDriver: ImageStoreFS,
+			Enabled:        true,
+		},
+		{
+			Name:           "auto with postgres store and vision",
+			Raw:            "version: 1\nstore:\n  driver: postgres\n  dsn: postgres://u:p@localhost:5432/db\nllm:\n  chat:\n    provider: openai\n    model: m\nconverter:\n  vision:\n    enabled: true\n",
+			ExpectedDriver: ImageStoreDatabase,
+			Enabled:        true,
+		},
+		{
+			Name:           "auto without vision",
+			Raw:            "version: 1\n",
+			ExpectedDriver: ImageStoreFS,
+			Enabled:        false,
+		},
+		{
+			Name:           "explicit backend without vision",
+			Raw:            "version: 1\nimages:\n  store: fs\n",
+			ExpectedDriver: ImageStoreFS,
+			Enabled:        true,
+		},
+		{
+			Name:           "none with vision",
+			Raw:            "version: 1\nllm:\n  chat:\n    provider: openai\n    model: m\nconverter:\n  vision:\n    enabled: true\nimages:\n  store: none\n",
+			ExpectedDriver: ImageStoreNone,
+			Enabled:        false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			cfg, err := Parse(tc.Raw, noEnv)
+			if err != nil {
+				t.Fatalf("unexpected error: %+v", err)
+			}
+
+			if e, g := tc.ExpectedDriver, cfg.ImageStoreDriver(); e != g {
+				t.Errorf("ImageStoreDriver(): expected %q, got %q", e, g)
+			}
+
+			if e, g := tc.Enabled, cfg.ImagesEnabled(); e != g {
+				t.Errorf("ImagesEnabled(): expected %v, got %v", e, g)
+			}
+		})
+	}
+}
+
+func TestImagesConfigRejectsUnknownBackend(t *testing.T) {
+	if _, err := Parse("version: 1\nimages:\n  store: s3\n", noEnv); err == nil {
+		t.Fatal("expected a validation error for an unknown backend")
+	}
+}

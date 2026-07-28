@@ -4,9 +4,11 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/convert"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/ingest"
+	"github.com/bornholm/amoxtli/markdown/imagetext"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/sourcecode"
@@ -51,6 +53,9 @@ type options struct {
 	stageClients       map[Stage]llm.Client
 	fileConverter      convert.Converter
 	sourceCode         *sourcecode.Registry
+	imageEnrichment    bool
+	imageEnrichOptions []imagetext.OptionFunc
+	blobs              blob.Store
 	maxWordsPerSection int
 	maxTotalWords      int
 	maxSectionWords    int
@@ -181,6 +186,48 @@ func WithFileConverter(fc convert.Converter) Option {
 func WithSourceCode(registry *sourcecode.Registry) Option {
 	return func(o *options) {
 		o.sourceCode = registry
+	}
+}
+
+// WithImageEnrichment describes the images embedded in indexed documents with
+// a vision LLM and inserts the descriptions, as text, next to each image —
+// making them findable through the same full-text and semantic search as the
+// rest of the document. It applies to native markdown files as well as to the
+// output of the file converters (pandoc, LibreOffice, GenAI OCR); source files
+// are left alone.
+//
+// Without an explicit describer, one is built from the LLM client set by
+// WithLLMClient, which must then support image attachments. Pass a dedicated
+// vision model — and the description cache — with imagetext.WithDescriber:
+//
+//	amoxtli.WithImageEnrichment(
+//	    imagetext.WithDescriber(vision.NewLLMDescriber(visionClient)),
+//	    imagetext.WithMaxImagesPerDocument(16),
+//	)
+//
+// Relative image paths are resolved against the directory of the indexed file
+// (file: sources only) and strictly confined to it; remote images are never
+// fetched unless imagetext.WithHTTPFetcher is given.
+func WithImageEnrichment(funcs ...imagetext.OptionFunc) Option {
+	return func(o *options) {
+		o.imageEnrichment = true
+		o.imageEnrichOptions = append(o.imageEnrichOptions, funcs...)
+	}
+}
+
+// WithBlobStore makes indexed images displayable again, not merely searchable:
+// each described image is stored, content-addressed, and referenced in the
+// document by the internal URI `amoxtli://images/<hash>`. Unlike a data URI
+// that destination survives the rendering of a chunk, so a consumer (typically
+// an MCP agent) sees the reference next to the description and can fetch the
+// bytes back.
+//
+// It also feeds the image enrichment (WithImageEnrichment) unless that one was
+// given a store of its own, and lets the cleanup task collect the blobs no
+// document references any more.
+func WithBlobStore(store blob.Store) Option {
+	return func(o *options) {
+		o.blobs = store
 	}
 }
 

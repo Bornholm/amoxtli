@@ -78,7 +78,7 @@ func NewStore(db *gorm.DB) *Store {
 	return &Store{
 		db: db,
 		getDatabase: createGetDatabase(db,
-			&Document{}, &Section{}, &Collection{},
+			&Document{}, &Section{}, &Collection{}, &DocumentBlob{},
 		),
 	}
 }

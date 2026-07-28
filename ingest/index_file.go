@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -129,10 +130,23 @@ func IndexFileTaskFactory(id task.ID, payload []byte) (task.Task, error) {
 
 const indexFileTaskTimeout = 2 * time.Hour
 
+// ImageEnricher inserts, in the markdown source of a document, the textual
+// description of the images it embeds — making them searchable like any other
+// text. It is satisfied by markdown/imagetext.Enricher.
+//
+// baseDir is the directory relative image paths resolve against (empty
+// disables their resolution) and progress, when non-nil, is called as
+// descriptions complete. Implementations must be tolerant: an image that
+// cannot be described is left alone rather than failing the document.
+type ImageEnricher interface {
+	Enrich(ctx context.Context, data []byte, baseDir string, progress func(done, total int)) ([]byte, error)
+}
+
 type IndexFileHandler struct {
 	store             Store
 	fileConverter     convert.Converter
 	sourceCode        *sourcecode.Registry
+	imageEnricher     ImageEnricher
 	index             index.Index
 	maxWordPerSection int
 }
@@ -144,6 +158,16 @@ type IndexFileHandlerOptionFunc func(h *IndexFileHandler)
 func WithIndexFileHandlerSourceCode(registry *sourcecode.Registry) IndexFileHandlerOptionFunc {
 	return func(h *IndexFileHandler) {
 		h.sourceCode = registry
+	}
+}
+
+// WithIndexFileHandlerImageEnrichment describes the images embedded in the
+// markdown source of a document before it is parsed — so it applies uniformly
+// to native .md files and to the output of the converters (pandoc,
+// LibreOffice, GenAI OCR). A nil enricher disables it.
+func WithIndexFileHandlerImageEnrichment(enricher ImageEnricher) IndexFileHandlerOptionFunc {
+	return func(h *IndexFileHandler) {
+		h.imageEnricher = enricher
 	}
 }
 
@@ -181,6 +205,51 @@ func (h *IndexFileHandler) isSourceCode(ext string) bool {
 	_, exists := h.sourceCode.Lookup(ext)
 
 	return exists
+}
+
+// enrichImages describes the images embedded in the markdown source. It is
+// best-effort: only a context error (the 2h task timeout, a cancellation) can
+// fail the document — anything else leaves the source as it is.
+func (h *IndexFileHandler) enrichImages(ctx context.Context, indexFileTask *IndexFileTask, data []byte, events chan task.Event) ([]byte, error) {
+	progress := func(done, total int) {
+		if total <= 0 {
+			return
+		}
+
+		events <- task.NewEvent(
+			task.WithMessage(fmt.Sprintf("describing images (%d/%d)", done, total)),
+			// Image description sits between the conversion (0.05) and the
+			// parsing (0.1) of the document.
+			task.WithProgress(0.05+0.05*float32(done)/float32(total)),
+		)
+	}
+
+	enriched, err := h.imageEnricher.Enrich(ctx, data, imageBaseDir(indexFileTask.source), progress)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		slog.WarnContext(ctx, "could not describe document images, indexing it as is",
+			slog.Any("error", errors.WithStack(err)),
+		)
+
+		return data, nil
+	}
+
+	return enriched, nil
+}
+
+// imageBaseDir returns the directory relative image paths resolve against: the
+// directory of the *original* file, not of the staged copy the handler works
+// on. Only file: sources yield one — for any other scheme there is no local
+// directory to resolve against.
+func imageBaseDir(source *url.URL) string {
+	if source == nil || source.Scheme != "file" || source.Path == "" {
+		return ""
+	}
+
+	return filepath.Dir(source.Path)
 }
 
 // Handle implements [task.Handler].
@@ -256,11 +325,22 @@ func (h *IndexFileHandler) Handle(ctx context.Context, tsk task.Task, events cha
 					return errors.WithStack(err)
 				}
 
+				ext := filepath.Ext(indexFileTask.originalName)
+
+				// Images are described on the markdown source, before parsing:
+				// source files are excluded, they never go through markdown.
+				if h.imageEnricher != nil && !h.isSourceCode(ext) {
+					data, err = h.enrichImages(ctx, indexFileTask, data, events)
+					if err != nil {
+						return errors.WithStack(err)
+					}
+				}
+
 				events <- task.NewEvent(task.WithMessage("parsing document"))
 
 				var doc parsedDocument
 
-				if ext := filepath.Ext(indexFileTask.originalName); h.isSourceCode(ext) {
+				if h.isSourceCode(ext) {
 					doc, err = sourcecode.Parse(
 						indexFileTask.originalName,
 						data,

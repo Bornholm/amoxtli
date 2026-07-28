@@ -1,6 +1,7 @@
 package markdown
 
 import (
+	"log/slog"
 	"net/url"
 	"slices"
 
@@ -99,6 +100,10 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 		}
 
 		document.source = source
+	}
+
+	if documentMetadata := hoistMetadata(metadata); len(documentMetadata) > 0 {
+		document.SetMetadata(documentMetadata)
 	}
 
 	split := false
@@ -231,6 +236,62 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 	}
 
 	return document, nil
+}
+
+// hoistMetadata lifts the YAML frontmatter into the document metadata, so that
+// a converter which only produces markdown (e.g. convert/vision emitting
+// `type: image`) can tag its documents for search-time filtering — symmetrical
+// to what sourcecode.Parse does with type=code/language.
+//
+// Only scalars survive: metadata are compared as JSON values by the index
+// backends, so values are normalized to string/float64/bool and composite
+// values (lists, maps) are dropped. The "source" key is excluded: it is the
+// document source URL, handled separately.
+func hoistMetadata(frontmatter map[string]any) map[string]any {
+	if len(frontmatter) == 0 {
+		return nil
+	}
+
+	metadata := make(map[string]any, len(frontmatter))
+
+	for key, rawValue := range frontmatter {
+		if key == "source" {
+			continue
+		}
+
+		value, ok := normalizeMetadataValue(rawValue)
+		if !ok {
+			slog.Debug("ignoring non-scalar frontmatter metadata", slog.String("key", key))
+			continue
+		}
+
+		metadata[key] = value
+	}
+
+	return metadata
+}
+
+// normalizeMetadataValue maps a YAML scalar onto its JSON equivalent,
+// reporting false for composite values.
+func normalizeMetadataValue(value any) (any, bool) {
+	switch v := value.(type) {
+	case string:
+		return v, true
+	case bool:
+		return v, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	default:
+		return nil, false
+	}
 }
 
 func findClosestAncestor(from *Section, level uint) *Section {

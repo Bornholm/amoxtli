@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	visionconv "github.com/bornholm/amoxtli/convert/vision"
 	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v3"
@@ -21,6 +22,81 @@ type Config struct {
 	Retrieval RetrievalConfig `yaml:"retrieval"`
 	Converter ConverterConfig `yaml:"converter"`
 	Indexing  IndexingConfig  `yaml:"indexing"`
+	Images    ImagesConfig    `yaml:"images"`
+}
+
+// ImagesConfig configures the storage of the images referenced by the indexed
+// documents, which is what makes them displayable again (MCP fetch_image)
+// rather than merely searchable.
+type ImagesConfig struct {
+	// Store selects the backend: "auto" (the default), "fs", "database" or
+	// "none". Auto follows the document store: "database" when it is
+	// PostgreSQL (one server to back up), "fs" when it is SQLite (keeping the
+	// bytes out of a file bleve and sqlite-vec already sit next to).
+	Store string `yaml:"store"`
+	// Path is the directory of the "fs" backend, relative to the .amoxtli
+	// directory (default "blobs").
+	Path string `yaml:"path"`
+	// MaxSize bounds the size of a stored image, in bytes; 0 defers to the
+	// library default (10 MiB, aligned with converter.vision.max_image_size).
+	MaxSize int64 `yaml:"max_size"`
+}
+
+// Image store backends.
+const (
+	ImageStoreAuto     = "auto"
+	ImageStoreFS       = "fs"
+	ImageStoreDatabase = "database"
+	ImageStoreNone     = "none"
+)
+
+// ImageStores lists the accepted images.store values.
+var ImageStores = []string{ImageStoreAuto, ImageStoreFS, ImageStoreDatabase, ImageStoreNone}
+
+// DefaultImagesPath is the blob directory used when images.path is left empty,
+// relative to the .amoxtli directory.
+const DefaultImagesPath = "blobs"
+
+// ImageStoreDriver resolves the images.store toggle: "auto" picks "database"
+// when the document store is PostgreSQL — everything in one server — and "fs"
+// otherwise.
+func (c *Config) ImageStoreDriver() string {
+	switch c.Images.Store {
+	case ImageStoreFS, ImageStoreDatabase, ImageStoreNone:
+		return c.Images.Store
+	default:
+		if c.Store.Driver == "postgres" {
+			return ImageStoreDatabase
+		}
+
+		return ImageStoreFS
+	}
+}
+
+// ImagesEnabled reports whether images must be stored. An explicit backend is
+// an opt-in on its own (the library API can store images without the
+// converter); left to "auto", storage follows the vision converter, since
+// nothing would produce image references without it.
+func (c *Config) ImagesEnabled() bool {
+	switch c.Images.Store {
+	case ImageStoreNone:
+		return false
+	case ImageStoreFS, ImageStoreDatabase:
+		return true
+	default:
+		return c.VisionEnabled()
+	}
+}
+
+// ImagesPath returns the configured blob directory, falling back to
+// DefaultImagesPath. The path may be relative to the .amoxtli directory
+// (resolve it with workspace.Resolve).
+func (c *Config) ImagesPath() string {
+	if c.Images.Path != "" {
+		return c.Images.Path
+	}
+
+	return DefaultImagesPath
 }
 
 type StoreConfig struct {
@@ -215,9 +291,63 @@ type DecompositionConfig struct {
 }
 
 type ConverterConfig struct {
-	Pandoc      PandocConfig         `yaml:"pandoc"`
-	LibreOffice LibreOfficeConfig    `yaml:"libreoffice"`
-	GenAI       GenAIConverterConfig `yaml:"genai"`
+	Pandoc      PandocConfig          `yaml:"pandoc"`
+	LibreOffice LibreOfficeConfig     `yaml:"libreoffice"`
+	GenAI       GenAIConverterConfig  `yaml:"genai"`
+	Vision      VisionConverterConfig `yaml:"vision"`
+}
+
+// VisionConverterConfig configures the description of image files by a vision
+// LLM: each image becomes a markdown document (title, description, visible
+// text) tagged with type=image, searchable like any other document.
+//
+// Extensions are routed before converter.genai (see convert.Routed and
+// runtime.newFileConverter): an extension listed here wins over the same
+// extension listed under converter.genai.
+type VisionConverterConfig struct {
+	// Enabled turns on the vision converter. It is opt-in and requires a chat
+	// client: the dedicated one below, or llm.chat.
+	Enabled bool `yaml:"enabled"`
+	// Chat is a dedicated chat client pointing at a vision-capable model.
+	// When absent, llm.chat is reused — which then must itself support image
+	// attachments.
+	Chat *ClientConfig `yaml:"chat"`
+	// Extensions are routed to this converter; empty defers to the built-in
+	// list (see VisionExtensions).
+	Extensions []string `yaml:"extensions"`
+	// MaxImageSize bounds the size of an image sent to the model, in bytes;
+	// 0 defers to the library default (10 MiB). Oversized files are rejected
+	// before any call.
+	MaxImageSize int64 `yaml:"max_image_size"`
+	// Prompt replaces the built-in description prompt. It is part of the
+	// description cache key, so changing it invalidates previous descriptions.
+	Prompt string `yaml:"prompt"`
+	// Embedded describes the images embedded in documents, on top of the
+	// standalone image files handled by the converter itself.
+	Embedded EmbeddedVisionConfig `yaml:"embedded"`
+}
+
+// EmbeddedVisionConfig configures the description of the images embedded in
+// markdown documents (native .md as well as converter output: pandoc,
+// LibreOffice, GenAI OCR). The description is inserted as text next to the
+// image, so it is indexed and searched like the rest of the document.
+//
+// Relative image paths are resolved against the directory of the indexed file
+// and strictly confined to it; remote (http/https) images are never fetched.
+type EmbeddedVisionConfig struct {
+	// Enabled turns on the enrichment. It requires converter.vision.enabled.
+	Enabled bool `yaml:"enabled"`
+	// MinDimensions is the smallest accepted side, in pixels: below it an
+	// image is an icon or a bullet, never content. 0 defers to the library
+	// default (64).
+	MinDimensions int `yaml:"min_dimensions"`
+	// MaxImagesPerDocument bounds the number of distinct images described per
+	// document — the main cost lever on image-rich corpora. 0 defers to the
+	// library default (32).
+	MaxImagesPerDocument int `yaml:"max_images_per_document"`
+	// Concurrency bounds the parallel descriptions of a single document. 0
+	// defers to the library default (2).
+	Concurrency int `yaml:"concurrency"`
 }
 
 type PandocConfig struct {
@@ -402,6 +532,43 @@ func (c *Config) CodeEnabled() bool {
 	return c.Indexing.Code.Enabled.Resolve(true)
 }
 
+// VisionEnabled reports whether image files should be described by a vision
+// LLM and indexed as markdown.
+func (c *Config) VisionEnabled() bool {
+	return c.Converter.Vision.Enabled
+}
+
+// EmbeddedVisionEnabled reports whether the images embedded in documents must
+// be described too. It depends on the vision converter being enabled.
+func (c *Config) EmbeddedVisionEnabled() bool {
+	return c.VisionEnabled() && c.Converter.Vision.Embedded.Enabled
+}
+
+// VisionChat resolves the chat client used to describe images: the dedicated
+// converter.vision.chat when set, llm.chat otherwise, nil when neither is
+// configured.
+func (c *Config) VisionChat() *ClientConfig {
+	if cfg := c.Converter.Vision.Chat; cfg != nil && cfg.Model != "" {
+		return cfg
+	}
+
+	if c.HasChat() {
+		return c.LLM.Chat
+	}
+
+	return nil
+}
+
+// VisionExtensions returns the extensions routed to the vision converter,
+// falling back to the built-in image list.
+func (c *Config) VisionExtensions() []string {
+	if len(c.Converter.Vision.Extensions) > 0 {
+		return c.Converter.Vision.Extensions
+	}
+
+	return visionconv.DefaultExtensions
+}
+
 // Validate checks cross-field constraints and rejects combinations that
 // would fail later with an obscure error.
 func (c *Config) Validate() error {
@@ -488,6 +655,30 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.Converter.Vision.Enabled {
+		if c.VisionChat() == nil {
+			return errors.New("converter.vision.enabled is true but no chat client is available: configure converter.vision.chat or llm.chat")
+		}
+		for _, ext := range c.Converter.Vision.Extensions {
+			if !strings.HasPrefix(ext, ".") {
+				return errors.Errorf("converter.vision.extensions: extension %q must start with a dot", ext)
+			}
+		}
+		if c.Converter.Vision.MaxImageSize < 0 {
+			return errors.New("converter.vision.max_image_size must not be negative")
+		}
+	} else if c.Converter.Vision.Embedded.Enabled {
+		return errors.New("converter.vision.embedded.enabled is true but converter.vision.enabled is false")
+	}
+
+	if s := c.Images.Store; s != "" && !slices.Contains(ImageStores, s) {
+		return errors.Errorf("images.store: unknown backend %q (supported: %v)", s, ImageStores)
+	}
+
+	if c.Images.MaxSize < 0 {
+		return errors.New("images.max_size must not be negative")
+	}
+
 	if len(c.LLM.Stages) > 0 && !c.HasChat() {
 		return errors.New("llm.stages requires llm.chat to be configured (stages override the default chat client)")
 	}
@@ -498,6 +689,7 @@ func (c *Config) Validate() error {
 	}{
 		{"llm.chat", c.LLM.Chat},
 		{"llm.embeddings", c.LLM.Embeddings},
+		{"converter.vision.chat", c.Converter.Vision.Chat},
 	}
 
 	for name, stage := range c.LLM.Stages {

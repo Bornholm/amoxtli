@@ -98,6 +98,18 @@ func (s *Store) DeleteDocumentByID(ctx context.Context, ids ...model.DocumentID)
 			return errors.WithStack(err)
 		}
 
+		documentIDs := make([]string, 0, len(ids))
+		for _, id := range ids {
+			documentIDs = append(documentIDs, string(id))
+		}
+
+		// Deleted explicitly rather than left to the foreign key, on the model
+		// of the sections above: the cleanup must behave identically whatever
+		// the dialect and whatever the state of the constraints.
+		if err := deleteBlobReferences(db, documentIDs...); err != nil {
+			return errors.WithStack(err)
+		}
+
 		if err := db.Model(&Document{}).Delete("id in ?", ids).Error; err != nil {
 			return errors.WithStack(err)
 		}
@@ -586,6 +598,13 @@ func (s *Store) SaveDocuments(ctx context.Context, documents ...model.Document) 
 			}
 
 			if existing.ID != "" {
+				// Re-indexing replaces the document: its previous references
+				// must go with it, or the blob garbage collector would keep
+				// images the new content no longer mentions.
+				if err := deleteBlobReferences(db, existing.ID); err != nil {
+					return errors.WithStack(err)
+				}
+
 				if err := db.Delete(&existing).Error; err != nil {
 					return errors.WithStack(err)
 				}
@@ -598,6 +617,13 @@ func (s *Store) SaveDocuments(ctx context.Context, documents ...model.Document) 
 
 			if res := db.Omit("Sections").Create(document); res.Error != nil {
 				return errors.WithStack(res.Error)
+			}
+
+			// Same transaction as the document itself: the derived index can
+			// never survive a write that was rolled back, nor miss one that
+			// committed.
+			if err := saveBlobReferences(db, document); err != nil {
+				return errors.WithStack(err)
 			}
 
 			for _, s := range document.Sections {

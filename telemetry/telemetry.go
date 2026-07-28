@@ -1,7 +1,8 @@
 // Package telemetry wires amoxtli to OpenTelemetry. It exposes a shared tracer
 // and meter under a single instrumentation scope, plus lazily-created metric
-// instruments for the two things worth watching in a RAG library: search
-// latency and LLM cost (call count, latency, token usage).
+// instruments for the things worth watching in a RAG library: search latency,
+// LLM cost (call count, latency, token usage) and image description volume
+// (descriptions produced, cache hits, failures).
 //
 // Instrumentation is always on but cheap: when the process has not installed a
 // TracerProvider/MeterProvider, OpenTelemetry's global no-op providers are used
@@ -31,6 +32,23 @@ const (
 	AttrQueryLength = "amoxtli.search.query_length"
 	// AttrResultCount is the number of results returned by a search.
 	AttrResultCount = "amoxtli.search.result_count"
+	// AttrVisionOutcome labels how an image description ended: "ok",
+	// "error" or "rejected" (refused before any call, e.g. an oversized
+	// image).
+	AttrVisionOutcome = "amoxtli.vision.outcome"
+	// AttrVisionCacheResult labels a description cache lookup: "hit" or
+	// "miss".
+	AttrVisionCacheResult = "amoxtli.vision.cache_result"
+)
+
+// Values of AttrVisionOutcome and AttrVisionCacheResult.
+const (
+	VisionOutcomeOK       = "ok"
+	VisionOutcomeError    = "error"
+	VisionOutcomeRejected = "rejected"
+
+	VisionCacheHit  = "hit"
+	VisionCacheMiss = "miss"
 )
 
 // Tracer returns amoxtli's shared tracer from the global provider.

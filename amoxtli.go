@@ -12,15 +12,18 @@ import (
 	"time"
 
 	"github.com/bornholm/amoxtli/backup"
+	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/index/pipeline"
 	"github.com/bornholm/amoxtli/ingest"
 	"github.com/bornholm/amoxtli/llmx"
+	"github.com/bornholm/amoxtli/markdown/imagetext"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/task"
 	taskGorm "github.com/bornholm/amoxtli/task/gorm"
 	taskMemory "github.com/bornholm/amoxtli/task/memory"
 	"github.com/bornholm/amoxtli/telemetry"
+	"github.com/bornholm/amoxtli/vision"
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/pkg/errors"
@@ -42,6 +45,7 @@ type Codex struct {
 	manager           *ingest.Manager
 	index             index.Index
 	store             ingest.Store
+	blobs             blob.Store
 	taskRunner        task.Runner
 	evaluator         retrieval.EvidenceEvaluator
 	groundingFailOpen bool
@@ -172,6 +176,36 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	if opts.sourceCode != nil {
 		managerOpts = append(managerOpts, ingest.WithManagerSourceCode(opts.sourceCode))
 	}
+	if opts.blobs != nil {
+		managerOpts = append(managerOpts, ingest.WithManagerBlobStore(opts.blobs))
+	}
+	if opts.imageEnrichment {
+		enrichOptions := opts.imageEnrichOptions
+
+		// A blob store declared on the codex feeds the enrichment, unless the
+		// caller gave it one of its own.
+		if opts.blobs != nil && imagetext.NewOptions(enrichOptions...).Blobs == nil {
+			enrichOptions = append(
+				[]imagetext.OptionFunc{imagetext.WithBlobStore(opts.blobs)},
+				enrichOptions...,
+			)
+		}
+
+		// Without an explicit describer, the codex LLM client serves as the
+		// vision model — it must then accept image attachments.
+		if imagetext.NewOptions(enrichOptions...).Describer == nil {
+			if opts.llmClient == nil {
+				return nil, errors.New("amoxtli: WithImageEnrichment requires either imagetext.WithDescriber or WithLLMClient")
+			}
+
+			enrichOptions = append(
+				[]imagetext.OptionFunc{imagetext.WithDescriber(vision.NewLLMDescriber(opts.llmClient))},
+				enrichOptions...,
+			)
+		}
+
+		managerOpts = append(managerOpts, ingest.WithManagerImageEnrichment(imagetext.New(enrichOptions...)))
+	}
 	if rerankClient := opts.clientFor(StageRerank); opts.reranking && rerankClient != nil {
 		managerOpts = append(managerOpts,
 			ingest.WithManagerReranker(retrieval.NewLLMReranker(rerankClient, store, opts.maxTotalWords,
@@ -197,6 +231,7 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	codex.manager = manager
 	codex.index = idx
 	codex.store = store
+	codex.blobs = opts.blobs
 	codex.taskRunner = taskRunner
 
 	// The fused evidence evaluator (relevance filtering + grounding verdict) is
@@ -550,8 +585,8 @@ func (c *Codex) Reindex(ctx context.Context) (task.ID, error) {
 	return taskID, nil
 }
 
-// Backup streams a snapshot of the index and the document store as a
-// multipart archive.
+// Backup streams a snapshot of the index, the document store and — when one is
+// configured — the blob store, as a multipart archive.
 func (c *Codex) Backup(ctx context.Context) (io.ReadCloser, error) {
 	reader, err := c.compositeSnapshotable().GenerateSnapshot(ctx)
 	if err != nil {
@@ -581,6 +616,12 @@ func (c *Codex) compositeSnapshotable() *backup.Composite {
 		snapshotables = append(snapshotables, backup.WithSnapshotID("store-v1", snapshotableStore))
 	}
 
+	// Documents reference their images by hash: restoring the documents without
+	// the blobs would leave dead references, so the two travel together.
+	if c.blobs != nil {
+		snapshotables = append(snapshotables, backup.WithSnapshotID("blobs-v1", blob.NewSnapshotter(c.blobs)))
+	}
+
 	return backup.ComposeSnapshots(c.snapshotBoundary, snapshotables...)
 }
 
@@ -592,6 +633,13 @@ func (c *Codex) Manager() *ingest.Manager {
 // Index returns the underlying index.Index for advanced usage.
 func (c *Codex) Index() index.Index {
 	return c.index
+}
+
+// Blobs returns the configured blob store (WithBlobStore), or nil. Consumers
+// use it to serve back the images referenced by `amoxtli://images/<hash>` in
+// the content of the sections they retrieve.
+func (c *Codex) Blobs() blob.Store {
+	return c.blobs
 }
 
 // Close stops the task runner, waiting up to the configured close timeout

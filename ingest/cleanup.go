@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/task"
@@ -82,13 +83,31 @@ func CleanupTaskFactory(id task.ID, payload []byte) (task.Task, error) {
 type CleanupHandler struct {
 	index index.Index
 	store Store
+	blobs blob.Store
 }
 
-func NewCleanupHandler(idx index.Index, store Store) *CleanupHandler {
-	return &CleanupHandler{
+// CleanupHandlerOptionFunc configures a CleanupHandler.
+type CleanupHandlerOptionFunc func(h *CleanupHandler)
+
+// WithCleanupBlobStore enables the blob garbage collection: blobs no stored
+// document references any more are deleted. A nil store disables it.
+func WithCleanupBlobStore(store blob.Store) CleanupHandlerOptionFunc {
+	return func(h *CleanupHandler) {
+		h.blobs = store
+	}
+}
+
+func NewCleanupHandler(idx index.Index, store Store, funcs ...CleanupHandlerOptionFunc) *CleanupHandler {
+	handler := &CleanupHandler{
 		index: idx,
 		store: store,
 	}
+
+	for _, fn := range funcs {
+		fn(handler)
+	}
+
+	return handler
 }
 
 // Handle implements [task.Handler].
@@ -106,7 +125,167 @@ func (h *CleanupHandler) Handle(ctx context.Context, tsk task.Task, events chan 
 		return errors.Wrap(err, "could not cleanup obsolete sections")
 	}
 
+	if err := h.cleanupOrphanedBlobs(ctx); err != nil {
+		return errors.Wrap(err, "could not cleanup orphaned blobs")
+	}
+
 	return nil
+}
+
+// cleanupOrphanedBlobs deletes the blobs no stored document references any
+// more. Blobs are written during conversion — before the document is saved —
+// so a failure downstream can leave some behind; and a document deleted (or
+// re-indexed under a different image) orphans its own. There is no reference
+// counting on purpose: a hash may be shared by any number of documents, and a
+// periodic sweep is both simpler and safe, since a blob is only ever deleted
+// once nothing points at it.
+func (h *CleanupHandler) cleanupOrphanedBlobs(ctx context.Context) error {
+	if h.blobs == nil {
+		return nil
+	}
+
+	slog.DebugContext(ctx, "checking orphaned blobs")
+
+	referenced, err := h.referencedBlobs(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	const deleteBatchSize = 100
+
+	toDelete := make([]blob.Hash, 0, deleteBatchSize)
+	deleted := 0
+
+	flush := func() error {
+		if len(toDelete) == 0 {
+			return nil
+		}
+
+		slog.InfoContext(ctx, "deleting orphaned blobs", slog.Int("count", len(toDelete)))
+
+		if err := h.blobs.Delete(ctx, toDelete...); err != nil {
+			return errors.WithStack(err)
+		}
+
+		deleted += len(toDelete)
+		toDelete = toDelete[:0]
+
+		return nil
+	}
+
+	err = h.blobs.List(ctx, func(info blob.Info) error {
+		if _, exists := referenced[info.Hash]; exists {
+			return nil
+		}
+
+		toDelete = append(toDelete, info.Hash)
+
+		if len(toDelete) >= deleteBatchSize {
+			return flush()
+		}
+
+		return nil
+	})
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := flush(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	slog.DebugContext(ctx, "orphaned blobs deleted", slog.Int("total", deleted))
+
+	return nil
+}
+
+// BlobReferenceLister is the optional capability of a Store able to enumerate
+// the blobs its documents reference without reading their content — typically
+// from an index maintained at write time (see ingest/gorm.DocumentBlob). A
+// store that does not implement it still works: the cleanup falls back to
+// scanning the documents.
+//
+// The enumeration must be *complete*: a reference missed here is a live blob
+// deleted. An implementation is expected to be maintained in the same
+// transaction as the document write, and to be covered by a differential test
+// against blob.ScanHashes.
+type BlobReferenceLister interface {
+	ListReferencedBlobs(ctx context.Context, fn func(blob.Hash) error) error
+}
+
+// referencedBlobs collects every blob hash referenced by a stored document.
+// It prefers the store's own index when it exposes one, and falls back to
+// reading the documents otherwise.
+func (h *CleanupHandler) referencedBlobs(ctx context.Context) (map[blob.Hash]struct{}, error) {
+	if lister, ok := h.store.(BlobReferenceLister); ok {
+		return h.listReferencedBlobs(ctx, lister)
+	}
+
+	return h.scanReferencedBlobs(ctx)
+}
+
+// listReferencedBlobs reads the live set from the store index: one indexed
+// query instead of a full pass over the corpus.
+func (h *CleanupHandler) listReferencedBlobs(ctx context.Context, lister BlobReferenceLister) (map[blob.Hash]struct{}, error) {
+	referenced := map[blob.Hash]struct{}{}
+
+	err := lister.ListReferencedBlobs(ctx, func(hash blob.Hash) error {
+		referenced[hash] = struct{}{}
+
+		return nil
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return referenced, nil
+}
+
+// scanReferencedBlobs derives the live set from the content of the documents
+// themselves. It is the fallback for stores without the index capability, and
+// the reference behaviour the index is tested against.
+func (h *CleanupHandler) scanReferencedBlobs(ctx context.Context) (map[blob.Hash]struct{}, error) {
+	referenced := map[blob.Hash]struct{}{}
+
+	page := 0
+	limit := 50
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		documents, _, err := h.store.QueryDocuments(ctx, QueryDocumentsOptions{
+			Page:       &page,
+			Limit:      &limit,
+			HeaderOnly: true,
+		})
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		if len(documents) == 0 {
+			return referenced, nil
+		}
+
+		for _, header := range documents {
+			document, err := h.store.GetDocumentByID(ctx, header.ID())
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+
+			content, err := document.Content()
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+
+			for _, hash := range blob.ScanHashes(content) {
+				referenced[hash] = struct{}{}
+			}
+		}
+
+		page++
+	}
 }
 
 func (h *CleanupHandler) cleanupOrphanedDocuments(ctx context.Context, tsk *CleanupTask) error {

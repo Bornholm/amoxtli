@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/convert"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/model"
@@ -32,6 +33,12 @@ type ManagerOptions struct {
 	// SourceCode, when set, enables source-code indexing for the file
 	// extensions registered in the registry.
 	SourceCode *sourcecode.Registry
+	// ImageEnricher, when set, describes the images embedded in the markdown
+	// source of a document before it is parsed.
+	ImageEnricher ImageEnricher
+	// Blobs, when set, is the blob store holding the images referenced by the
+	// indexed documents; the cleanup task collects the unreferenced ones.
+	Blobs blob.Store
 	// StagingDir, when set, pins the directory where files awaiting indexing are
 	// staged to a stable location instead of a per-process temporary directory.
 	// It is required for a persistent task runner: a resumed IndexFile task must
@@ -72,6 +79,24 @@ func WithManagerMaxWordPerSection(maxWordPerSection int) ManagerOptionFunc {
 	}
 }
 
+// WithManagerImageEnrichment describes the images embedded in the markdown
+// source of a document (native .md as well as converter output) before it is
+// parsed, so their descriptions are indexed as ordinary text.
+func WithManagerImageEnrichment(enricher ImageEnricher) ManagerOptionFunc {
+	return func(opts *ManagerOptions) {
+		opts.ImageEnricher = enricher
+	}
+}
+
+// WithManagerBlobStore declares the blob store holding the images referenced
+// by the documents, so the cleanup task can collect the ones no document
+// references any more.
+func WithManagerBlobStore(store blob.Store) ManagerOptionFunc {
+	return func(opts *ManagerOptions) {
+		opts.Blobs = store
+	}
+}
+
 // WithManagerSourceCode enables source-code indexing: files whose extension is
 // registered in the registry are parsed into declaration-level sections
 // instead of going through the converter and markdown pipeline.
@@ -99,6 +124,8 @@ type Manager struct {
 	maxWordPerSection int
 	fileConverter     convert.Converter
 	sourceCode        *sourcecode.Registry
+	imageEnricher     ImageEnricher
+	blobs             blob.Store
 	index             index.Index
 	taskRunner        task.Runner
 	reranker          Reranker
@@ -747,8 +774,11 @@ func (m *Manager) Reindex(ctx context.Context) (task.ID, error) {
 // factories are registered too so pending tasks can be rebuilt and resumed
 // after a restart.
 func (m *Manager) RegisterHandlers(runner task.Runner) {
-	runner.RegisterTask(TaskTypeIndexFile, NewIndexFileHandler(m.Store, m.fileConverter, m.index, m.maxWordPerSection, WithIndexFileHandlerSourceCode(m.sourceCode)))
-	runner.RegisterTask(TaskTypeCleanup, NewCleanupHandler(m.index, m.Store))
+	runner.RegisterTask(TaskTypeIndexFile, NewIndexFileHandler(m.Store, m.fileConverter, m.index, m.maxWordPerSection,
+		WithIndexFileHandlerSourceCode(m.sourceCode),
+		WithIndexFileHandlerImageEnrichment(m.imageEnricher),
+	))
+	runner.RegisterTask(TaskTypeCleanup, NewCleanupHandler(m.index, m.Store, WithCleanupBlobStore(m.blobs)))
 	runner.RegisterTask(TaskTypeReindex, NewReindexHandler(m.Store, m.index, m.maxWordPerSection))
 
 	if persistent, ok := runner.(task.PersistentRunner); ok {
@@ -777,6 +807,8 @@ func NewManager(store Store, idx index.Index, taskRunner task.Runner, funcs ...M
 		index:              idx,
 		fileConverter:      opts.FileConverter,
 		sourceCode:         opts.SourceCode,
+		imageEnricher:      opts.ImageEnricher,
+		blobs:              opts.Blobs,
 		reranker:           opts.Reranker,
 		stagingDirOverride: opts.StagingDir,
 	}

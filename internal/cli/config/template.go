@@ -142,6 +142,55 @@ converter:
   #   enabled: true
   #   dsn: mistral://?apiKey=${MISTRAL_API_KEY}   # or marker://host:port
   #   extensions: [.pdf, .png, .jpg, .jpeg]
+  #
+  # Vision converter: describes image files with a vision LLM (title,
+  # description, visible text) and indexes the description as markdown tagged
+  # with type=image (searchable, and filterable with --filter type=image).
+  # Its extensions are routed before converter.genai's.
+  #
+  # vision:
+  #   enabled: true
+  #   # Dedicated vision model; omit to reuse llm.chat (which must then
+  #   # support image attachments).
+  #   chat:
+  #     provider: openrouter
+  #     model: qwen/qwen2.5-vl-72b-instruct
+  #     api_key: ${OPENROUTER_API_KEY}
+  #   extensions: [.png, .jpg, .jpeg, .webp, .gif]
+  #   # Largest image sent to the model, in bytes. 0 = default (10 MiB).
+  #   max_image_size: 10485760
+  #   # Custom description prompt (part of the description cache key).
+  #   # prompt: |
+  #   #   ...
+  #   # Also describe the images embedded in documents (native .md as well as
+  #   # pandoc/LibreOffice/OCR output). Relative image paths are resolved
+  #   # against the directory of the indexed file and confined to it; remote
+  #   # images are never fetched.
+  #   embedded:
+  #     enabled: true
+  #     # Smallest accepted side in px — below it an image is an icon, not
+  #     # content. 0 = default (64), negative disables the filter.
+  #     min_dimensions: 64
+  #     # Main cost lever on image-rich corpora. 0 = default (32).
+  #     max_images_per_document: 32
+  #     # Parallel descriptions per document. 0 = default (2).
+  #     concurrency: 2
+
+# Storage of the images referenced by the indexed documents: it is what makes
+# them displayable again (MCP fetch_image / resources), not merely searchable.
+# Documents point at them with amoxtli://images/<hash>, a destination that
+# survives the rendering of a chunk — unlike a data URI.
+images:
+  # "auto" (default) follows the document store: "database" when it is
+  # postgres (one server to back up), "fs" when it is sqlite (keeping the bytes
+  # out of a file bleve and sqlite-vec already sit next to). "none" disables
+  # storage. With "auto", storage follows converter.vision.enabled; naming a
+  # backend explicitly turns it on by itself.
+  store: auto
+  # Directory of the "fs" backend, relative to this one.
+  path: blobs
+  # Largest stored image, in bytes. 0 = default (10 MiB).
+  max_size: 0
 
 indexing:
   # 0 defers to the library defaults.

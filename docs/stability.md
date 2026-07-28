@@ -56,9 +56,20 @@ Ne font **pas** partie de la surface stable et peuvent changer à tout moment :
   la (ré)indexation, un index antérieur reste lisible mais ses documents ne sont
   filtrables qu'après réindexation.
 
+## Changements de comportement à surveiller
+
+- **Hoisting du frontmatter markdown.** `markdown.Parse` remonte désormais
+  *toutes* les clés scalaires du frontmatter dans les métadonnées du document
+  (auparavant seule `source` était lue). Un document markdown à frontmatter déjà
+  indexé verra donc ses métadonnées changer à la réindexation — de nouvelles
+  clés apparaissent, filtrables via `WithSearchFilter`. Les métadonnées fournies
+  à l'ingestion continuent d'écraser celles du parseur. C'est le mécanisme par
+  lequel le convertisseur d'images injecte `type=image` (voir
+  [images.md](images.md)).
+
 ## Contraintes de dépendances
 
 Le backend `index/sqlitevec` impose deux versions précises
-(`ncruces/go-sqlite3` v0.23.0 et `wazero` ≥ v1.9.0) documentées dans le
-[README](../README.md). Elles font partie du contrat d'installation de ce
+(`ncruces/go-sqlite3` v0.23.0 et `wazero` ≥ v1.9.0) documentées dans
+[sqlite.md](sqlite.md). Elles font partie du contrat d'installation de ce
 backend et ne changeront pas sans note explicite dans le CHANGELOG.

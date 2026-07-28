@@ -22,6 +22,14 @@ type Instruments struct {
 	SearchDuration metric.Float64Histogram
 	// SearchResults counts results returned across searches.
 	SearchResults metric.Int64Counter
+	// VisionDescriptions counts image descriptions produced, tagged by
+	// outcome.
+	VisionDescriptions metric.Int64Counter
+	// VisionDescriptionDuration is the image description latency in seconds.
+	VisionDescriptionDuration metric.Float64Histogram
+	// VisionCacheLookups counts description cache lookups, tagged by result
+	// (hit or miss).
+	VisionCacheLookups metric.Int64Counter
 }
 
 var (
@@ -78,6 +86,28 @@ func newInstruments() *Instruments {
 		metric.WithUnit("{result}"),
 	); err != nil {
 		logInstrumentError("amoxtli.search.results", err)
+	}
+
+	if in.VisionDescriptions, err = meter.Int64Counter(
+		"amoxtli.vision.descriptions",
+		metric.WithDescription("Number of image descriptions produced"),
+		metric.WithUnit("{description}"),
+	); err != nil {
+		logInstrumentError("amoxtli.vision.descriptions", err)
+	}
+	if in.VisionDescriptionDuration, err = meter.Float64Histogram(
+		"amoxtli.vision.duration",
+		metric.WithDescription("Image description latency"),
+		metric.WithUnit("s"),
+	); err != nil {
+		logInstrumentError("amoxtli.vision.duration", err)
+	}
+	if in.VisionCacheLookups, err = meter.Int64Counter(
+		"amoxtli.vision.cache.lookups",
+		metric.WithDescription("Image description cache lookups"),
+		metric.WithUnit("{lookup}"),
+	); err != nil {
+		logInstrumentError("amoxtli.vision.cache.lookups", err)
 	}
 
 	return in

@@ -2,8 +2,10 @@ package mcpserver
 
 import (
 	"context"
+	"strings"
 
 	"github.com/bornholm/amoxtli"
+	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/ingest"
 	"github.com/bornholm/amoxtli/internal/filterexpr"
@@ -77,6 +79,12 @@ type listDocumentsOutput struct {
 	Total     int64            `json:"total"`
 }
 
+type fetchImageInput struct {
+	// URI is an amoxtli://images/<hash> reference as found in the content of a
+	// section — a bare hash is accepted too.
+	URI string `json:"uri" jsonschema:"the amoxtli://images/<hash> URI of the image, as found in a section content (a bare hash also works)"`
+}
+
 type documentHeader struct {
 	ID       string         `json:"id"`
 	Source   string         `json:"source"`
@@ -90,9 +98,17 @@ type documentHeader struct {
 // re-retrieval orchestration and groundingEnabled surfaces the confidence
 // verdict, both derived from the configured retrieval profile.
 func (s *Server) registerTools(iterative, groundingEnabled bool) {
+	searchDescription := "Search the local document corpus. Returns matching documents with their most relevant sections inline, plus the metadata each document carries — read it to learn which keys and values the filters parameter accepts. Indexed source code carries type=code and language=<name> metadata: use filters like [\"type=code\"] to search code only, or [\"!type\"] for documentation only (every operator but !key requires the key to be present, so type!=code skips documents carrying no type at all)."
+
+	// Images are described in text at index time; the description sits next to
+	// an amoxtli://images/<hash> reference the agent can dereference.
+	if s.rt.Codex.Blobs() != nil {
+		searchDescription += " Section contents may reference images as amoxtli://images/<hash>: pass that URI to fetch_image to get the image itself."
+	}
+
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name:        "search",
-		Description: "Search the local document corpus. Returns matching documents with their most relevant sections inline, plus the metadata each document carries — read it to learn which keys and values the filters parameter accepts. Indexed source code carries type=code and language=<name> metadata: use filters like [\"type=code\"] to search code only, or [\"!type\"] for documentation only (every operator but !key requires the key to be present, so type!=code skips documents carrying no type at all).",
+		Description: searchDescription,
 	}, s.handleSearch(iterative, groundingEnabled))
 
 	mcp.AddTool(s.mcp, &mcp.Tool{
@@ -109,6 +125,94 @@ func (s *Server) registerTools(iterative, groundingEnabled bool) {
 		Name:        "list_documents",
 		Description: "List indexed documents, optionally restricted to a collection or source pattern.",
 	}, s.handleListDocuments)
+
+	// Only advertise image retrieval when there is a store to serve from,
+	// mirroring how iterative/grounding are conditioned on their configuration.
+	if s.rt.Codex.Blobs() != nil {
+		s.registerImageAccess()
+	}
+}
+
+// registerImageAccess exposes the stored images two ways: a tool, which every
+// MCP client supports, and a resource template, which is the idiomatic form for
+// the clients that can dereference URIs on their own.
+func (s *Server) registerImageAccess() {
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "fetch_image",
+		Description: "Fetch an image referenced in a section content by its amoxtli://images/<hash> URI. Returns the image itself, so it can be looked at rather than only read about.",
+	}, s.handleFetchImage)
+
+	s.mcp.AddResourceTemplate(&mcp.ResourceTemplate{
+		Name:        "image",
+		Title:       "Indexed image",
+		Description: "An image referenced by an indexed document, addressed by the hash of its content.",
+		URITemplate: blob.URIScheme + "://" + blob.URIHost + "/{hash}",
+	}, s.handleReadImageResource)
+}
+
+// handleFetchImage returns the stored image as an MCP image block.
+func (s *Server) handleFetchImage(ctx context.Context, _ *mcp.CallToolRequest, in fetchImageInput) (*mcp.CallToolResult, any, error) {
+	data, info, err := s.readImage(ctx, in.URI)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.ImageContent{Data: data, MIMEType: info.MimeType},
+		},
+	}, nil, nil
+}
+
+// handleReadImageResource serves the same bytes through the resource API.
+func (s *Server) handleReadImageResource(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	uri := req.Params.URI
+
+	data, info, err := s.readImage(ctx, uri)
+	if err != nil {
+		if errors.Is(err, blob.ErrNotFound) {
+			return nil, mcp.ResourceNotFoundError(uri)
+		}
+
+		return nil, err
+	}
+
+	return &mcp.ReadResourceResult{
+		Contents: []*mcp.ResourceContents{
+			{URI: uri, MIMEType: info.MimeType, Blob: data},
+		},
+	}, nil
+}
+
+// readImage resolves a reference to the stored bytes. It refuses to serve
+// anything that is not an image: the store is addressed by content hash, and
+// a caller must not be able to turn it into a generic file-exfiltration
+// endpoint.
+func (s *Server) readImage(ctx context.Context, uri string) ([]byte, *blob.Info, error) {
+	blobs := s.rt.Codex.Blobs()
+	if blobs == nil {
+		return nil, nil, errors.New("no image store is configured for this workspace")
+	}
+
+	hash, ok := blob.ParseURI(uri)
+	if !ok {
+		return nil, nil, errors.Errorf("malformed image reference %q (expected %s://%s/<hash>)", uri, blob.URIScheme, blob.URIHost)
+	}
+
+	data, info, err := blobs.Get(ctx, hash)
+	if err != nil {
+		if errors.Is(err, blob.ErrNotFound) {
+			return nil, nil, errors.Wrapf(err, "no image stored for %q", uri)
+		}
+
+		return nil, nil, errors.WithStack(err)
+	}
+
+	if !strings.HasPrefix(info.MimeType, "image/") {
+		return nil, nil, errors.Errorf("blob %q is not an image (%s)", hash, info.MimeType)
+	}
+
+	return data, info, nil
 }
 
 func (s *Server) handleSearch(iterative, groundingEnabled bool) mcp.ToolHandlerFor[searchInput, searchOutput] {

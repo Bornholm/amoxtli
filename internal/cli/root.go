@@ -93,6 +93,7 @@ func NewRootCommand() *cobra.Command {
 		newSearchCommand(opts),
 		newDocCommand(opts),
 		newCollectionCommand(opts),
+		newImageCommand(opts),
 		newTaskCommand(opts),
 		newReindexCommand(opts),
 		newCleanupCommand(opts),

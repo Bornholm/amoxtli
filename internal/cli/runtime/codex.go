@@ -22,6 +22,7 @@ import (
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/sourcecode"
+	"github.com/bornholm/amoxtli/vision"
 	"github.com/bornholm/genai/llm"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/errors"
@@ -110,12 +111,37 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 
 	opts = append(opts, retrievalOptions(cfg, client, stageClients)...)
 
-	converter, err := newFileConverter(ctx, cfg)
+	// The vision describer is shared by the converter (standalone image files)
+	// and the enrichment of the images embedded in documents, so both hit the
+	// same description cache.
+	var visionDescriber vision.Describer
+	if cfg.VisionEnabled() {
+		visionDescriber, err = newVisionDescriber(ctx, ws, cfg)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Same store for every path (converter, enrichment, pandoc media): an image
+	// is content-addressed, so meeting it twice costs one entry.
+	blobs, err := newBlobStore(ws, cfg, store)
+	if err != nil {
+		return nil, err
+	}
+	if blobs != nil {
+		opts = append(opts, amoxtli.WithBlobStore(blobs))
+	}
+
+	converter, err := newFileConverter(ctx, cfg, visionDescriber, blobs)
 	if err != nil {
 		return nil, err
 	}
 	if converter != nil {
 		opts = append(opts, amoxtli.WithFileConverter(converter))
+	}
+
+	if cfg.EmbeddedVisionEnabled() {
+		opts = append(opts, amoxtli.WithImageEnrichment(imageEnrichmentOptions(cfg, visionDescriber)...))
 	}
 
 	if cfg.CodeEnabled() {

@@ -99,6 +99,81 @@ Le convertisseur `genai` utilise un DSN d'extraction distinct du client chat :
 `mistral://?apiKey=${MISTRAL_API_KEY}` ou `marker://host:port`. Ses extensions
 sont prioritaires sur pandoc/libreoffice en cas de recouvrement.
 
+### Images
+
+La section `converter.vision` décrit les images avec un LLM vision pour les
+rendre cherchables. Elle est opt-in et exige un client chat capable de vision
+(dédié, ou `llm.chat` à défaut) :
+
+```yaml
+converter:
+  vision:
+    enabled: true
+    chat:                                     # absent : réutilise llm.chat
+      provider: openrouter
+      model: qwen/qwen2.5-vl-72b-instruct
+      api_key: ${OPENROUTER_API_KEY}
+    extensions: [.png, .jpg, .jpeg, .webp, .gif]
+    max_image_size: 10485760                  # 0 = défaut (10 Mio)
+    # prompt: |                               # remplace le prompt par défaut
+    #   ...
+    embedded:
+      enabled: true                           # images embarquées dans les documents
+      min_dimensions: 64                      # 0 = défaut (64), négatif = pas de filtre
+      max_images_per_document: 32             # 0 = défaut (32)
+      concurrency: 2                          # 0 = défaut (2)
+```
+
+Un fichier image devient un document markdown portant la métadonnée
+`type=image` ; les images embarquées dans un document voient leur description
+insérée en texte à côté d'elles.
+
+```bash
+amoxtli add ./captures/*.png
+amoxtli search "tableau de bord des ventes" --filter type=image
+```
+
+Les extensions de `converter.vision` sont routées **avant** celles de
+`converter.genai`. `embedded.enabled` exige `vision.enabled`, et active au
+passage l'extraction des médias par pandoc (sinon les images des `.docx`/`.odt`
+sont perdues). Les descriptions sont mises en cache par contenu d'image sous
+`<llm.cache.path>/vision/` : une réindexation ne rappelle pas le modèle.
+
+Pour rendre les images **réaffichables** (et pas seulement cherchables), la
+section `images` active un stockage adressé par contenu ; les documents y
+renvoient via `amoxtli://images/<hash>`, une destination qui survit au rendu des
+extraits, et le serveur MCP expose alors l'outil `fetch_image` :
+
+```yaml
+images:
+  # auto (défaut) : "database" si store.driver est postgres, "fs" sinon ;
+  # "none" désactive. Avec auto, le stockage suit converter.vision.enabled ;
+  # nommer un backend explicitement l'active à lui seul.
+  store: auto
+  path: blobs        # backend fs, relatif au répertoire .amoxtli
+  max_size: 0        # 0 = défaut (10 Mio)
+```
+
+Deux commandes lisent ce stockage :
+
+```bash
+amoxtli image list                                   # hash, type média, taille, total
+amoxtli image get <hash> -o schema.png               # par hash nu…
+amoxtli image get amoxtli://images/<hash> -o s.png   # …ou par l'URI vue dans une section
+amoxtli image get <hash> > schema.png                # redirection et pipes fonctionnent
+```
+
+`image get` suit la convention de `curl` : il **refuse d'écrire du binaire dans
+un terminal**. Rediriger, piper ou passer `-o <fichier>` fonctionne ; `-o -`
+force la sortie standard quoi qu'il arrive. Le message de confirmation de `-o
+<fichier>` part sur stderr, pour que la sortie standard reste exacte à l'octet.
+
+`amoxtli cleanup` ramasse au passage les blobs qu'aucun document ne référence
+plus, et `amoxtli backup` les inclut dans le snapshot.
+
+Guide complet — coûts, choix du modèle, garde-fous de sécurité, réaffichage :
+[docs/images.md](images.md).
+
 ### Code source
 
 L'indexation de code source est active par défaut (`indexing.code.enabled:
@@ -128,6 +203,7 @@ extension→langage (ex. `.phtml: php`). Langages intégrés : `go`, `javascript
 | `search <requête> [-n N] [-c coll] [--filter k=v] [--cursor c] [--deep] [--no-content]` | Recherche (—`--deep` = itérative LLM) |
 | `doc list\|show\|delete` | Inspecte et supprime des documents (suppression par lot via filtres) |
 | `collection create\|list\|show\|rename\|describe\|stats\|delete` | Gère les collections |
+| `image list\|get` | Liste les images stockées et en extrait une |
 | `task list\|show\|cancel` | Suit les tâches d'indexation |
 | `reindex [-c coll]` / `cleanup [-c coll]` | Maintenance de l'index |
 | `cache purge` | Vide le cache LLM sur disque (embeddings + chat) |

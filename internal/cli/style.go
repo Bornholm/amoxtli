@@ -42,6 +42,12 @@ func colorsEnabled(w io.Writer) bool {
 		return false
 	}
 
+	return isTerminal(w)
+}
+
+// isTerminal reports whether w is an interactive terminal. Commands writing
+// binary content use it to refuse dumping it into a tty.
+func isTerminal(w io.Writer) bool {
 	file, ok := w.(*os.File)
 	if !ok {
 		return false

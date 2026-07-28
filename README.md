@@ -2,11 +2,13 @@
 
 > *Amoxtli* — « livre, codex » en nahuatl.
 
-Bibliothèque Go d'indexation documentaire multi-backend et d'ingestion de fichiers : recherche plein-texte ([bleve](https://github.com/blevesearch/bleve)), recherche vectorielle ([sqlite-vec](https://github.com/asg017/sqlite-vec)), recherche hybride PostgreSQL ([pgvector](https://github.com/pgvector/pgvector) + FTS natif), fusion des résultats par Reciprocal Rank Fusion (pondérée par index), découpage markdown en sections, indexation de code source par déclaration ([tree-sitter](https://github.com/tree-sitter/tree-sitter) en pur Go : Go, JS/TS, Python, PHP…), conversion de fichiers (pandoc, LibreOffice, OCR/LLM), grounding (récupération vérifiée) et sauvegarde/restauration des index.
+Bibliothèque Go pour ingérer des fichiers et y faire de la recherche documentaire, avec plusieurs backends d'index au choix.
 
-Extraite du projet [bornholm/corpus](https://github.com/Bornholm/corpus), dont elle constitue le cœur, mais indépendante de celui-ci.
-
-**Statut : pré-v0.1.0 — API instable.**
+- **Recherche**: plein-texte ([bleve](https://github.com/blevesearch/bleve)), vectorielle ([sqlite-vec](https://github.com/asg017/sqlite-vec)) ou hybride PostgreSQL ([pgvector](https://github.com/pgvector/pgvector) + FTS natif). Les résultats de plusieurs index sont fusionnés par Reciprocal Rank Fusion pondérée.
+- **Ingestion**: conversion de fichiers (pandoc, LibreOffice, OCR/LLM), découpage des documents markdown en sections.
+- **Code source**: indexation déclaration par déclaration via [tree-sitter](https://github.com/tree-sitter/tree-sitter) en pur Go (Go, JS/TS, Python, PHP…).
+- **Images**: description par LLM vision, fichiers autonomes comme images embarquées, stockage adressé par contenu et réaffichage via MCP.
+- **Qualité et exploitation**: grounding (récupération vérifiée), sauvegarde et restauration des index.
 
 ## Installation
 
@@ -14,17 +16,9 @@ Extraite du projet [bornholm/corpus](https://github.com/Bornholm/corpus), dont e
 go get github.com/bornholm/amoxtli
 ```
 
-Aucune directive `replace` n'est nécessaire : le backend `index/sqlitevec` embarque son propre build WASM de SQLite incluant l'extension sqlite-vec (voir `index/sqlitevec/internal/vec`).
-
-> **Backend sqlite-vec : versions de `ncruces/go-sqlite3` et `wazero`.** Le build WASM embarqué impose deux contraintes (déclarées dans le `go.mod` d'amoxtli, à préserver côté consommateur) :
-> ```
-> require github.com/ncruces/go-sqlite3 v0.23.0   // ABI hôte du WASM
-> require github.com/tetratelabs/wazero v1.11.0   // >= v1.9.0
-> ```
-> - `ncruces/go-sqlite3` **v0.23.0** : le WASM est couplé à cette ABI (`sqlite3.Binary` / `sqlite3.RuntimeConfig`, retirées dans les versions ultérieures ; les versions ≥ v0.30.5 attendent un contrat guest incompatible).
-> - `tetratelabs/wazero` **≥ v1.9.0** : le compilateur de wazero v1.8.2 (version épinglée par défaut par ncruces v0.23.0) mis-compile `vec0Filter` de sqlite-vec et provoque un crash (`out of bounds memory access`) sur **toute** requête KNN. Corrigé depuis wazero v1.9.0.
->
-> Les autres backends (bleve, postgres) et le magasin SQLite (`ingest/gorm`) ne sont pas concernés.
+> **Attention**
+> 
+> Le backend `index/sqlitevec` impose deux versions précises (`ncruces/go-sqlite3` v0.23.0 et `wazero` ≥ v1.9.0) à préserver côté consommateur : voir [Backend SQLite](docs/sqlite.md).
 
 ## Démarrage rapide
 
@@ -54,7 +48,12 @@ taskID, _ := codex.IndexFile(ctx, collID, "guide.md", file)
 results, _ := codex.Search(ctx, "comment faire…", amoxtli.WithSearchMaxResults(5))
 ```
 
-Exemples complets et exécutables : [`example/sqlite`](example/sqlite/main.go) (SQLite + bleve, sans LLM), [`example/postgres`](example/postgres/main.go) (tout PostgreSQL), [`example/convert`](example/convert/main.go) (conversion de fichier + suivi de tâche) et [`example/sourcecode`](example/sourcecode/main.go) (indexation de code + recherche croisée doc ↔ code).
+Exemples complets et exécutables : 
+- [`example/sqlite`](example/sqlite/main.go) (SQLite + bleve, sans LLM)
+- [`example/postgres`](example/postgres/main.go) (tout PostgreSQL)
+- [`example/convert`](example/convert/main.go) (conversion de fichier + suivi de tâche)
+- [`example/sourcecode`](example/sourcecode/main.go) (indexation de code + recherche croisée doc ↔ code) 
+- [`example/vision`](example/vision/main.go) (description d'images, descripteur factice ou modèle réel).
 
 ## Ligne de commande
 
@@ -69,6 +68,10 @@ amoxtli sync --base-dir . ./docs                     # arborescence, sources rel
 amoxtli search "modèle de concurrence"               # doc ET code
 amoxtli search "modèle de concurrence" --filter '!type'        # documentation seule
 amoxtli search "modèle de concurrence" --filter dirname=/docs  # métadonnées de fichier (filename, extension, size, mtime, dirname, indexed_at)
+amoxtli add ./captures/*.png                         # images décrites par LLM vision (type=image)
+amoxtli search "tableau de bord des ventes" --filter type=image
+amoxtli image list                                   # images stockées
+amoxtli image get <hash> -o schema.png               # en extraire une
 amoxtli mcp stdio             # serveur MCP sur stdio (un processus par client)
 amoxtli mcp http --addr :8080 # serveur MCP HTTP (processus partagé, multi-sessions)
 ```
@@ -80,8 +83,10 @@ Voir [docs/cli.md](docs/cli.md) pour la configuration (`config.yaml`, interpolat
 - [Ligne de commande](docs/cli.md) — CLI `amoxtli` : espace de travail, configuration, commandes CRUD, serveur MCP
 - [Architecture](docs/architecture.md) — packages, indexeurs personnalisés et suite de conformité
 - [Grounding (récupération vérifiée)](docs/grounding.md) — `CheckGrounding`, `SearchIterative`, décomposition, re-retrieval itératif et modes d'application (`demote` par défaut / `filter`)
+- [Backend SQLite](docs/sqlite.md) — déploiement local par fichiers (sqlite-vec, build WASM embarqué, versions épinglées)
 - [Backend PostgreSQL](docs/postgres.md) — déploiement entièrement PostgreSQL (FTS + pgvector, fusion RRF)
 - [Convertisseurs de fichiers](docs/converters.md) — pandoc, LibreOffice, OCR/LLM
+- [Indexation des images](docs/images.md) — description par LLM vision, images embarquées, coûts et cache, choix du modèle, garde-fous, réaffichage par un agent (blob store + MCP `fetch_image`)
 - [Indexation de code source](docs/source-code.md) — tree-sitter pur Go, `WithSourceCode`, recherche croisée doc ↔ code, build tags
 - [Tests](docs/testing.md) — tests unitaires et d'intégration (Docker, Ollama, PostgreSQL)
 - [Évaluation de la pertinence](docs/evaluation.md) — Recall@k / MRR / nDCG@k, benchmarks SQuAD/BEIR, profils de récupération et résultats de référence

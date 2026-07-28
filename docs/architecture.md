@@ -14,12 +14,15 @@
 | `index/testsuite` | Suite de conformité pour les implémentations de `index.Index` |
 | `markdown` | Parsing/chunking markdown en sections |
 | `sourcecode` | Parsing/chunking de code source en sections par déclaration (tree-sitter pur Go, métadonnées `type=code` / `language=<nom>`) |
-| `convert` | Conversion de fichiers vers markdown (`pandoc`, `libreoffice`, `genai`) |
+| `convert` | Conversion de fichiers vers markdown (`pandoc`, `libreoffice`, `genai`, `vision`) |
+| `vision` | Description d'images par LLM vision (`Describer`) + cache de descriptions indexé par contenu |
+| `markdown/imagetext` | Enrichissement des images embarquées : description insérée par réécriture des octets source, inlining des médias locaux |
+| `blob` / `blob/fs` / `blob/gorm` | Stockage des images adressé par contenu (`amoxtli://images/<hash>`) : interface + backend fichiers et backend base (SQLite/PostgreSQL), suite de conformance partagée (`blob/testsuite`) |
 | `task` / `task/memory` / `task/gorm` | Exécution de tâches asynchrones : contrat `task.Runner`, runner en mémoire, runner persistant gorm (reprise au démarrage) |
-| `ingest` / `ingest/gorm` | Pipeline d'ingestion + magasin de documents (SQLite ou PostgreSQL) |
-| `backup` | Abstraction snapshot/restore |
+| `ingest` / `ingest/gorm` | Pipeline d'ingestion + magasin de documents (SQLite ou PostgreSQL), index de références de blobs pour le ramasse-miettes |
+| `backup` | Abstraction snapshot/restore (index, documents, blobs) |
 | `eval` / `eval/hfqa` | Harnais d'évaluation de la pertinence (Recall@k / MRR / nDCG@k, segmentation par langue) + loader de jeux QA Hugging Face (format SQuAD) |
-| `telemetry` | Intégration OpenTelemetry : tracer/meter partagés + instruments (latence recherche, coût LLM) |
+| `telemetry` | Intégration OpenTelemetry : tracer/meter partagés + instruments (latence recherche, coût LLM, descriptions d'images) |
 
 ## Indexeurs personnalisés
 
@@ -324,6 +327,40 @@ l'embedder domine, HyDE apporte un gain modeste et dépendant du modèle chat, e
 le grounding s'applique par défaut en mode `demote` (préserve le rappel) —
 détails dans [grounding.md](grounding.md#mode-dapplication--demote-défaut--filter).
 
+### Pipeline d'ingestion d'un fichier
+
+`IndexFileHandler` fait converger tout fichier vers du markdown avant parsing —
+c'est ce qui permet d'ajouter des sources sans toucher aux index :
+
+```
+fichier                                                          progression
+  │
+  ├─ .md natif ─────────────────────────────────────────────┐        0.05
+  ├─ code source (.go, .py…) ──────────────► sourcecode.Parse│        0.05
+  └─ autre ──► convert.Routed ──► markdown ─────────────────┤        0.01 → 0.05
+               (vision, genai, pandoc, libreoffice)         │
+                                                            ▼
+                                    imagetext.Enrich (facultatif)  0.05 → 0.10
+                                    description des images
+                                    embarquées, insérée en texte
+                                                            │
+                                                            ▼
+                                        markdown.Parse (sections)      0.10
+                                                            │
+                                                            ▼
+                                        store.SaveDocuments + index    → 1.0
+```
+
+L'enrichissement des images s'insère entre la lecture du contenu et le parsing
+(`ingest/index_file.go`), donc **après** toute conversion : il s'applique
+uniformément au markdown natif et à la sortie de pandoc, LibreOffice ou de l'OCR
+GenAI. Les fichiers routés vers `sourcecode.Parse` en sont exclus. Il est activé
+par `amoxtli.WithImageEnrichment(...)` (option `nil` = comportement inchangé),
+et le répertoire de résolution des chemins d'images relatifs est dérivé de la
+source `file:` de la tâche — le répertoire du fichier *original*, pas celui de
+la copie temporaire sur laquelle travaille le handler. Voir
+[images.md](images.md).
+
 ### Runner de tâches persistant (`task/gorm`)
 
 L'ingestion (`IndexFile`, `Reindex`, `CleanupIndex`) est asynchrone : elle
@@ -388,8 +425,10 @@ L'instrumentation OpenTelemetry est **toujours active mais gratuite** : sans
 provider installé, les providers no-op globaux d'OTel absorbent spans et mesures.
 Le package `telemetry` expose un tracer et un meter partagés sous un scope
 d'instrumentation unique, plus des instruments créés paresseusement : latence de
-recherche, nombre de résultats, et pour les appels LLM le nombre d'appels, la
-latence et les tokens (prompt/completion). `Codex.Search` ouvre un span (longueur
+recherche, nombre de résultats, pour les appels LLM le nombre d'appels, la
+latence et les tokens (prompt/completion), et pour la description d'images le
+nombre de descriptions (par issue), leur latence et les hits/misses du cache
+dédié. `Codex.Search` ouvre un span (longueur
 de requête, nombre de résultats — jamais le texte de la requête). Le décorateur
 `llmx.ObservableClient` instrumente un `llm.Client` (spans + métriques, dérivant
 les tokens de complétion depuis `Usage()`) ; l'option `WithObservability()`
