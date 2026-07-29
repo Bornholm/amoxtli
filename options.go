@@ -43,10 +43,13 @@ const (
 	StageDecompose Stage = "decompose"
 	// StageReformulate rewrites the query for iterative re-retrieval.
 	StageReformulate Stage = "reformulate"
+	// StageTranslate translates the query into the corpus languages (lexical
+	// indexes).
+	StageTranslate Stage = "translate"
 )
 
 // Stages lists every stage accepted by WithStageLLMClient.
-var Stages = []Stage{StageHyDE, StageJudge, StageGrounding, StageRerank, StageDecompose, StageReformulate}
+var Stages = []Stage{StageHyDE, StageJudge, StageGrounding, StageRerank, StageDecompose, StageReformulate, StageTranslate}
 
 type options struct {
 	llmClient          llm.Client
@@ -62,7 +65,10 @@ type options struct {
 	taskParallelism    int
 	disableHyDE        bool
 	disableJudge       bool
-	snapshotBoundary   string
+	// Query translation widens the lexical query with the corpus languages.
+	queryTranslation    bool
+	translationMaxLangs int
+	snapshotBoundary    string
 	// Grounding & explicit re-retrieval (see CheckGrounding / SearchIterative).
 	groundingCheck             bool
 	groundingFailOpen          bool
@@ -285,6 +291,28 @@ func WithTaskParallelism(n int) Option {
 func WithDisableHyDE() Option {
 	return func(o *options) {
 		o.disableHyDE = true
+	}
+}
+
+// WithQueryTranslation widens the query sent to lexical (full-text) indexes
+// with its translation into the languages the corpus is written in, taken from
+// the "lang" metadata detected at ingestion.
+//
+// It is opt-in, unlike HyDE: it costs one LLM call per search and only pays off
+// when the corpus and the questions are not in the same language. Measured on
+// SciFact, asking in French over an English corpus costs the lexical leg 40% of
+// its nDCG@10 — but a monolingual corpus queried in its own language has
+// nothing to gain (the transformer then skips the call entirely).
+//
+// The semantic leg is deliberately left untouched: a multilingual embedding
+// model already crosses the language barrier on its own.
+//
+// maxLanguages bounds how many corpus languages the query is translated into,
+// most represented first; 0 selects the default (2).
+func WithQueryTranslation(maxLanguages int) Option {
+	return func(o *options) {
+		o.queryTranslation = true
+		o.translationMaxLangs = maxLanguages
 	}
 }
 

@@ -17,3 +17,15 @@ type SectionStore interface {
 type CollectionLister interface {
 	ListCollections(ctx context.Context, ids []model.CollectionID) ([]model.Collection, error)
 }
+
+// CollectionLanguageLister reports the natural languages a corpus is written
+// in, as ISO 639-1 codes ordered by decreasing number of documents. It is used
+// by the query translation transformer to know which languages are worth
+// translating a query into. A nil or empty ids selects every collection.
+//
+// Only documents carrying a detected language are counted, so an entirely
+// undetectable corpus yields an empty slice — and translation is skipped rather
+// than guessed at.
+type CollectionLanguageLister interface {
+	ListCollectionLanguages(ctx context.Context, ids []model.CollectionID) ([]string, error)
+}

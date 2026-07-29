@@ -376,6 +376,10 @@ func retrievalOptions(cfg *config.Config, client llm.Client, stageClients map[st
 		opts = append(opts, amoxtli.WithIterativeRetrieval(cfg.Retrieval.Iterative.MaxRounds))
 	}
 
+	if cfg.Retrieval.Translation.Enabled {
+		opts = append(opts, amoxtli.WithQueryTranslation(cfg.Retrieval.Translation.MaxLanguages))
+	}
+
 	if cfg.Retrieval.Decomposition.Enabled {
 		opts = append(opts, amoxtli.WithQueryDecomposition(cfg.Retrieval.Decomposition.MaxSubQueries))
 	}

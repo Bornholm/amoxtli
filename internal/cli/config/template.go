@@ -79,7 +79,8 @@ index:
 #     enabled: auto
 #     path: cache
 #   # Dedicated chat client per retrieval stage (hyde, judge, grounding,
-#   # rerank, decompose, reformulate), overriding llm.chat for that stage.
+#   # rerank, decompose, reformulate, translate), overriding llm.chat for that
+#   # stage.
 #   # Main cost lever: point the high-volume stages at a small fast model.
 #   stages:
 #     hyde:
@@ -123,6 +124,17 @@ retrieval:
   decomposition:
     enabled: false
     max_sub_queries: 3
+  # Widens the query sent to the FULL-TEXT index with its translation into the
+  # languages of the corpus (metadata "lang", detected at ingestion) — the
+  # vector index keeps the original wording, a multilingual embedding model
+  # already crossing the language barrier on its own. Useful when questions and
+  # documents are in different languages: measured on SciFact, a French query
+  # over an English corpus costs the lexical leg 40% of its nDCG@10. Costs one
+  # cached, seeded chat call per distinct query, and is skipped entirely when
+  # the corpus is already in the query's language.
+  translation:
+    enabled: false
+    max_languages: 2
 
 converter:
   # File conversion to markdown. "auto" enables pandoc when the binary is in

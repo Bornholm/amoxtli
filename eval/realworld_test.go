@@ -196,6 +196,10 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 	// "precision" retrieval profile. Iterative implies grounding on its own
 	// through the orchestrator, so this toggle only matters standalone.
 	grounding := os.Getenv("AMOXTLI_EVAL_GROUNDING") != ""
+	// translate widens the LEXICAL query with its translation into the corpus
+	// languages (metadata "lang"). It leaves the semantic query alone, so it is
+	// the knob to measure the cross-lingual penalty being paid back.
+	translate := os.Getenv("AMOXTLI_EVAL_TRANSLATE") != ""
 
 	codexOpts := []amoxtli.Option{
 		amoxtli.WithStore(store),
@@ -207,8 +211,12 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 	}
 	// A single chat client feeds every LLM feature (HyDE, reranker, grounding
 	// evaluator, query reformulator). WithLLMClient must be set exactly once.
-	if hyde || rerank || iterative || grounding {
+	if hyde || rerank || iterative || grounding || translate {
 		codexOpts = append(codexOpts, amoxtli.WithLLMClient(chatClient(t)))
+	}
+	if translate {
+		codexOpts = append(codexOpts, amoxtli.WithQueryTranslation(envInt(t, "AMOXTLI_EVAL_TRANSLATE_MAX_LANGS", 0)))
+		mode += " + translate"
 	}
 	if hyde {
 		mode += " + hyde"

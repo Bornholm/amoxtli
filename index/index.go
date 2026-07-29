@@ -56,10 +56,11 @@ type SearchResult struct {
 // Semantic is an optional capability implemented by indexes performing
 // embedding/vector similarity search, which therefore benefit from query
 // expansion such as HyDE. Full-text (lexical) indexes must not implement it —
-// or must return false — so the search pipeline queries them with the raw
-// query. Hybrid indexes that manage their own lexical/vector fusion internally
-// should also report false, to avoid polluting their lexical leg with an
-// expanded query.
+// or must return false — so the search pipeline sends them the lexical variant
+// of the query instead (see pipeline.LexicalQueryTransformer, which carries
+// transformations such as translation that only a lexical index needs). Hybrid
+// indexes that manage their own lexical/vector fusion internally should also
+// report false, to avoid polluting their lexical leg with an expanded query.
 type Semantic interface {
 	// Semantic reports whether the index performs vector similarity search.
 	Semantic() bool

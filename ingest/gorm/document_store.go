@@ -1,9 +1,11 @@
 package gorm
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"log/slog"
+	"maps"
 	"net/url"
 	"slices"
 	"strings"
@@ -236,11 +238,110 @@ func (s *Store) GetCollectionStats(ctx context.Context, id model.CollectionID) (
 		return nil, errors.WithStack(err)
 	}
 
+	languages, err := s.countLanguages(ctx, []model.CollectionID{id})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	stats := &model.CollectionStats{
 		TotalDocuments: db.Model(&Collection{ID: string(id)}).Association("Documents").Count(),
+		Languages:      languages,
 	}
 
 	return stats, nil
+}
+
+// ListCollectionLanguages implements pipeline.CollectionLanguageLister: the
+// languages of the given collections (all of them when ids is empty), ordered
+// by decreasing number of documents.
+func (s *Store) ListCollectionLanguages(ctx context.Context, ids []model.CollectionID) ([]string, error) {
+	languages, err := s.countLanguages(ctx, ids)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	codes := slices.Collect(maps.Keys(languages))
+
+	slices.SortFunc(codes, func(a, b string) int {
+		if languages[a] != languages[b] {
+			return cmp.Compare(languages[b], languages[a])
+		}
+
+		return cmp.Compare(a, b)
+	})
+
+	return codes, nil
+}
+
+// countLanguages counts the documents per detected natural language over the
+// given collections, or over the whole corpus when ids is empty.
+//
+// The tally is computed in Go over the metadata blobs rather than pushed down
+// as a JSON aggregate, which would tie the store to one SQL dialect. Only the
+// metadata column is read — a short JSON header, never the document content.
+func (s *Store) countLanguages(ctx context.Context, ids []model.CollectionID) (map[string]int64, error) {
+	// The document id comes along so a document belonging to several of the
+	// listed collections — which the join yields once per collection — is only
+	// counted once. Deduplicating in Go keeps the query free of the DISTINCT /
+	// GROUP BY rules that differ between SQLite and PostgreSQL.
+	type row struct {
+		ID       string
+		Metadata []byte
+	}
+
+	var rows []row
+
+	err := s.withRetry(ctx, false, func(ctx context.Context, db *gorm.DB) error {
+		query := db.Model(&Document{}).
+			Select("documents.id, documents.metadata").
+			Where("documents.metadata IS NOT NULL")
+
+		if len(ids) > 0 {
+			collectionIDs := make([]string, 0, len(ids))
+			for _, id := range ids {
+				collectionIDs = append(collectionIDs, string(id))
+			}
+
+			query = query.
+				Joins("JOIN documents_collections ON documents_collections.document_id = documents.id").
+				Where("documents_collections.collection_id IN ?", collectionIDs)
+		}
+
+		return query.Scan(&rows).Error
+	}, sqlite3.LOCKED, sqlite3.BUSY)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	languages := map[string]int64{}
+	counted := make(map[string]struct{}, len(rows))
+
+	for _, r := range rows {
+		if len(r.Metadata) == 0 {
+			continue
+		}
+
+		if _, seen := counted[r.ID]; seen {
+			continue
+		}
+		counted[r.ID] = struct{}{}
+
+		var metadata map[string]any
+
+		if err := json.Unmarshal(r.Metadata, &metadata); err != nil {
+			slog.WarnContext(ctx, "could not unmarshal document metadata", slog.String("document", r.ID), slog.Any("error", errors.WithStack(err)))
+			continue
+		}
+
+		code, ok := metadata[ingest.MetadataKeyLang].(string)
+		if !ok || code == "" {
+			continue
+		}
+
+		languages[code]++
+	}
+
+	return languages, nil
 }
 
 // CreateCollection implements ingest.Store.

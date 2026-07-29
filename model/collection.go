@@ -25,6 +25,10 @@ type PersistedCollection interface {
 
 type CollectionStats struct {
 	TotalDocuments int64
+	// Languages counts the documents per detected natural language, keyed by
+	// ISO 639-1 code. Documents whose language could not be determined are not
+	// counted, so the sum may be lower than TotalDocuments.
+	Languages map[string]int64
 }
 
 type BaseCollection struct {

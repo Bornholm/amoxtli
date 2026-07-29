@@ -64,6 +64,39 @@ func (ds *Dataset) KeepAnswerable(sources map[string]struct{}) *Dataset {
 	return out
 }
 
+// TranslateQueries returns a copy of the dataset with each query text replaced
+// by its translation, looked up by query ID, and its Lang set to lang. It also
+// reports how many queries were actually translated.
+//
+// Everything else — IDs, relevant sources, answers, tags — is carried over
+// untouched: the gold set is a property of the corpus, not of the language the
+// question is asked in. Evaluating the translated dataset against the same
+// index as the original therefore isolates one variable, the language gap
+// between query and documents, which is what makes the two runs comparable.
+//
+// Queries with no translation are kept verbatim, in their original language.
+// Callers should treat a partial count as a reason to fix the translation file
+// rather than to interpret the run: a dataset mixing translated and untranslated
+// queries measures neither language cleanly.
+func (ds *Dataset) TranslateQueries(translations map[string]string, lang string) (*Dataset, int) {
+	out := &Dataset{Name: ds.Name, Queries: make([]Query, 0, len(ds.Queries))}
+
+	translated := 0
+
+	for _, q := range ds.Queries {
+		text, ok := translations[q.ID]
+		if ok && text != "" {
+			q.Query = text
+			q.Lang = lang
+			translated++
+		}
+
+		out.Queries = append(out.Queries, q)
+	}
+
+	return out, translated
+}
+
 // Truncate keeps at most the first n queries. A non-positive n leaves the
 // dataset unchanged.
 func (ds *Dataset) Truncate(n int) {

@@ -116,6 +116,19 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 			}
 		}
 
+		if translateClient := opts.clientFor(StageTranslate); opts.queryTranslation && translateClient != nil {
+			if lister, ok := store.(pipeline.CollectionLanguageLister); ok {
+				pipelineOpts = append(pipelineOpts,
+					pipeline.WithQueryTransformers(
+						pipeline.NewTranslateQueryTransformer(translateClient, lister,
+							pipeline.WithMaxTargetLanguages(opts.translationMaxLangs)),
+					),
+				)
+			} else {
+				slog.WarnContext(ctx, "query translation requested but the store cannot list corpus languages, ignoring it")
+			}
+		}
+
 		resultsTransformers := []pipeline.ResultsTransformer{
 			pipeline.NewDuplicateContentResultsTransformer(store),
 		}

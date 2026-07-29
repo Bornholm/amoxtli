@@ -146,6 +146,52 @@ func TestIndexFileHandlerMarkdownUnchanged(t *testing.T) {
 	}
 }
 
+const testFrenchDocument = `# La recherche hybride
+
+La recherche documentaire hybride combine un canal lexical et un canal
+sémantique. Le premier retrouve les termes exacts de la requête, le second
+rapproche les formulations différentes d'une même idée.
+
+Leur fusion donne un rappel supérieur à celui de chacun des deux canaux pris
+isolément, à condition que les scores soient ramenés sur une échelle commune.
+`
+
+func TestIndexFileHandlerDetectsLang(t *testing.T) {
+	doc := runIndexFileTask(t, "note.md", testFrenchDocument, nil)
+
+	if e, g := "fr", model.Metadata(doc)[MetadataKeyLang]; e != g {
+		t.Errorf("metadata[%q]: expected '%s', got '%v'", MetadataKeyLang, e, g)
+	}
+}
+
+// An undecidable document must carry no lang at all: a wrong code silently
+// excludes it from every lang filter, an absent one does not.
+func TestIndexFileHandlerOmitsUndetectableLang(t *testing.T) {
+	doc := runIndexFileTask(t, "note.md", "# 42\n\n1234 5678\n", nil)
+
+	if code, exists := model.Metadata(doc)[MetadataKeyLang]; exists {
+		t.Errorf("metadata[%q]: expected no language, got '%v'", MetadataKeyLang, code)
+	}
+}
+
+func TestIndexFileHandlerLangMetadataOverride(t *testing.T) {
+	doc := runIndexFileTask(t, "note.md", testFrenchDocument, map[string]any{MetadataKeyLang: "oc"})
+
+	if e, g := "oc", model.Metadata(doc)[MetadataKeyLang]; e != g {
+		t.Errorf("metadata[%q]: expected '%s', got '%v'", MetadataKeyLang, e, g)
+	}
+}
+
+// The natural language of a source file must not clobber the programming
+// language the parser records under "language".
+func TestIndexFileHandlerLangDoesNotShadowSourceCodeLanguage(t *testing.T) {
+	doc := runIndexFileTask(t, "greeting.go", testSourceFile, nil)
+
+	if e, g := "go", model.Metadata(doc)["language"]; e != g {
+		t.Errorf("metadata[\"language\"]: expected '%s', got '%v'", e, g)
+	}
+}
+
 // TestIndexFileHandlerImageEnrichment checks the enrichment step of the
 // pipeline: images embedded in a markdown source are described before parsing,
 // relative paths resolving against the directory of the *original* file (the

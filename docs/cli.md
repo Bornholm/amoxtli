@@ -245,6 +245,7 @@ indexé, directement utilisables comme clés de `--filter` :
 | `mtime` | Date de dernière modification sur disque | `--filter mtime>=2026-01-01T00:00:00Z` |
 | `dirname` | Répertoire du fichier, exprimé comme la source (relatif à `--base-dir` s'il est posé, absolu sinon) | `--filter dirname=/docs` |
 | `indexed_at` | Date de passage à l'indexation | `--filter indexed_at<2026-01-01T00:00:00Z` |
+| `lang` | Langue naturelle dominante du document, code ISO 639-1 | `--filter lang=fr` |
 
 ```bash
 amoxtli sync --base-dir . ./docs
@@ -260,6 +261,55 @@ amoxtli doc list --filter indexed_at'<'2026-01-01T00:00:00Z   # documents jamais
   soupape quand l'attribut déduit ne convient pas.
 - Ces clés s'ajoutent à celles injectées par les analyseurs (`type=code`,
   `language=<nom>`) sans les remplacer.
+- `lang` est déduit du contenu, pas du fichier : il est donc posé quelle que
+  soit la voie d'ingestion (`add`, `sync`, API Go, MCP) et `--no-file-metadata`
+  ne le désactive pas. Ne pas le confondre avec `language`, qui désigne un
+  **langage de programmation** pour les documents `type=code`.
+- La détection est prudente : si elle n'est pas fiable — document trop court,
+  suite de chiffres, code brut — la clé `lang` est simplement **absente**. Une
+  valeur fausse exclurait silencieusement le document de tout filtre de langue,
+  une clé absente non. Conséquence pratique : `--filter lang=fr` ne remonte
+  jamais un document dont la langue n'a pas pu être établie ; utilisez
+  `--filter '!lang'` (absence) pour les inventorier.
+- `amoxtli collection stats <id>` récapitule les langues présentes et leur
+  volume — l'inventaire à consulter avant de conclure qu'une requête « ne
+  remonte rien » alors qu'elle interroge un fonds rédigé dans une autre langue.
+
+### Interroger un fonds multilingue (`retrieval.translation`)
+
+Une requête posée dans une autre langue que les documents perd du rappel, mais
+**pas sur les deux canaux de la même façon** : mesuré sur SciFact, une question
+française sur un corpus anglais coûte **40 %** du nDCG@10 au plein-texte contre
+**3 %** au vectoriel (`bge-m3`), un embedder multilingue franchissant déjà la
+barrière (voir [performance-overview.md](performance-overview.md)).
+
+```yaml
+retrieval:
+  translation:
+    enabled: true
+    max_languages: 2
+```
+
+Activée, l'option élargit la requête envoyée à l'index **plein-texte** avec sa
+traduction dans les langues du corpus (métadonnée `lang`) ; l'index vectoriel
+conserve la formulation d'origine.
+
+- La requête initiale est **conservée** à côté des traductions : pour BM25 la
+  concaténation agit comme une disjonction de termes, la transformation ne peut
+  donc pas coûter du rappel.
+- Un corpus déjà rédigé dans la langue de la question **ne déclenche aucun
+  appel** : les langues cibles sont l'inventaire du corpus moins celle de la
+  requête, et si le reste est vide la recherche passe sans étape LLM.
+- `max_languages` borne le nombre de langues cibles (les plus représentées
+  d'abord), *après* exclusion de la langue de la requête. Une longue traîne de
+  langues diluerait les statistiques de termes de BM25.
+- Le coût est d'un appel chat par requête distincte, mais la complétion est
+  déterministe (température 0, seed dérivé de la requête) donc **mise en cache
+  sur disque** — contrairement à HyDE dont la valeur tient à sa variété, une
+  même question reposée est gratuite.
+- `llm.stages.translate` permet de pointer cette étape vers un modèle plus
+  petit : traduire une requête courte ne demande pas le modèle de raisonnement
+  du reste du pipeline.
 - `--no-file-metadata` les désactive ; seul ce qui est passé par `--meta` est
   alors enregistré.
 - Elles ne sont posées qu'au moment où le fichier est lu sur le disque : les

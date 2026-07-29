@@ -29,6 +29,14 @@ import (
 //	AMOXTLI_EVAL_SAMPLE_QUERIES=150
 //	AMOXTLI_EVAL_SAMPLE_DOCS=500
 //
+// To measure the cross-lingual penalty, point _QUERIES_TRANSLATED at the same
+// queries.jsonl translated offline into another language (same _id values).
+// The corpus and qrels stay as they are, so the delta against the baseline run
+// is attributable to the language gap alone:
+//
+//	AMOXTLI_EVAL_BEIR_QUERIES_TRANSLATED=/path/queries.fr.jsonl
+//	AMOXTLI_EVAL_BEIR_QUERIES_LANG=fr
+//
 // The workdir, RRF weights, embeddings and reranking knobs are identical to
 // TestEvaluateRealWorld (see its doc comment).
 func TestEvaluateBEIR(t *testing.T) {
@@ -99,6 +107,34 @@ func TestEvaluateBEIR(t *testing.T) {
 			}
 		}
 		t.Logf("attached gold answers to %d/%d queries", attached, len(dataset.Queries))
+	}
+
+	// Cross-lingual run: swap the queries for the same questions written in
+	// another language, leaving the corpus and the gold set untouched. The
+	// delta against the baseline run is the cost of the query↔document
+	// language gap — the number to look at before deciding whether query
+	// translation is worth an LLM call per search.
+	if trPath := os.Getenv("AMOXTLI_EVAL_BEIR_QUERIES_TRANSLATED"); trPath != "" {
+		translations, err := beir.LoadQueries(trPath)
+		if err != nil {
+			t.Fatalf("load translated BEIR queries: %+v", errors.WithStack(err))
+		}
+
+		trLang := os.Getenv("AMOXTLI_EVAL_BEIR_QUERIES_LANG")
+		if trLang == "" {
+			trLang = "xx"
+		}
+
+		var translated int
+		dataset, translated = dataset.TranslateQueries(translations, trLang)
+
+		if translated < len(dataset.Queries) {
+			t.Logf("WARNING: only %d/%d queries translated — the remainder stays in its original language, which blurs the comparison",
+				translated, len(dataset.Queries))
+		}
+
+		t.Logf("evaluating %d/%d queries translated to %q against the untouched %q corpus",
+			translated, len(dataset.Queries), trLang, name)
 	}
 
 	topK := envInt(t, "AMOXTLI_EVAL_TOPK", 10)

@@ -2,9 +2,11 @@ package bleve
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 
-	"github.com/abadojack/whatlanggo"
+	"github.com/bornholm/amoxtli/internal/lang"
+
 	"github.com/blevesearch/bleve/v2/analysis"
 	"github.com/blevesearch/bleve/v2/analysis/char/asciifolding"
 	"github.com/blevesearch/bleve/v2/analysis/lang/en"
@@ -48,30 +50,9 @@ type DetectLangAppendCharFilter struct {
 }
 
 func (c *DetectLangAppendCharFilter) Filter(input []byte) []byte {
-	var langs []string
-	hasDefLang := false
-	if len(input) > 0 {
-		sInput := string(input)
-		options := whatlanggo.Options{
-			Blacklist: map[whatlanggo.Lang]bool{},
-		}
-		for i := 0; i < 8; i++ {
-			info := whatlanggo.DetectWithOptions(sInput, options)
-			options.Blacklist[info.Lang] = true
-			lang := info.Lang.Iso6391()
-			langs = append(langs, lang)
-			if !hasDefLang && lang == c.defaultLang {
-				hasDefLang = true
-			}
-			if !info.IsReliable() {
-				if !hasDefLang {
-					langs = append(langs, c.defaultLang)
-					hasDefLang = true
-				}
-				break
-			}
-		}
-	}
+	langs := lang.DetectAll(string(input), lang.MaxDetected)
+
+	hasDefLang := slices.Contains(langs, c.defaultLang)
 	if !hasDefLang {
 		langs = append(langs, c.defaultLang)
 	}

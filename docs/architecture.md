@@ -46,7 +46,17 @@ Le pipeline fusionne les listes de résultats des différents indexeurs par **Re
 
 ### Transformation de requête par-index (`index.Semantic`)
 
-La transformation de requête est appliquée **par-index** : les transformers marqués sémantiques (interface `pipeline.SemanticQueryTransformer`, implémentée par HyDE) ne sont appliqués qu'aux indexeurs déclarant l'interface de capacité `index.Semantic` (`Semantic() bool`), car l'expansion de requête aide la recherche vectorielle mais dégrade souvent le plein-texte. `index/sqlitevec` déclare cette capacité ; `index/bleve` (lexical) et `index/postgres` (hybride, gérant sa propre fusion lexical/vectoriel en interne) ne la déclarent pas et reçoivent la requête brute. Si aucun indexeur n'est sémantique, HyDE (et son appel LLM) est purement et simplement ignoré.
+La transformation de requête est appliquée **par-index**. Chaque transformer se range dans l'une de trois portées :
+
+| Portée | Marqueur | Destinataires | Exemple |
+|---|---|---|---|
+| Universelle (défaut) | aucun | tous les indexeurs | normalisation |
+| Sémantique | `pipeline.SemanticQueryTransformer` | indexeurs déclarant `index.Semantic` | HyDE |
+| Lexicale | `pipeline.LexicalQueryTransformer` | indexeurs ne la déclarant pas | traduction de requête |
+
+Les deux jambes partent de la requête universellement transformée puis divergent : ce qui aide l'une dégrade régulièrement l'autre. L'expansion de requête aide le vectoriel et nuit au plein-texte ; inversement une traduction est le **seul** remède du lexical face à une requête dans une autre langue que le corpus (aucun analyseur ne fera correspondre `chien` à `dog`), alors qu'un embedder multilingue franchit déjà la barrière — mesuré sur SciFact, une requête française coûte 40 % du nDCG@10 au lexical contre 3 % au vectoriel (voir [performance-overview.md](performance-overview.md) § Écart cross-lingue).
+
+`index/sqlitevec` déclare la capacité sémantique ; `index/bleve` (lexical) et `index/postgres` (hybride, gérant sa propre fusion lexical/vectoriel en interne) ne la déclarent pas. Les deux variantes sont calculées **paresseusement et au plus une fois**, depuis les jambes qui en ont besoin : chaque jambe n'attend que son propre aller-retour LLM, jamais celui de l'autre. Un pipeline sans indexeur sémantique ignore purement et simplement HyDE et son appel LLM — et symétriquement pour un pipeline sans indexeur lexical. Déclarer les deux marqueurs est contradictoire : le transformer n'est alors appliqué nulle part, et `pipeline.NewIndex` le signale au câblage.
 
 ### Métadonnées de documents et filtrage (`index.Filter`)
 

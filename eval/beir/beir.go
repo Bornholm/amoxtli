@@ -296,6 +296,15 @@ func loadCorpus(path, name, lang string) (*eval.Corpus, map[string]struct{}, err
 	return corpus, present, nil
 }
 
+// LoadQueries reads a BEIR queries.jsonl file and returns the query text per
+// query id. It is exported so a caller can load a *second* query file — the
+// same queries translated into another language — and swap it into a dataset
+// with eval.Dataset.TranslateQueries, which is how cross-lingual recall is
+// measured without a translation model in the loop.
+func LoadQueries(path string) (map[string]string, error) {
+	return loadQueries(path)
+}
+
 func loadQueries(path string) (map[string]string, error) {
 	f, err := os.Open(path)
 	if err != nil {

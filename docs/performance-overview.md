@@ -130,6 +130,76 @@ Lecture :
 > cache converge. Reste à confirmer la hiérarchie sur **corpus complet** (prochain
 > incrément).
 
+### Écart cross-lingue (requête FR sur corpus EN)
+
+Même index, mêmes qrels, **seule la langue des requêtes change** : les 300
+requêtes du test set SciFact ont été traduites en français hors ligne
+(`scripts/translate_beir_queries.py`, `mistral-medium-3-5`, température 0) puis
+rejouées contre le corpus anglais complet (5183 documents). Embeddings
+`bge-m3`, profil `fast` (aucun appel chat à la recherche).
+
+| Canal | nDCG@10 EN | nDCG@10 FR | Δ | Recall@10 EN | Recall@10 FR | Δ | MRR EN | MRR FR |
+|---|---|---|---|---|---|---|---|---|
+| Lexical seul (BM25) | 0.681 | 0.410 | **−40 %** | 0.816 | 0.531 | **−35 %** | 0.644 | 0.379 |
+| Vectoriel seul (`bge-m3`) | 0.489 | 0.473 | **−3 %** | 0.742 | 0.712 | −4 % | 0.413 | 0.401 |
+| **Hybride** (RRF 0.50/0.50) | **0.692** | **0.559** | **−19 %** | **0.829** | **0.701** | **−15 %** | 0.658 | 0.524 |
+
+### Ce que la traduction de requête récupère
+
+Troisième run, mêmes 300 requêtes françaises et même index, `retrieval.translation`
+activée (traduction vers `en`, `mistral-medium-3-5`) :
+
+| Configuration | nDCG@10 | Recall@10 | Recall@3 | MRR |
+|---|---|---|---|---|
+| Référence EN (plafond) | 0.692 | 0.829 | 0.705 | 0.658 |
+| FR sans traduction | 0.559 | 0.701 | 0.556 | 0.524 |
+| **FR + traduction lexicale** | **0.650** | **0.793** | **0.658** | **0.614** |
+| *Écart récupéré* | *+0.091 (68 %)* | *+0.092 (72 %)* | *+0.102 (69 %)* | *+0.090 (67 %)* |
+
+La transformation reprend **environ les deux tiers** de ce que la barrière de
+langue avait coûté, et le fait uniformément du haut au bas de la liste. Le tiers
+restant (0.042 de nDCG@10, 6 % relatif) est le prix de la traduction elle-même :
+un LLM ne reconstitue pas la requête anglaise d'origine terme pour terme, et la
+requête élargie reste une union de deux formulations plutôt que la bonne.
+
+Coût mesuré : **1,0 appel chat par requête**, 0,68 s de latence médiane, ~55 k
+tokens de prompt et ~11 k de complétion pour les 300 requêtes. En production la
+complétion est déterministe et mise en cache sur disque, donc une question
+reposée est gratuite — le harnais d'évaluation, lui, ne câble pas ce cache sur
+son client chat, d'où les 300 appels facturés ici.
+
+Lecture :
+
+- **Un embedder multilingue franchit la barrière de langue, pas BM25.** `bge-m3`
+  ne perd que 3 points relatifs de nDCG@10 ; le canal lexical en perd 40. La
+  perte hybride de 19 % est **entièrement importée par la jambe lexicale** — ce
+  qui est logique : aucun analyseur ne fera correspondre `chien` à `dog`.
+- **L'ordre des canaux s'inverse.** En anglais, le lexical domine le vectoriel
+  sur SciFact (0.681 vs 0.489) ; en français il passe dessous (0.410 vs 0.473).
+  C'est précisément parce que le lexical est le canal *fort* de ce corpus que
+  son effondrement pèse autant sur la fusion.
+- **La dégradation frappe la tête de liste.** Recall@1 −22 %, Recall@10 −15 % :
+  les bons documents ne disparaissent pas tant qu'ils cessent de remonter.
+- **Conséquence de conception** : une traduction de requête n'a d'intérêt que
+  pour le canal lexical. L'appliquer à la requête sémantique ferait payer un
+  appel LLM pour remplacer la question de l'utilisateur par une paraphrase, au
+  bénéfice d'un canal qui n'en a pas besoin. Le run anglais est la **borne
+  supérieure** de ce qu'une telle traduction peut restaurer (≈ +0.13 nDCG@10 sur
+  la fusion), atteinte seulement si la traduction est parfaite.
+- **Ne pas généraliser à un autre embedder.** Ces 3 % sont une propriété de
+  `bge-m3`. Un modèle anglophone (`mxbai-embed-large`) verrait sa jambe
+  vectorielle décrocher aussi, et le verdict changerait.
+
+**Remédiation disponible** : `retrieval.translation` (option
+`amoxtli.WithQueryTranslation`) élargit la requête du **seul** canal lexical
+avec sa traduction dans les langues du corpus — elle en récupère les deux tiers,
+voir ci-dessous. L'option est désactivée par défaut : elle coûte un appel chat
+par requête distincte (mis en cache), et un corpus interrogé dans sa propre
+langue n'a rien à y gagner.
+
+Reproduction : voir [evaluation.md](evaluation.md) § « Mesurer l'écart
+cross-lingue ».
+
 ## 3. Les leviers de configuration
 
 | Levier | Ce qu'il achète | Ce qu'il coûte | Option |
@@ -139,6 +209,7 @@ Lecture :
 | Reranking | Précision de tête (MRR, nDCG@1) | 1 appel LLM/requête ; perte de rappel profond | `WithReranking()` + `WithLLMClient` |
 | HyDE | Rappel sur requêtes courtes / vocabulaire éloigné | 1 appel LLM/requête ; embedder à grand contexte requis | LLM + ne pas `WithDisableHyDE()` |
 | Judge | Précision (retire le hors-sujet) | Appels LLM ; risque de sur-filtrer | ne pas `WithDisableJudge()` |
+| Traduction de requête | Rappel lexical quand requête et corpus diffèrent de langue (jusqu'à +40 % sur la jambe BM25) | 1 appel LLM/requête distincte (mis en cache) ; inutile en corpus monolingue interrogé dans sa langue | `WithQueryTranslation(n)` |
 | Grounding + itératif (**demote**) | Meilleure récupération pure (rappel + classement) | Plusieurs appels LLM/requête | `WithGroundingCheck()`, `WithGroundingMode(GroundingDemote)`, `WithIterativeRetrieval(n)` |
 | Grounding + itératif (**filter**) | Évidence minimale et très pure pour un générateur | Plusieurs appels LLM/requête ; coupe le rappel | `WithGroundingCheck()`, `WithIterativeRetrieval(n)` |
 

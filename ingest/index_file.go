@@ -12,9 +12,11 @@ import (
 	"path/filepath"
 	"slices"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bornholm/amoxtli/convert"
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/internal/lang"
 	"github.com/bornholm/amoxtli/internal/workflow"
 	"github.com/bornholm/amoxtli/markdown"
 	"github.com/bornholm/amoxtli/model"
@@ -252,6 +254,53 @@ func imageBaseDir(source *url.URL) string {
 	return filepath.Dir(source.Path)
 }
 
+// MetadataKeyLang is the metadata key carrying the dominant *natural* language
+// of a document, as an ISO 639-1 code ("fr", "en", ...). It is distinct from
+// the "language" key the source-code parser injects, which names a programming
+// language.
+const MetadataKeyLang = "lang"
+
+// langDetectionSampleSize bounds how much of a document is fed to the language
+// detector. The dominant language of a text is settled well before that, and
+// the cap keeps the cost of a large document constant.
+const langDetectionSampleSize = 8 << 10
+
+// setDetectedLang records the dominant natural language of the document under
+// MetadataKeyLang. Detection is best-effort and the key is left out entirely
+// when it is unreliable — an absent key is honest, a wrong one silently
+// excludes the document from any lang filter.
+func setDetectedLang(doc parsedDocument, data []byte) {
+	code, reliable := lang.Detect(langDetectionSample(data))
+	if !reliable {
+		return
+	}
+
+	metadata := model.Metadata(doc)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+
+	metadata[MetadataKeyLang] = code
+
+	doc.SetMetadata(metadata)
+}
+
+// langDetectionSample returns the leading langDetectionSampleSize bytes of
+// data, cut back to a rune boundary so the detector is never handed a mangled
+// character.
+func langDetectionSample(data []byte) string {
+	if len(data) <= langDetectionSampleSize {
+		return string(data)
+	}
+
+	sample := data[:langDetectionSampleSize]
+	for len(sample) > 0 && !utf8.Valid(sample[len(sample)-1:]) {
+		sample = sample[:len(sample)-1]
+	}
+
+	return string(sample)
+}
+
 // Handle implements [task.Handler].
 func (h *IndexFileHandler) Handle(ctx context.Context, tsk task.Task, events chan task.Event) error {
 	// Add a 2-hour timeout for the entire task execution
@@ -370,6 +419,8 @@ func (h *IndexFileHandler) Handle(ctx context.Context, tsk task.Task, events cha
 				if indexFileTask.etag != "" {
 					doc.SetETag(indexFileTask.etag)
 				}
+
+				setDetectedLang(doc, data)
 
 				// Merge user-supplied metadata over the parser-injected base
 				// (e.g. type/language for source code); user values win.

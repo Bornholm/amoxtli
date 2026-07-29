@@ -105,21 +105,24 @@ func parityCorpus() []parityDoc {
 	for i := range 120 {
 		topic := topics[i%len(topics)]
 
-		// One document in twelve is French; one in three is recent.
-		lang := "en"
+		// One document in twelve belongs to the "fr" region; one in three is
+		// recent. The key is deliberately not "lang": that one is filled in
+		// automatically at ingestion, so a document could never be missing it
+		// and the absent-key case below would not be exercised.
+		region := "en"
 		if i%12 == 0 {
-			lang = "fr"
+			region = "fr"
 		}
 		year := 2019.0
 		if i%3 == 0 {
 			year = 2026.0
 		}
 
-		metadata := map[string]any{"lang": lang, "year": year}
-		// A tenth of the corpus carries no lang at all, to exercise the
+		metadata := map[string]any{"region": region, "year": year}
+		// A tenth of the corpus carries no region at all, to exercise the
 		// absent-key semantics on both paths.
 		if i%10 == 7 {
-			delete(metadata, "lang")
+			delete(metadata, "region")
 		}
 
 		docs = append(docs, parityDoc{
@@ -160,11 +163,11 @@ func TestPushdownEvalParity(t *testing.T) {
 		conditions []index.Condition
 	}{
 		{"unfiltered", nil},
-		{"selective equality", []index.Condition{index.Eq("lang", "fr")}},
-		{"absent key", []index.Condition{index.NotExists("lang")}},
-		{"inequality", []index.Condition{index.Ne("lang", "fr")}},
+		{"selective equality", []index.Condition{index.Eq("region", "fr")}},
+		{"absent key", []index.Condition{index.NotExists("region")}},
+		{"inequality", []index.Condition{index.Ne("region", "fr")}},
 		{"range", []index.Condition{index.Gte("year", 2020)}},
-		{"conjunction", []index.Condition{index.Eq("lang", "en"), index.Gte("year", 2020)}},
+		{"conjunction", []index.Condition{index.Eq("region", "en"), index.Gte("year", 2020)}},
 	}
 
 	for _, tc := range filters {

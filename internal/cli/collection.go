@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"cmp"
 	"fmt"
+	"maps"
+	"slices"
 	"text/tabwriter"
 
 	"github.com/bornholm/amoxtli/ingest"
@@ -220,15 +223,39 @@ func newCollectionStatsCommand(opts *rootOptions) *cobra.Command {
 				}
 
 				if opts.json {
-					return printJSON(cmd.OutOrStdout(), map[string]any{"id": id, "total_documents": stats.TotalDocuments})
+					return printJSON(cmd.OutOrStdout(), map[string]any{
+						"id":              id,
+						"total_documents": stats.TotalDocuments,
+						"languages":       stats.Languages,
+					})
 				}
 
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Collection %s: %d document(s)\n", id, stats.TotalDocuments)
+
+				for _, code := range sortedLanguages(stats.Languages) {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s: %d document(s)\n", code, stats.Languages[code])
+				}
 
 				return nil
 			})
 		},
 	}
+}
+
+// sortedLanguages orders the language inventory by decreasing document count,
+// ties broken on the code so the listing is stable between runs.
+func sortedLanguages(languages map[string]int64) []string {
+	codes := slices.Collect(maps.Keys(languages))
+
+	slices.SortFunc(codes, func(a, b string) int {
+		if languages[a] != languages[b] {
+			return cmp.Compare(languages[b], languages[a])
+		}
+
+		return cmp.Compare(a, b)
+	})
+
+	return codes
 }
 
 func newCollectionDeleteCommand(opts *rootOptions) *cobra.Command {

@@ -281,23 +281,29 @@ func (i *Index) Filterable() bool {
 }
 
 func (i *Index) search(ctx context.Context, query string, filter index.Filter, opts index.SearchOptions) ([]*index.SearchResult, error) {
-	// Query transformation is per-index: semantic (vector) indexes receive the
-	// query expanded by the semantic-only transformers (e.g. HyDE) while
-	// lexical indexes keep the raw (universally transformed) query, as query
-	// expansion tends to help vector search but degrade full-text search.
+	// Query transformation is per-index: each leg starts from the universally
+	// transformed query, then gets the variant its own retrieval model calls
+	// for — the semantic-only transformers (e.g. HyDE) for vector indexes, the
+	// lexical-only ones (e.g. query translation) for full-text indexes. What
+	// helps one leg routinely hurts the other, which is why neither variant
+	// leaks into the other's query.
 	baseQuery, err := i.transformBaseQuery(ctx, query, opts)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	// The semantic variant is computed lazily and at most once, from inside the
-	// semantic legs: lexical indexes start searching baseQuery immediately
-	// instead of waiting for the LLM round-trip of HyDE, so the total latency
-	// is max(semantic transform + vector search, lexical search) rather than
-	// their sum. Lexical-only pipelines never invoke it at all, preserving the
-	// no-HyDE-without-semantic-index property.
+	// Both variants are computed lazily and at most once, from inside the legs
+	// that need them: each leg waits for its own LLM round-trip and not for the
+	// other's, so the total latency is the max of the two branches rather than
+	// their sum. A pipeline without any semantic index never invokes the
+	// semantic variant — preserving the no-HyDE-without-semantic-index property
+	// — and symmetrically for a pipeline without any lexical index.
 	semanticQueryOnce := sync.OnceValues(func() (string, error) {
 		return i.transformSemanticQuery(ctx, baseQuery, opts)
+	})
+
+	lexicalQueryOnce := sync.OnceValues(func() (string, error) {
+		return i.transformLexicalQuery(ctx, baseQuery, opts)
 	})
 
 	count := len(i.indexes)
@@ -341,18 +347,19 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 
 			indexCtx := slogx.WithAttrs(ctx, slog.String("index_type", fmt.Sprintf("%T", identified.Index())))
 
-			indexQuery := baseQuery
+			variant := lexicalQueryOnce
 			if index.IsSemantic(identified.Index()) {
-				semanticQuery, err := semanticQueryOnce()
-				if err != nil {
-					err = errors.WithStack(err)
-					slog.ErrorContext(indexCtx, "could not transform query", slog.Any("error", err))
-					messages <- &Message{
-						Err: err,
-					}
-					return
+				variant = semanticQueryOnce
+			}
+
+			indexQuery, err := variant()
+			if err != nil {
+				err = errors.WithStack(err)
+				slog.ErrorContext(indexCtx, "could not transform query", slog.Any("error", err))
+				messages <- &Message{
+					Err: err,
 				}
-				indexQuery = semanticQuery
+				return
 			}
 
 			legOpts := index.SearchOptions{
@@ -364,10 +371,7 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 			// query: its top-k is then k *matching* results, instead of a top-k
 			// the filter may empty afterwards. Filterable above guarantees every
 			// leg can, so there is no unfiltered leg to reconcile here.
-			var (
-				results []*index.SearchResult
-				err     error
-			)
+			var results []*index.SearchResult
 			if filterable, ok := index.AsFilterable(identified.Index()); ok && len(filter) > 0 {
 				results, err = filterable.SearchFiltered(indexCtx, indexQuery, filter, legOpts)
 			} else {
@@ -432,14 +436,14 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 	return transformed, nil
 }
 
-// transformBaseQuery applies the universal (non semantic-only) query
-// transformers; the result is the query sent to lexical indexes and the input
-// of the semantic variant.
+// transformBaseQuery applies the universal query transformers — those opting
+// into neither marker. The result is the common input of both the lexical and
+// the semantic variants.
 func (i *Index) transformBaseQuery(ctx context.Context, query string, opts index.SearchOptions) (string, error) {
 	baseQuery := query
 	var err error
 	for _, t := range i.queryTransformers {
-		if isSemanticOnly(t) {
+		if scopeOf(t) != scopeUniversal {
 			continue
 		}
 		baseQuery, err = t.TransformQuery(ctx, baseQuery, opts)
@@ -450,6 +454,25 @@ func (i *Index) transformBaseQuery(ctx context.Context, query string, opts index
 	return baseQuery, nil
 }
 
+// transformLexicalQuery applies the lexical-only transformers (e.g. query
+// translation) on top of the already base-transformed query. Like its semantic
+// counterpart it is only invoked — lazily, from Search — when at least one
+// lexical index needs it, so a purely semantic pipeline never pays for it.
+func (i *Index) transformLexicalQuery(ctx context.Context, baseQuery string, opts index.SearchOptions) (string, error) {
+	lexicalQuery := baseQuery
+	var err error
+	for _, t := range i.queryTransformers {
+		if scopeOf(t) != scopeLexical {
+			continue
+		}
+		lexicalQuery, err = t.TransformQuery(ctx, lexicalQuery, opts)
+		if err != nil {
+			return "", errors.WithStack(err)
+		}
+	}
+	return lexicalQuery, nil
+}
+
 // transformSemanticQuery applies the semantic-only transformers (e.g. HyDE, an
 // LLM call) on top of the already base-transformed query. It is only invoked —
 // lazily, from Search — when at least one semantic index needs it.
@@ -457,7 +480,7 @@ func (i *Index) transformSemanticQuery(ctx context.Context, baseQuery string, op
 	semanticQuery := baseQuery
 	var err error
 	for _, t := range i.queryTransformers {
-		if !isSemanticOnly(t) {
+		if scopeOf(t) != scopeSemantic {
 			continue
 		}
 		semanticQuery, err = t.TransformQuery(ctx, semanticQuery, opts)
@@ -570,6 +593,19 @@ func (i *Index) mergeResults(indexResults []*indexSearchResults, maxResults int)
 
 func NewIndex(indexes WeightedIndexes, funcs ...OptionFunc) *Index {
 	opts := NewOptions(funcs...)
+
+	// "Only lexical" and "only semantic" intersect to nothing, so a transformer
+	// declaring both is silently applied nowhere. Say so once, at wiring time,
+	// rather than leaving the author to wonder why their transformation never
+	// runs.
+	for _, t := range opts.QueryTransformers {
+		if scopeOf(t) == scopeNone {
+			slog.Warn("query transformer declares itself both semantic-only and lexical-only, it will never be applied",
+				slog.String("transformer", fmt.Sprintf("%T", t)),
+			)
+		}
+	}
+
 	return &Index{
 		queryTransformers:   opts.QueryTransformers,
 		resultsTransformers: opts.ResultsTransformers,

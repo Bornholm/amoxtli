@@ -1,6 +1,6 @@
 package postgres
 
-import "github.com/abadojack/whatlanggo"
+import "github.com/bornholm/amoxtli/internal/lang"
 
 // textSearchConfigs maps ISO 639-1 language codes to the text search
 // configurations shipped with PostgreSQL 13+.
@@ -39,12 +39,12 @@ func detectTextSearchConfig(text string, fallback string) string {
 		return fallback
 	}
 
-	info := whatlanggo.Detect(text)
-	if !info.IsReliable() {
+	code, reliable := lang.Detect(text)
+	if !reliable {
 		return fallback
 	}
 
-	config, exists := textSearchConfigs[info.Lang.Iso6391()]
+	config, exists := textSearchConfigs[code]
 	if !exists {
 		return fallback
 	}

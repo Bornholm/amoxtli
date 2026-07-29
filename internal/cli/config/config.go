@@ -190,7 +190,7 @@ type LLMConfig struct {
 
 // StageNames lists the retrieval stages accepted under llm.stages, mirroring
 // amoxtli.Stages.
-var StageNames = []string{"hyde", "judge", "grounding", "rerank", "decompose", "reformulate"}
+var StageNames = []string{"hyde", "judge", "grounding", "rerank", "decompose", "reformulate", "translate"}
 
 type ClientConfig struct {
 	Provider string `yaml:"provider"`
@@ -278,6 +278,19 @@ type RetrievalConfig struct {
 	MaxSectionWords int                 `yaml:"max_section_words"`
 	Iterative       IterativeConfig     `yaml:"iterative"`
 	Decomposition   DecompositionConfig `yaml:"decomposition"`
+	Translation     TranslationConfig   `yaml:"translation"`
+}
+
+// TranslationConfig widens the query sent to the full-text index with its
+// translation into the languages the corpus is written in (metadata "lang",
+// detected at ingestion). Off by default: it costs one chat call per distinct
+// query and only pays off when questions and documents are in different
+// languages.
+type TranslationConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// MaxLanguages bounds how many corpus languages the query is translated
+	// into, most represented first. Zero defers to the library default (2).
+	MaxLanguages int `yaml:"max_languages"`
 }
 
 type IterativeConfig struct {
@@ -422,6 +435,9 @@ func Default() *Config {
 			},
 			Decomposition: DecompositionConfig{
 				MaxSubQueries: 3,
+			},
+			Translation: TranslationConfig{
+				MaxLanguages: 2,
 			},
 		},
 		Converter: ConverterConfig{
@@ -631,6 +647,9 @@ func (c *Config) Validate() error {
 		}
 		if c.Retrieval.Decomposition.Enabled {
 			needsChat = append(needsChat, "retrieval.decomposition")
+		}
+		if c.Retrieval.Translation.Enabled {
+			needsChat = append(needsChat, "retrieval.translation")
 		}
 		if len(needsChat) > 0 {
 			return errors.Errorf("%s requires llm.chat to be configured", strings.Join(needsChat, ", "))

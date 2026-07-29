@@ -171,6 +171,49 @@ et le reranking avec `AMOXTLI_EVAL_RERANK=1`. Le sous-échantillonnage
 documents pertinents des requêtes retenues, puis complète avec des distracteurs —
 chaque requête gardée reste donc répondable.
 
+### Mesurer l'écart cross-lingue
+
+Un corpus en anglais interrogé en français perd du rappel, mais l'ampleur de la
+perte dépend entièrement de l'embedder : un modèle multilingue (`bge-m3`,
+`multilingual-e5`) aligne déjà les deux langues, un modèle anglophone non. Le
+canal lexical, lui, est structurellement incapable de franchir la barrière —
+`chien` ne matchera jamais `dog`. Avant d'investir dans une traduction de
+requête à l'exécution, **chiffrer la perte** sur sa propre configuration :
+
+```bash
+# 1. Traduire hors ligne queries.jsonl en conservant les _id. Le script ne
+#    traduit que les requêtes jugées dans les qrels et reprend là où il s'est
+#    arrêté si le fournisseur rate-limite.
+scripts/eval_env.sh python3 scripts/translate_beir_queries.py \
+  --queries .eval-data/scifact/queries.jsonl \
+  --qrels .eval-data/scifact/qrels/test.tsv \
+  --out .eval-data/scifact/queries.fr.jsonl --lang French
+
+# 2. Rejouer le même corpus et les mêmes qrels avec les requêtes traduites.
+#    AMOXTLI_EVAL_WORKDIR réutilise l'index du run de référence : aucune
+#    ré-ingestion, donc les deux runs portent sur des vecteurs identiques.
+AMOXTLI_EVAL_BEIR_QUERIES_TRANSLATED=.eval-data/scifact/queries.fr.jsonl \
+AMOXTLI_EVAL_BEIR_QUERIES_LANG=fr \
+AMOXTLI_EVAL_WORKDIR=.eval-workdir-xlingual \
+make eval-beir EVAL_BEIR=scifact EVAL_SAMPLE_DOCS=0
+```
+
+Pour attribuer la perte à un canal, rejouer chaque langue en **lexical seul**
+(ne pas configurer `AMOXTLI_EVAL_EMBED_*`, avec un workdir dédié) puis en
+**vectoriel seul** (`AMOXTLI_EVAL_BLEVE_WEIGHT=0`). Résultats mesurés dans
+[performance-overview.md](performance-overview.md) § « Écart cross-lingue » :
+sur SciFact, `bge-m3` ne perd que 3 % de nDCG@10 là où BM25 en perd 40.
+
+Seules les requêtes changent : le corpus, les qrels et l'index sont identiques
+au run de référence, donc l'écart de nDCG/rappel est imputable à la seule
+barrière de langue. Les requêtes sans traduction sont conservées telles quelles
+et le test le signale — un fichier partiel mélange deux langues et ne mesure
+proprement ni l'une ni l'autre.
+
+Côté corpus, `amoxtli collection stats <id>` donne l'inventaire des langues
+réellement indexées (métadonnée `lang`, cf. [cli.md](cli.md)), c'est-à-dire les
+langues cibles vers lesquelles une traduction de requête aurait un sens.
+
 ### FEVER et les très gros corpus (chargement en streaming)
 
 Le corpus BEIR de **FEVER** (fact-checking sur Wikipédia) compte **~5,4 M de

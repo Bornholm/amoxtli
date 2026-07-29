@@ -91,7 +91,7 @@ func testStoreConformance(t *testing.T, ctx context.Context, store *Store) {
 	// canonicalize it, since lexicographic comparison of stored dates is only
 	// chronological on a canonical format.
 	published := time.Date(2026, 7, 13, 14, 0, 0, 0, time.FixedZone("CEST", 2*3600))
-	doc.SetMetadata(map[string]any{"author": "william", "year": float64(2026), "published": published})
+	doc.SetMetadata(map[string]any{"author": "william", "year": float64(2026), "published": published, ingest.MetadataKeyLang: "en"})
 
 	if err := store.SaveDocuments(ctx, doc); err != nil {
 		t.Fatalf("could not save document: %+v", errors.WithStack(err))
@@ -158,6 +158,19 @@ func testStoreConformance(t *testing.T, ctx context.Context, store *Store) {
 	}
 	if len(sectionIDs) == 0 {
 		t.Errorf("expected persisted document to have sections")
+	}
+
+	// Collection stats, including the language inventory. The tally walks the
+	// documents/collections join table, so running here covers both dialects.
+	stats, err := store.GetCollectionStats(ctx, coll.ID())
+	if err != nil {
+		t.Fatalf("could not get collection stats: %+v", errors.WithStack(err))
+	}
+	if e, g := int64(1), stats.TotalDocuments; e != g {
+		t.Errorf("stats.TotalDocuments: expected %d, got %d", e, g)
+	}
+	if e, g := int64(1), stats.Languages["en"]; e != g {
+		t.Errorf("stats.Languages[\"en\"]: expected %d, got %d (languages: %+v)", e, g, stats.Languages)
 	}
 
 	// ListCollections (pipeline.CollectionLister)
