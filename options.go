@@ -469,6 +469,9 @@ type IndexFileOptions struct {
 	Source      *url.URL
 	ETag        string
 	Collections []model.CollectionID
+	// ImageBaseDir is the directory the relative image paths embedded in the
+	// document resolve against (see WithIndexFileImageBaseDir).
+	ImageBaseDir string
 	// Metadata is arbitrary document metadata used for filtering at search time.
 	Metadata map[string]any
 }
@@ -487,6 +490,21 @@ func WithIndexFileSource(source *url.URL) IndexFileOption {
 func WithIndexFileETag(etag string) IndexFileOption {
 	return func(o *IndexFileOptions) {
 		o.ETag = etag
+	}
+}
+
+// WithIndexFileImageBaseDir sets the directory the relative image paths
+// embedded in the document resolve against — normally the directory of the
+// file being indexed.
+//
+// Without it the directory is derived from the source, which is only correct
+// when the source is the file's own path. An indexer storing anything else
+// (a path relative to a repository root, an identifier from another scheme)
+// must set it: image enrichment is best-effort, so an unresolvable directory
+// costs the images of the document silently.
+func WithIndexFileImageBaseDir(dir string) IndexFileOption {
+	return func(o *IndexFileOptions) {
+		o.ImageBaseDir = dir
 	}
 }
 

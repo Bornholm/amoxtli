@@ -265,6 +265,75 @@ func TestIndexFileHandlerImageEnrichment(t *testing.T) {
 	}
 }
 
+// TestIndexFileHandlerImageEnrichmentRelativeSource covers the case the
+// source cannot serve as a base directory: indexed with --base-dir, it names a
+// location relative to a repository root, which does not exist on this
+// filesystem. Deriving the directory from it finds no image and, enrichment
+// being best-effort, indexes the document stripped of its illustrations
+// without any error — hence the explicit base directory.
+func TestIndexFileHandlerImageEnrichmentRelativeSource(t *testing.T) {
+	corpus := t.TempDir()
+	writeTestImage(t, filepath.Join(corpus, "img", "ecran.png"))
+
+	const document = `# Commandes
+
+![L'écran des commandes](img/ecran.png)
+`
+
+	staged := filepath.Join(t.TempDir(), "staged")
+	if err := os.WriteFile(staged, []byte(document), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	describer := &countingDescriber{
+		desc: &vision.Description{Description: "La liste des commandes de la clinique."},
+	}
+
+	store := &handlerStore{}
+	handler := NewIndexFileHandler(store, nil, &stubIndex{}, 250,
+		WithIndexFileHandlerImageEnrichment(imagetext.New(imagetext.WithDescriber(describer))),
+	)
+
+	// What the CLI stores under --base-dir: absolute-looking, yet nowhere on
+	// this filesystem.
+	source := &url.URL{Scheme: "file", Path: "/proj/docs/tutoriel/commandes.md"}
+	tsk := NewIndexFileTask(staged, "commandes.md", "etag", source, []model.CollectionID{"default"}, nil,
+		WithIndexFileTaskImageBaseDir(corpus),
+	)
+
+	events := make(chan task.Event, 128)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range events {
+		}
+	}()
+
+	if err := handler.Handle(context.Background(), tsk, events); err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	close(events)
+	<-done
+
+	if describer.calls != 1 {
+		t.Errorf("describer.calls: expected 1, got %d", describer.calls)
+	}
+
+	if len(store.saved) != 1 {
+		t.Fatalf("expected one saved document, got %d", len(store.saved))
+	}
+
+	content, err := store.saved[0].Content()
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	if !strings.Contains(string(content), "La liste des commandes de la clinique.") {
+		t.Errorf("document content: expected the image description, got:\n%s", content)
+	}
+}
+
 // TestIndexFileHandlerImageEnrichmentSkipsSourceCode locks that source files
 // never go through the markdown enrichment.
 func TestIndexFileHandlerImageEnrichmentSkipsSourceCode(t *testing.T) {
@@ -341,18 +410,58 @@ func TestIndexFileHandlerImageEnrichmentFailureIsNotFatal(t *testing.T) {
 
 func TestImageBaseDir(t *testing.T) {
 	testCases := []struct {
+		Name     string
 		Source   *url.URL
+		Explicit string
 		Expected string
 	}{
-		{&url.URL{Scheme: "file", Path: "/corpus/notes/note.md"}, "/corpus/notes"},
-		{&url.URL{Scheme: "https", Host: "example.net", Path: "/note.md"}, ""},
-		{nil, ""},
+		{"derived from the source", &url.URL{Scheme: "file", Path: "/corpus/notes/note.md"}, "", "/corpus/notes"},
+		{"non-file source", &url.URL{Scheme: "https", Host: "example.net", Path: "/note.md"}, "", ""},
+		{"no source", nil, "", ""},
+		// A source made relative to a base directory (CLI --base-dir) names a
+		// location that does not exist on this filesystem: the explicit
+		// directory is the only one the images can be resolved against.
+		{"explicit wins over a relative source", &url.URL{Scheme: "file", Path: "/proj/docs/note.md"}, "/srv/repos/proj/docs", "/srv/repos/proj/docs"},
+		{"explicit without a source", nil, "/srv/repos/proj/docs", "/srv/repos/proj/docs"},
 	}
 
 	for _, tc := range testCases {
-		if e, g := tc.Expected, imageBaseDir(tc.Source); e != g {
-			t.Errorf("imageBaseDir(%v): expected %q, got %q", tc.Source, e, g)
-		}
+		t.Run(tc.Name, func(t *testing.T) {
+			var funcs []IndexFileTaskOption
+			if tc.Explicit != "" {
+				funcs = append(funcs, WithIndexFileTaskImageBaseDir(tc.Explicit))
+			}
+
+			tsk := NewIndexFileTask("", "note.md", "", tc.Source, nil, nil, funcs...)
+
+			if e, g := tc.Expected, tsk.ImageBaseDir(); e != g {
+				t.Errorf("ImageBaseDir(): expected %q, got %q", e, g)
+			}
+		})
+	}
+}
+
+// TestIndexFileTaskImageBaseDirRoundTrip guards the persisted form: the
+// directory must survive a task being resumed from its payload, or a restart
+// silently reverts to the broken resolution.
+func TestIndexFileTaskImageBaseDirRoundTrip(t *testing.T) {
+	source := &url.URL{Scheme: "file", Path: "/proj/docs/note.md"}
+	tsk := NewIndexFileTask("/staging/x.md", "note.md", "etag", source, nil, nil,
+		WithIndexFileTaskImageBaseDir("/srv/repos/proj/docs"),
+	)
+
+	payload, err := tsk.MarshalJSON()
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	restored, err := IndexFileTaskFactory(tsk.ID(), payload)
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	if e, g := "/srv/repos/proj/docs", restored.(*IndexFileTask).ImageBaseDir(); e != g {
+		t.Errorf("restored ImageBaseDir(): expected %q, got %q", e, g)
 	}
 }
 

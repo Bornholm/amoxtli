@@ -328,6 +328,9 @@ func (c *Codex) IndexFile(ctx context.Context, collectionID model.CollectionID, 
 	if opts.ETag != "" {
 		ingestOpts = append(ingestOpts, ingest.WithIndexFileETag(opts.ETag))
 	}
+	if opts.ImageBaseDir != "" {
+		ingestOpts = append(ingestOpts, ingest.WithIndexFileImageBaseDir(opts.ImageBaseDir))
+	}
 	if len(opts.Metadata) > 0 {
 		ingestOpts = append(ingestOpts, ingest.WithIndexFileMetadata(opts.Metadata))
 	}

@@ -228,6 +228,10 @@ func scheduleFile(cmd *cobra.Command, rt *runtime.Runtime, collID model.Collecti
 	indexOpts := []amoxtli.IndexFileOption{
 		amoxtli.WithIndexFileSource(source),
 		amoxtli.WithIndexFileETag(etag),
+		// The source may be relative to --base-dir, and never names a location
+		// on this filesystem once it is: the embedded images resolve against
+		// the directory the file was actually read from.
+		amoxtli.WithIndexFileImageBaseDir(filepath.Dir(abs)),
 	}
 	if attached := metadata.build(abs, info, source); len(attached) > 0 {
 		indexOpts = append(indexOpts, amoxtli.WithIndexFileMetadata(attached))

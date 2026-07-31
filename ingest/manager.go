@@ -667,6 +667,10 @@ func (m *Manager) SupportedExtensions() []string {
 type IndexFileOptions struct {
 	ETag   string
 	Source *url.URL
+	// ImageBaseDir is the directory the relative image paths of the document
+	// resolve against. Empty falls back on the directory of the source, which
+	// only holds when the source is a filesystem path.
+	ImageBaseDir string
 	// Names of the collection to associate with the document
 	Collections []model.CollectionID
 	// Arbitrary document metadata used for filtering at search time.
@@ -701,6 +705,16 @@ func WithIndexFileETag(etag string) IndexFileOptionFunc {
 	}
 }
 
+// WithIndexFileImageBaseDir sets the directory the relative image paths
+// embedded in the document resolve against. Callers indexing a file whose
+// source is not its filesystem path must set it, otherwise its images cannot
+// be found (see IndexFileTask.ImageBaseDir).
+func WithIndexFileImageBaseDir(dir string) IndexFileOptionFunc {
+	return func(opts *IndexFileOptions) {
+		opts.ImageBaseDir = dir
+	}
+}
+
 func NewIndexFileOptions(funcs ...IndexFileOptionFunc) *IndexFileOptions {
 	opts := &IndexFileOptions{}
 	for _, fn := range funcs {
@@ -732,7 +746,9 @@ func (m *Manager) IndexFile(ctx context.Context, filename string, r io.Reader, f
 		return "", errors.WithStack(err)
 	}
 
-	indexFileTask := NewIndexFileTask(path, filename, opts.ETag, opts.Source, opts.Collections, opts.Metadata)
+	indexFileTask := NewIndexFileTask(path, filename, opts.ETag, opts.Source, opts.Collections, opts.Metadata,
+		WithIndexFileTaskImageBaseDir(opts.ImageBaseDir),
+	)
 
 	taskCtx := slogx.WithAttrs(context.Background(), slog.String("filename", filename), slog.String("filepath", path))
 

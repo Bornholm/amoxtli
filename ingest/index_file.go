@@ -33,6 +33,11 @@ type IndexFileTask struct {
 	originalName string
 	etag         string
 	source       *url.URL
+	// Directory the relative image paths of the document resolve against. It
+	// overrides the one derived from the source: the two part ways as soon as
+	// the source is a logical identifier rather than a filesystem path (see
+	// ImageBaseDir).
+	imageBaseDir string
 	// Names of the collection to associate with the document
 	collections []model.CollectionID
 	// Arbitrary document metadata used for filtering at search time.
@@ -44,6 +49,7 @@ type indexTaskPayload struct {
 	OriginalName string               `json:"originalName"`
 	Etag         string               `json:"etag"`
 	Source       string               `json:"source"`
+	ImageBaseDir string               `json:"imageBaseDir,omitempty"`
 	Collections  []model.CollectionID `json:"collections"`
 	Metadata     map[string]any       `json:"metadata,omitempty"`
 }
@@ -60,6 +66,7 @@ func (i *IndexFileTask) MarshalJSON() ([]byte, error) {
 		OriginalName: i.originalName,
 		Etag:         i.etag,
 		Source:       sourceStr,
+		ImageBaseDir: i.imageBaseDir,
 		Collections:  i.collections,
 		Metadata:     i.metadata,
 	}
@@ -84,6 +91,7 @@ func (i *IndexFileTask) UnmarshalJSON(data []byte) error {
 	i.etag = payload.Etag
 	i.originalName = payload.OriginalName
 	i.path = payload.Path
+	i.imageBaseDir = payload.ImageBaseDir
 	i.metadata = payload.Metadata
 
 	source, err := url.Parse(payload.Source)
@@ -96,8 +104,20 @@ func (i *IndexFileTask) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func NewIndexFileTask(path string, originalName string, etag string, source *url.URL, collections []model.CollectionID, metadata map[string]any) *IndexFileTask {
-	return &IndexFileTask{
+// IndexFileTaskOption configures an optional aspect of an IndexFileTask, kept
+// out of the constructor's positional arguments.
+type IndexFileTaskOption func(*IndexFileTask)
+
+// WithIndexFileTaskImageBaseDir sets the directory the relative image paths of
+// the document resolve against, overriding the one derived from the source.
+func WithIndexFileTaskImageBaseDir(dir string) IndexFileTaskOption {
+	return func(t *IndexFileTask) {
+		t.imageBaseDir = dir
+	}
+}
+
+func NewIndexFileTask(path string, originalName string, etag string, source *url.URL, collections []model.CollectionID, metadata map[string]any, funcs ...IndexFileTaskOption) *IndexFileTask {
+	t := &IndexFileTask{
 		id:           task.NewID(),
 		path:         path,
 		originalName: originalName,
@@ -106,6 +126,12 @@ func NewIndexFileTask(path string, originalName string, etag string, source *url
 		collections:  collections,
 		metadata:     metadata,
 	}
+
+	for _, fn := range funcs {
+		fn(t)
+	}
+
+	return t
 }
 
 // ID implements [task.Task].
@@ -226,7 +252,7 @@ func (h *IndexFileHandler) enrichImages(ctx context.Context, indexFileTask *Inde
 		)
 	}
 
-	enriched, err := h.imageEnricher.Enrich(ctx, data, imageBaseDir(indexFileTask.source), progress)
+	enriched, err := h.imageEnricher.Enrich(ctx, data, indexFileTask.ImageBaseDir(), progress)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, errors.WithStack(err)
@@ -242,16 +268,31 @@ func (h *IndexFileHandler) enrichImages(ctx context.Context, indexFileTask *Inde
 	return enriched, nil
 }
 
-// imageBaseDir returns the directory relative image paths resolve against: the
+// ImageBaseDir returns the directory relative image paths resolve against: the
 // directory of the *original* file, not of the staged copy the handler works
-// on. Only file: sources yield one — for any other scheme there is no local
-// directory to resolve against.
-func imageBaseDir(source *url.URL) string {
-	if source == nil || source.Scheme != "file" || source.Path == "" {
+// on.
+//
+// The explicit value set by the scheduler wins, and is the only reliable one:
+// falling back on the source assumes it carries a real filesystem path, which
+// is not a given. An indexer may well store a logical identifier instead — the
+// CLI's --base-dir makes sources relative to a base directory, keeping a
+// leading slash so they stay well-formed file URLs. Such a source still looks
+// absolute, so the fallback cannot tell it apart; it yields a directory that
+// does not exist, every image is silently skipped (enrichment is best-effort),
+// and the document is indexed without any of its illustrations. Schedulers
+// that know the real location must therefore say so.
+func (i *IndexFileTask) ImageBaseDir() string {
+	if i.imageBaseDir != "" {
+		return i.imageBaseDir
+	}
+
+	// Only file: sources yield one — for any other scheme there is no local
+	// directory to resolve against.
+	if i.source == nil || i.source.Scheme != "file" || i.source.Path == "" {
 		return ""
 	}
 
-	return filepath.Dir(source.Path)
+	return filepath.Dir(i.source.Path)
 }
 
 // MetadataKeyLang is the metadata key carrying the dominant *natural* language
