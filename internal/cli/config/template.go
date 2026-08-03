@@ -170,7 +170,10 @@ converter:
   #     api_key: ${OPENROUTER_API_KEY}
   #   extensions: [.png, .jpg, .jpeg, .webp, .gif]
   #   # Largest image sent to the model, in bytes. 0 = default (10 MiB).
+  #   # A larger image is downscaled to fit, not rejected.
   #   max_image_size: 10485760
+  #   # Largest image accepted for that downscaling. 0 = default (64 MiB).
+  #   max_source_size: 67108864
   #   # Custom description prompt (part of the description cache key).
   #   # prompt: |
   #   #   ...

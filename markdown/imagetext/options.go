@@ -28,6 +28,12 @@ const DefaultConcurrency = 2
 // would refuse is not worth carrying around either.
 const DefaultMaxImageBytes = vision.DefaultMaxImageBytes
 
+// DefaultMaxSourceBytes is the largest image accepted for a description, the
+// describer shrinking anything above DefaultMaxImageBytes to fit (see
+// vision.Shrink). It does not apply to inlining: a heavy image is worth
+// describing, not worth carrying as base64 inside the markdown.
+const DefaultMaxSourceBytes = vision.DefaultMaxSourceBytes
+
 // Fetcher resolves remote (http/https) image destinations. None is wired by
 // default: ingestion performs no network call of its own.
 type Fetcher interface {
@@ -52,6 +58,10 @@ type Options struct {
 	MaxImages int
 	// MaxImageBytes bounds the size of a single image.
 	MaxImageBytes int64
+	// MaxSourceBytes bounds the size of an image resolved for a description,
+	// which the describer shrinks when it exceeds the model limit. It is
+	// ignored when no describer is set (inlining).
+	MaxSourceBytes int64
 	// Concurrency bounds the parallel descriptions of a single document.
 	Concurrency int
 	// HTTPFetcher resolves http(s) destinations; nil skips them.
@@ -65,10 +75,11 @@ type OptionFunc func(opts *Options)
 
 func NewOptions(funcs ...OptionFunc) *Options {
 	opts := &Options{
-		MinDimension:  DefaultMinDimension,
-		MaxImages:     DefaultMaxImagesPerDocument,
-		MaxImageBytes: DefaultMaxImageBytes,
-		Concurrency:   DefaultConcurrency,
+		MinDimension:   DefaultMinDimension,
+		MaxImages:      DefaultMaxImagesPerDocument,
+		MaxImageBytes:  DefaultMaxImageBytes,
+		MaxSourceBytes: DefaultMaxSourceBytes,
+		Concurrency:    DefaultConcurrency,
 	}
 
 	for _, fn := range funcs {
@@ -76,6 +87,17 @@ func NewOptions(funcs ...OptionFunc) *Options {
 	}
 
 	return opts
+}
+
+// sourceLimit is the size beyond which an image is not even read. Describing
+// tolerates a heavy image — the describer re-encodes it — while inlining bounds
+// it strictly: those bytes travel inside the document.
+func (o *Options) sourceLimit() int64 {
+	if o.Describer == nil {
+		return o.MaxImageBytes
+	}
+
+	return max(o.MaxSourceBytes, o.MaxImageBytes)
 }
 
 // WithDescriber sets the describer producing the image descriptions.
@@ -136,6 +158,17 @@ func WithMaxImageBytes(maxBytes int64) OptionFunc {
 	return func(opts *Options) {
 		if maxBytes > 0 {
 			opts.MaxImageBytes = maxBytes
+		}
+	}
+}
+
+// WithMaxSourceBytes bounds the size of an image resolved for a description;
+// <= 0 keeps the default. Anything above MaxImageBytes is shrunk by the
+// describer before reaching the model.
+func WithMaxSourceBytes(maxBytes int64) OptionFunc {
+	return func(opts *Options) {
+		if maxBytes > 0 {
+			opts.MaxSourceBytes = maxBytes
 		}
 	}
 }

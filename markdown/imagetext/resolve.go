@@ -85,7 +85,7 @@ func resolveDataURL(destination string, opts *Options) (*resolvedImage, error) {
 	// A base64 payload is 4/3 of the decoded size: bound it before decoding
 	// rather than after, so an oversized inline image never lands in memory
 	// twice.
-	if int64(len(payload)) > (opts.MaxImageBytes/3+1)*4 {
+	if int64(len(payload)) > (opts.sourceLimit()/3+1)*4 {
 		return nil, errors.Wrap(errSkip, "image exceeds the size limit")
 	}
 
@@ -176,7 +176,7 @@ func resolveLocal(destination string, opts *Options) (*resolvedImage, error) {
 
 	// One byte past the limit: an oversized file is refused without being fully
 	// read into memory.
-	data, err := io.ReadAll(io.LimitReader(file, opts.MaxImageBytes+1))
+	data, err := io.ReadAll(io.LimitReader(file, opts.sourceLimit()+1))
 	if err != nil {
 		return nil, errors.Wrapf(errSkip, "could not read '%s'", path)
 	}
@@ -191,7 +191,7 @@ func validate(mimeType string, data []byte, opts *Options) (*resolvedImage, erro
 		return nil, errors.Wrap(errSkip, "empty image")
 	}
 
-	if int64(len(data)) > opts.MaxImageBytes {
+	if int64(len(data)) > opts.sourceLimit() {
 		return nil, errors.Wrap(errSkip, "image exceeds the size limit")
 	}
 

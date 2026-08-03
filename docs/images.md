@@ -108,8 +108,12 @@ converter:
       api_key: ${OPENROUTER_API_KEY}
     extensions: [.png, .jpg, .jpeg, .webp, .gif]
     # Taille maximale d'une image envoyée au modèle, en octets.
-    # 0 = défaut (10 Mio). Au-delà : refus, jamais de troncature.
+    # 0 = défaut (10 Mio). Au-delà : ré-encodage en JPEG réduit, jamais de
+    # troncature.
     max_image_size: 10485760
+    # Taille maximale d'une image acceptée pour ce ré-encodage, en octets.
+    # 0 = défaut (64 Mio). Au-delà : refus, sans même la décoder.
+    max_source_size: 67108864
     # Prompt de description personnalisé (fait partie de la clé de cache).
     # prompt: |
     #   ...
@@ -257,6 +261,30 @@ markdown monstrueux.
   pour les data-URI, avant même le décodage base64.
 - Les data-URI restent retirés des extraits rendus (`StripDataURL`) : la
   description, elle, est du texte ordinaire et survit.
+
+## Images trop grandes
+
+Une capture d'écran exportée en PNG (un tableau de bord Grafana, une page
+scannée) dépasse facilement les 10 Mio : elle est lourde à cause du format sans
+perte, pas parce qu'elle porte autant de détail. Plutôt que de refuser l'image —
+et donc de faire échouer l'indexation du fichier —, `vision.Shrink` la
+ré-encode avant l'appel au modèle :
+
+- aplatissement sur fond blanc (le JPEG n'a pas de canal alpha) ;
+- plus grand côté ramené à 2048 px, la limite au-delà de laquelle les
+  fournisseurs redimensionnent de toute façon ;
+- ré-encodage JPEG qualité 85, puis réductions successives jusqu'à passer sous
+  `max_image_size`.
+
+Le rééchantillonnage utilise CatmullRom : l'enjeu est de garder lisible le
+*texte* de la capture, qui est justement ce que la description doit
+transcrire. L'original — pas la version réduite — reste ce qui est stocké dans
+le magasin de blobs et resservi par `fetch_image`.
+
+Restent refusées avec `vision.ErrImageTooLarge` : les images dépassant
+`max_source_size` (64 Mio par défaut, non décodées), celles dont aucun décodeur
+Go ne gère le format, et celles qui ne tiendraient sous la limite qu'en tombant
+sous une taille illisible.
 
 ## Tolérance aux pannes
 

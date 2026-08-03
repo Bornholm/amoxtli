@@ -87,10 +87,12 @@ func (c *Converter) Convert(ctx context.Context, filename string, r io.Reader) (
 		return nil, errors.WithStack(convert.ErrNotSupported)
 	}
 
-	maxBytes := c.maxImageBytes()
+	maxBytes := c.maxSourceBytes()
 
-	// Read one byte past the limit: the oversized file is rejected here, before
-	// any (billable) call to the model.
+	// Read one byte past the limit: a file too large to even be shrunk is
+	// rejected here, before any (billable) call to the model. Between the model
+	// limit and this one the describer re-encodes the image itself, so the
+	// bytes are read in full.
 	data, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -135,6 +137,18 @@ func (c *Converter) maxImageBytes() int64 {
 	}
 
 	return vision.DefaultMaxImageBytes
+}
+
+// maxSourceBytes reports the largest image the describer accepts before
+// shrinking it; beyond that the file is not even read.
+func (c *Converter) maxSourceBytes() int64 {
+	if describer, ok := c.describer.(interface{ MaxSourceBytes() int64 }); ok {
+		if maxBytes := describer.MaxSourceBytes(); maxBytes > 0 {
+			return maxBytes
+		}
+	}
+
+	return max(vision.DefaultMaxSourceBytes, c.maxImageBytes())
 }
 
 // render lays out the description as markdown. The frontmatter `type: image`

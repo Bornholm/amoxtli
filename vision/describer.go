@@ -14,7 +14,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"log/slog"
+	"mime"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -36,8 +39,45 @@ const PromptVersion = "1"
 const DefaultMaxImageBytes int64 = 10 << 20 // 10 MiB
 
 // ErrImageTooLarge is returned when an image exceeds the configured size
-// limit. It is returned *before* any call to the model.
+// limit and could not be shrunk below it (see Shrink). It is returned *before*
+// any call to the model.
 var ErrImageTooLarge = errors.New("image too large")
+
+// ErrUnsupportedImageFormat is returned when the media type of an image is not
+// one the vision providers accept. Like ErrImageTooLarge, it is returned
+// *before* any call to the model: the provider client rejects such an image
+// while building its request parameters, and reports it as a generic
+// "unavailable" error that is indistinguishable from a transient outage — so
+// it would otherwise be retried, pointlessly, on every image.
+var ErrUnsupportedImageFormat = errors.New("unsupported image format")
+
+// SupportedMimeTypes are the media types accepted by the mainstream vision
+// providers (and the only ones the OpenAI-compatible client of genai lets
+// through). It mirrors convert/vision.DefaultExtensions.
+var SupportedMimeTypes = []string{
+	"image/png",
+	"image/jpeg",
+	"image/webp",
+	"image/gif",
+}
+
+// IsSupportedMimeType reports whether a vision provider accepts mimeType. Any
+// media type parameter (`; charset=...`, as returned by http.DetectContentType)
+// is ignored, and the comparison is case-insensitive.
+func IsSupportedMimeType(mimeType string) bool {
+	return slices.Contains(SupportedMimeTypes, normalizeMimeType(mimeType))
+}
+
+// normalizeMimeType strips the parameters of a media type and lowercases it.
+// An unparsable value is returned lowercased, and will simply not match any
+// supported type.
+func normalizeMimeType(mimeType string) string {
+	if media, _, err := mime.ParseMediaType(mimeType); err == nil {
+		return media
+	}
+
+	return strings.ToLower(strings.TrimSpace(mimeType))
+}
 
 // DefaultPrompt asks for a dense, factual description. The description is what
 // gets indexed and searched, so it must be rich in the vocabulary a user would
@@ -80,9 +120,13 @@ type Describer interface {
 // Options configures an LLMDescriber.
 type Options struct {
 	Prompt string
-	// MaxImageBytes is the largest image accepted; above it Describe fails
-	// with ErrImageTooLarge without calling the model.
+	// MaxImageBytes is the largest image submitted to the model; a larger one
+	// is re-encoded to fit (see Shrink).
 	MaxImageBytes int64
+	// MaxSourceBytes is the largest image Describe accepts at all: between
+	// MaxImageBytes and this limit an image is shrunk, above it Describe fails
+	// with ErrImageTooLarge without decoding it.
+	MaxSourceBytes int64
 	// StructuredOutput requests a JSON response matching Description. Disable
 	// it for providers that reject a response schema; the whole reply then
 	// lands in Description.
@@ -95,12 +139,18 @@ func NewOptions(funcs ...OptionFunc) *Options {
 	opts := &Options{
 		Prompt:           DefaultPrompt,
 		MaxImageBytes:    DefaultMaxImageBytes,
+		MaxSourceBytes:   DefaultMaxSourceBytes,
 		StructuredOutput: true,
 	}
 
 	for _, fn := range funcs {
 		fn(opts)
 	}
+
+	// A source limit below the model limit would reject images that need no
+	// shrinking at all: a configuration raising only MaxImageBytes keeps its
+	// meaning.
+	opts.MaxSourceBytes = max(opts.MaxSourceBytes, opts.MaxImageBytes)
 
 	return opts
 }
@@ -121,6 +171,17 @@ func WithMaxImageBytes(maxBytes int64) OptionFunc {
 	return func(opts *Options) {
 		if maxBytes > 0 {
 			opts.MaxImageBytes = maxBytes
+		}
+	}
+}
+
+// WithMaxSourceBytes bounds the size of an image accepted for shrinking; <= 0
+// keeps the default (DefaultMaxSourceBytes). It is always raised to at least
+// MaxImageBytes.
+func WithMaxSourceBytes(maxBytes int64) OptionFunc {
+	return func(opts *Options) {
+		if maxBytes > 0 {
+			opts.MaxSourceBytes = maxBytes
 		}
 	}
 }
@@ -152,6 +213,12 @@ func NewLLMDescriber(client llm.Client, funcs ...OptionFunc) *LLMDescriber {
 // their reads before handing over the bytes.
 func (d *LLMDescriber) MaxImageBytes() int64 {
 	return d.opts.MaxImageBytes
+}
+
+// MaxSourceBytes reports the largest image Describe accepts before shrinking,
+// so callers can bound their reads accordingly.
+func (d *LLMDescriber) MaxSourceBytes() int64 {
+	return d.opts.MaxSourceBytes
 }
 
 // Prompt reports the effective description prompt (used to derive the cache
@@ -191,13 +258,40 @@ func (d *LLMDescriber) Describe(ctx context.Context, mimeType string, data []byt
 		return nil, errors.New("empty image data")
 	}
 
-	if int64(len(data)) > d.opts.MaxImageBytes {
+	if int64(len(data)) > d.opts.MaxSourceBytes {
 		recordOutcome(ctx, telemetry.VisionOutcomeRejected)
-		return nil, errors.Wrapf(ErrImageTooLarge, "image is %d bytes, limit is %d", len(data), d.opts.MaxImageBytes)
+		return nil, errors.Wrapf(ErrImageTooLarge, "image is %d bytes, limit is %d", len(data), d.opts.MaxSourceBytes)
 	}
 
 	if mimeType == "" {
 		mimeType = http.DetectContentType(data)
+	}
+
+	mimeType = normalizeMimeType(mimeType)
+
+	if !IsSupportedMimeType(mimeType) {
+		recordOutcome(ctx, telemetry.VisionOutcomeRejected)
+		return nil, errors.Wrapf(ErrUnsupportedImageFormat, "media type '%s' (supported: %s)", mimeType, strings.Join(SupportedMimeTypes, ", "))
+	}
+
+	// An image above the model limit is re-encoded rather than refused: a
+	// lossless screenshot is heavy because of its format, not because of its
+	// content, and its description is exactly what makes it searchable.
+	if int64(len(data)) > d.opts.MaxImageBytes {
+		shrunkType, shrunk, err := Shrink(mimeType, data, d.opts.MaxImageBytes)
+		if err != nil {
+			recordOutcome(ctx, telemetry.VisionOutcomeRejected)
+			return nil, errors.Wrapf(ErrImageTooLarge, "image is %d bytes, limit is %d, and could not be shrunk: %s", len(data), d.opts.MaxImageBytes, err)
+		}
+
+		slog.DebugContext(ctx, "shrunk oversized image before describing it",
+			slog.Int("sourceBytes", len(data)),
+			slog.Int("shrunkBytes", len(shrunk)),
+			slog.String("sourceMimeType", mimeType),
+			slog.String("shrunkMimeType", shrunkType),
+		)
+
+		mimeType, data = shrunkType, shrunk
 	}
 
 	attachment, err := llm.NewImageAttachment(mimeType, base64.StdEncoding.EncodeToString(data), false)

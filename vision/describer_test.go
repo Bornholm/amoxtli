@@ -122,7 +122,9 @@ func TestLLMDescriberCustomPromptAndNoStructuredOutput(t *testing.T) {
 	}
 }
 
-func TestLLMDescriberRejectsOversizedImage(t *testing.T) {
+func TestLLMDescriberRejectsUnshrinkableImage(t *testing.T) {
+	// A 1x1 pixel cannot be re-encoded below 8 bytes: shrinking fails, and the
+	// image is refused as it was before shrinking existed.
 	client := &stubClient{content: "description"}
 
 	describer := NewLLMDescriber(client, WithMaxImageBytes(8))
@@ -134,6 +136,94 @@ func TestLLMDescriberRejectsOversizedImage(t *testing.T) {
 
 	if client.calls != 0 {
 		t.Errorf("client.calls: expected 0 (no LLM call for an oversized image), got %d", client.calls)
+	}
+}
+
+func TestLLMDescriberShrinksOversizedImage(t *testing.T) {
+	const maxBytes = 60_000
+
+	source := noisyPNG(t, 800, 600)
+	client := &stubClient{content: "description"}
+
+	describer := NewLLMDescriber(client, WithMaxImageBytes(maxBytes), WithStructuredOutput(false))
+
+	if _, err := describer.Describe(context.Background(), "image/png", source); err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	if client.calls != 1 {
+		t.Fatalf("client.calls: expected 1, got %d", client.calls)
+	}
+
+	attachment := client.opts.Messages[0].Attachments()[0]
+
+	if e, g := "image/jpeg", attachment.MimeType(); e != g {
+		t.Errorf("attachment.MimeType(): expected %q, got %q", e, g)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(attachment.Data())
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	if int64(len(decoded)) > maxBytes {
+		t.Errorf("attachment size: expected at most %d bytes, got %d", maxBytes, len(decoded))
+	}
+}
+
+func TestLLMDescriberRejectsImageAboveSourceLimit(t *testing.T) {
+	// Beyond the source limit the image is not even decoded: shrinking it would
+	// cost more memory than the description is worth.
+	client := &stubClient{content: "description"}
+
+	describer := NewLLMDescriber(client,
+		WithMaxImageBytes(8),
+		WithMaxSourceBytes(16),
+	)
+
+	_, err := describer.Describe(context.Background(), "image/png", pngPixel)
+	if !errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("expected ErrImageTooLarge, got %+v", err)
+	}
+
+	// The source limit is the one reported: the image never reached the
+	// shrinking step.
+	if !strings.Contains(err.Error(), "limit is 16") {
+		t.Errorf("err: expected the source limit to be reported, got %v", err)
+	}
+
+	if client.calls != 0 {
+		t.Errorf("client.calls: expected 0, got %d", client.calls)
+	}
+}
+
+func TestLLMDescriberRejectsUnsupportedMimeType(t *testing.T) {
+	// The provider client rejects such an image while building its request and
+	// reports it as a generic "unavailable" error, which the retry decorator
+	// then replays. Catch it here instead, before any call.
+	for _, mimeType := range []string{"image/svg+xml", "image/bmp", "image/x-icon", "text/xml; charset=utf-8"} {
+		client := &stubClient{content: "description"}
+
+		_, err := NewLLMDescriber(client).Describe(context.Background(), mimeType, pngPixel)
+		if !errors.Is(err, ErrUnsupportedImageFormat) {
+			t.Errorf("%s: expected ErrUnsupportedImageFormat, got %+v", mimeType, err)
+		}
+
+		if client.calls != 0 {
+			t.Errorf("%s: client.calls: expected 0 (no LLM call for an unsupported format), got %d", mimeType, client.calls)
+		}
+	}
+}
+
+func TestLLMDescriberAcceptsMimeTypeWithParameters(t *testing.T) {
+	client := &stubClient{content: "description"}
+
+	if _, err := NewLLMDescriber(client).Describe(context.Background(), "IMAGE/PNG; charset=binary", pngPixel); err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	if e, g := "image/png", client.opts.Messages[0].Attachments()[0].MimeType(); e != g {
+		t.Errorf("attachment.MimeType(): expected %q, got %q", e, g)
 	}
 }
 

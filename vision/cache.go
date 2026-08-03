@@ -73,6 +73,16 @@ func (c *CachingDescriber) MaxImageBytes() int64 {
 	return DefaultMaxImageBytes
 }
 
+// MaxSourceBytes reports the source limit of the wrapped describer, when it
+// exposes one, so the decorator stays transparent to size-aware callers.
+func (c *CachingDescriber) MaxSourceBytes() int64 {
+	if inner, ok := c.inner.(interface{ MaxSourceBytes() int64 }); ok {
+		return inner.MaxSourceBytes()
+	}
+
+	return max(DefaultMaxSourceBytes, c.MaxImageBytes())
+}
+
 // Describe implements Describer.
 func (c *CachingDescriber) Describe(ctx context.Context, mimeType string, data []byte) (*Description, error) {
 	path := c.path(data)

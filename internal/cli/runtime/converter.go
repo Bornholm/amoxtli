@@ -152,6 +152,7 @@ func newVisionDescriber(ctx context.Context, ws *workspace.Workspace, cfg *confi
 		llmx.NewRetryClient(client),
 		vision.WithPrompt(cfg.Converter.Vision.Prompt),
 		vision.WithMaxImageBytes(cfg.Converter.Vision.MaxImageSize),
+		vision.WithMaxSourceBytes(cfg.Converter.Vision.MaxSourceSize),
 	)
 
 	// The description cache follows the LLM cache toggle, but not its
@@ -211,6 +212,7 @@ func imageEnrichmentOptions(cfg *config.Config, describer vision.Describer) []im
 		imagetext.WithMaxImagesPerDocument(embedded.MaxImagesPerDocument),
 		imagetext.WithConcurrency(embedded.Concurrency),
 		imagetext.WithMaxImageBytes(cfg.Converter.Vision.MaxImageSize),
+		imagetext.WithMaxSourceBytes(cfg.Converter.Vision.MaxSourceSize),
 	}
 }
 

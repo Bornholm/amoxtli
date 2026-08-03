@@ -329,9 +329,13 @@ type VisionConverterConfig struct {
 	// list (see VisionExtensions).
 	Extensions []string `yaml:"extensions"`
 	// MaxImageSize bounds the size of an image sent to the model, in bytes;
-	// 0 defers to the library default (10 MiB). Oversized files are rejected
-	// before any call.
+	// 0 defers to the library default (10 MiB). A larger image is re-encoded
+	// (downscaled JPEG) to fit, never sent as is.
 	MaxImageSize int64 `yaml:"max_image_size"`
+	// MaxSourceSize bounds the size of an image accepted for that re-encoding,
+	// in bytes; 0 defers to the library default (64 MiB). Beyond it a file is
+	// rejected without being decoded.
+	MaxSourceSize int64 `yaml:"max_source_size"`
 	// Prompt replaces the built-in description prompt. It is part of the
 	// description cache key, so changing it invalidates previous descriptions.
 	Prompt string `yaml:"prompt"`
@@ -685,6 +689,9 @@ func (c *Config) Validate() error {
 		}
 		if c.Converter.Vision.MaxImageSize < 0 {
 			return errors.New("converter.vision.max_image_size must not be negative")
+		}
+		if c.Converter.Vision.MaxSourceSize < 0 {
+			return errors.New("converter.vision.max_source_size must not be negative")
 		}
 	} else if c.Converter.Vision.Embedded.Enabled {
 		return errors.New("converter.vision.embedded.enabled is true but converter.vision.enabled is false")

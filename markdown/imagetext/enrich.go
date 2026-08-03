@@ -292,6 +292,17 @@ func describeImages(ctx context.Context, images map[string]*resolvedImage, opts 
 					return errors.WithStack(err)
 				}
 
+				// A format no vision provider accepts (SVG, BMP, ICO...) is an
+				// expected outcome of a real corpus, not an incident: the image
+				// keeps its alt-text without polluting the logs.
+				if errors.Is(err, vision.ErrUnsupportedImageFormat) {
+					slog.DebugContext(groupCtx, "image format not supported by the vision model, keeping alt-text only",
+						slog.String("mimeType", image.mimeType),
+					)
+
+					return nil
+				}
+
 				slog.WarnContext(groupCtx, "could not describe image, keeping alt-text only",
 					slog.Any("error", errors.WithStack(err)),
 				)

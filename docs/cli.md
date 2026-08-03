@@ -114,7 +114,8 @@ converter:
       model: qwen/qwen2.5-vl-72b-instruct
       api_key: ${OPENROUTER_API_KEY}
     extensions: [.png, .jpg, .jpeg, .webp, .gif]
-    max_image_size: 10485760                  # 0 = défaut (10 Mio)
+    max_image_size: 10485760                  # 0 = défaut (10 Mio), au-delà : image réduite
+    max_source_size: 67108864                 # 0 = défaut (64 Mio), au-delà : image refusée
     # prompt: |                               # remplace le prompt par défaut
     #   ...
     embedded:

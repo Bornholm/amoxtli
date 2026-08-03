@@ -94,10 +94,11 @@ func TestConverterMarkdownIsParsedWithImageMetadata(t *testing.T) {
 	}
 }
 
-func TestConverterRejectsOversizedImageWithoutCallingTheModel(t *testing.T) {
+func TestConverterRejectsImageAboveSourceLimitWithoutCallingTheModel(t *testing.T) {
 	describer := &stubDescriber{
-		desc:     &amoxtlivision.Description{Description: "..."},
-		maxBytes: 8,
+		desc:           &amoxtlivision.Description{Description: "..."},
+		maxBytes:       8,
+		maxSourceBytes: 8,
 	}
 
 	_, err := NewConverter(describer).Convert(context.Background(), "schema.png", bytes.NewReader(pngPixel))
@@ -107,6 +108,28 @@ func TestConverterRejectsOversizedImageWithoutCallingTheModel(t *testing.T) {
 
 	if describer.calls != 0 {
 		t.Errorf("describer.calls: expected 0, got %d", describer.calls)
+	}
+}
+
+func TestConverterHandsOversizedImageToTheDescriber(t *testing.T) {
+	// Between the model limit and the source limit the converter reads the file
+	// whole: shrinking it is the describer's job, not a reason to fail the
+	// indexation of the image.
+	describer := &stubDescriber{
+		desc:     &amoxtlivision.Description{Description: "..."},
+		maxBytes: 8,
+	}
+
+	if _, err := NewConverter(describer).Convert(context.Background(), "schema.png", bytes.NewReader(pngPixel)); err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	if describer.calls != 1 {
+		t.Fatalf("describer.calls: expected 1, got %d", describer.calls)
+	}
+
+	if !bytes.Equal(pngPixel, describer.data) {
+		t.Error("describer.data: expected the whole image to be handed over")
 	}
 }
 
@@ -162,9 +185,10 @@ func convertImage(t *testing.T, converter *Converter, filename string, data []by
 
 // stubDescriber records what it was handed and replays a canned description.
 type stubDescriber struct {
-	desc     *amoxtlivision.Description
-	err      error
-	maxBytes int64
+	desc           *amoxtlivision.Description
+	err            error
+	maxBytes       int64
+	maxSourceBytes int64
 
 	calls    int
 	mimeType string
@@ -185,6 +209,10 @@ func (d *stubDescriber) Describe(ctx context.Context, mimeType string, data []by
 
 func (d *stubDescriber) MaxImageBytes() int64 {
 	return d.maxBytes
+}
+
+func (d *stubDescriber) MaxSourceBytes() int64 {
+	return d.maxSourceBytes
 }
 
 var _ amoxtlivision.Describer = &stubDescriber{}
