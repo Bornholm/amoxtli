@@ -6,10 +6,10 @@ import (
 	"image/jpeg"
 	"math"
 
-	// Decoders for the formats the vision providers accept. WebP is not in the
-	// standard library, so it is pulled from golang.org/x/image.
+	// Decoders for the formats the vision providers accept (JPEG comes with the
+	// import above). WebP is not in the standard library, so it is pulled from
+	// golang.org/x/image.
 	_ "image/gif"
-	_ "image/jpeg"
 	_ "image/png"
 
 	_ "golang.org/x/image/webp"
