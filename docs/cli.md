@@ -395,6 +395,12 @@ sections inline, option `filters` — mêmes expressions que `--filter`,
 ex. `["type=code", "language=go"]`), `fetch_sections`, `list_collections` et
 `list_documents`.
 
+`fetch_sections` renvoie par défaut le contenu complet des sections demandées.
+Lorsqu'une section dépasse la limite de taille des résultats d'outil du client,
+elle se lit par tranches via `offset` et `length` (comptés en caractères) :
+chaque section renvoyée indique sa `total_length` et, s'il reste du contenu, le
+`next_offset` auquel reprendre.
+
 `search` et `list_documents` renvoient les métadonnées de chaque document dans
 un champ `metadata`. L'agent découvre ainsi les clés et valeurs réellement
 indexées, et peut les réinjecter dans `filters` au tour suivant sans les

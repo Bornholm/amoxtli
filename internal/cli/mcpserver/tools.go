@@ -61,10 +61,32 @@ type searchOutput struct {
 
 type fetchSectionsInput struct {
 	SectionIDs []string `json:"section_ids" jsonschema:"the section IDs to fetch"`
+	// Offset and Length page through a section whose content is too large to
+	// survive the client's tool-result size limit in one piece.
+	Offset int `json:"offset,omitempty" jsonschema:"start reading each section at this character offset (0-based, defaults to the beginning); use the next_offset reported by a previous call to continue where it stopped"`
+	Length int `json:"length,omitempty" jsonschema:"maximum number of characters returned per section (0 or less returns the section up to its end)"`
+}
+
+// sectionContent carries a slice of a section's content along with enough
+// bookkeeping for the agent to know whether it read the whole thing, and where
+// to resume if it did not.
+type sectionContent struct {
+	Content string `json:"content"`
+	// Offset is where this slice starts and Length how many characters it
+	// holds, both in characters and not bytes, so that a follow-up call can be
+	// addressed in the same units the request used.
+	Offset int `json:"offset"`
+	Length int `json:"length"`
+	// TotalLength is the section's full size, so a partial read is never
+	// mistaken for the whole section.
+	TotalLength int `json:"total_length"`
+	// NextOffset is set when content remains past this slice, and is the offset
+	// to pass back to read the rest.
+	NextOffset int `json:"next_offset,omitempty"`
 }
 
 type fetchSectionsOutput struct {
-	Sections map[string]string `json:"sections"`
+	Sections map[string]sectionContent `json:"sections"`
 }
 
 type listCollectionsOutput struct {
@@ -129,7 +151,7 @@ func (s *Server) registerTools(iterative, groundingEnabled bool) {
 
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name:        "fetch_sections",
-		Description: "Fetch the full content of specific sections by ID (e.g. to expand on a search result).",
+		Description: "Fetch the content of specific sections by ID (e.g. to expand on a search result). Returns the whole section by default; when a section is too large for one tool result, read it in slices with offset and length. Each section comes back with its total_length and, when content remains, the next_offset to resume from.",
 	}, s.handleFetchSections)
 
 	mcp.AddTool(s.mcp, &mcp.Tool{
@@ -326,16 +348,48 @@ func (s *Server) handleFetchSections(ctx context.Context, _ *mcp.CallToolRequest
 		return nil, fetchSectionsOutput{}, errors.WithStack(err)
 	}
 
-	out := fetchSectionsOutput{Sections: map[string]string{}}
+	out := fetchSectionsOutput{Sections: map[string]sectionContent{}}
 	for id, section := range sections {
 		content, err := section.Content()
 		if err != nil {
 			return nil, fetchSectionsOutput{}, errors.WithStack(err)
 		}
-		out.Sections[string(id)] = string(content)
+		out.Sections[string(id)] = sliceContent(string(content), in.Offset, in.Length)
 	}
 
 	return nil, out, nil
+}
+
+// sliceContent cuts the requested range out of a section's content. It counts
+// in characters rather than bytes: an offset landing in the middle of a
+// multi-byte rune would hand back mojibake, and an agent paging through a
+// document has no way to know where the rune boundaries are.
+//
+// Out of range requests are clamped instead of rejected: a caller resuming from
+// a stale next_offset gets an empty slice and the real total length, which is
+// enough to correct itself.
+func sliceContent(content string, offset, length int) sectionContent {
+	runes := []rune(content)
+	total := len(runes)
+
+	start := min(max(offset, 0), total)
+
+	end := total
+	if length > 0 {
+		end = min(start+length, total)
+	}
+
+	sliced := sectionContent{
+		Content:     string(runes[start:end]),
+		Offset:      start,
+		Length:      end - start,
+		TotalLength: total,
+	}
+	if end < total {
+		sliced.NextOffset = end
+	}
+
+	return sliced
 }
 
 func (s *Server) handleListCollections(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listCollectionsOutput, error) {

@@ -109,6 +109,83 @@ func TestMaxSectionsPerResultConfig(t *testing.T) {
 	}
 }
 
+// TestSliceContentWholeSection: without a range, a section is returned whole
+// and reports no continuation.
+func TestSliceContentWholeSection(t *testing.T) {
+	got := sliceContent("hello", 0, 0)
+
+	if got.Content != "hello" {
+		t.Fatalf("expected the whole content, got %q", got.Content)
+	}
+	if got.Offset != 0 || got.Length != 5 || got.TotalLength != 5 {
+		t.Fatalf("unexpected bookkeeping: %+v", got)
+	}
+	if got.NextOffset != 0 {
+		t.Fatalf("expected no continuation, got next offset %d", got.NextOffset)
+	}
+}
+
+// TestSliceContentPaging: reading a section in slices must cover it exactly
+// once, each slice pointing at the next one until the end.
+func TestSliceContentPaging(t *testing.T) {
+	const content = "abcdefghij"
+
+	first := sliceContent(content, 0, 4)
+	if first.Content != "abcd" || first.NextOffset != 4 {
+		t.Fatalf("unexpected first slice: %+v", first)
+	}
+
+	second := sliceContent(content, first.NextOffset, 4)
+	if second.Content != "efgh" || second.NextOffset != 8 {
+		t.Fatalf("unexpected second slice: %+v", second)
+	}
+
+	last := sliceContent(content, second.NextOffset, 4)
+	if last.Content != "ij" {
+		t.Fatalf("unexpected last slice: %+v", last)
+	}
+	if last.NextOffset != 0 {
+		t.Fatalf("expected the last slice to report no continuation, got %d", last.NextOffset)
+	}
+	if last.TotalLength != len(content) {
+		t.Fatalf("expected the full length %d, got %d", len(content), last.TotalLength)
+	}
+}
+
+// TestSliceContentCountsRunes: offsets are expressed in characters, so a slice
+// never cuts a multi-byte rune in half.
+func TestSliceContentCountsRunes(t *testing.T) {
+	got := sliceContent("éàü", 1, 1)
+
+	if got.Content != "à" {
+		t.Fatalf("expected the second character, got %q", got.Content)
+	}
+	if got.TotalLength != 3 {
+		t.Fatalf("expected a length of 3 characters, got %d", got.TotalLength)
+	}
+}
+
+// TestSliceContentOutOfRange: an offset past the end is clamped rather than
+// rejected, so a caller resuming from a stale offset learns the real size
+// instead of getting an error.
+func TestSliceContentOutOfRange(t *testing.T) {
+	got := sliceContent("abc", 10, 5)
+
+	if got.Content != "" || got.Length != 0 {
+		t.Fatalf("expected an empty slice, got %+v", got)
+	}
+	if got.Offset != 3 || got.TotalLength != 3 {
+		t.Fatalf("expected the offset clamped to the total length, got %+v", got)
+	}
+	if got.NextOffset != 0 {
+		t.Fatalf("expected no continuation past the end, got %d", got.NextOffset)
+	}
+
+	if before := sliceContent("abc", -5, 0); before.Content != "abc" || before.Offset != 0 {
+		t.Fatalf("expected a negative offset clamped to the beginning, got %+v", before)
+	}
+}
+
 // TestRenderResultsReportsOmittedSections: a trimmed result must never pass for
 // an exhaustive one — the agent has to know there is more to fetch before it
 // answers from an excerpt.
