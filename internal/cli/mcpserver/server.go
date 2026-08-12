@@ -28,6 +28,10 @@ type Server struct {
 	// search tool returns inline; 0 returns them all
 	// (cf. config.MCPConfig.MaxSectionsPerResult).
 	maxSectionsPerResult int
+	// maxContentChars bounds the total inline section content of one search
+	// response; 0 returns every section whole
+	// (cf. config.MCPConfig.MaxContentChars).
+	maxContentChars int
 }
 
 // New opens the workspace runtime and registers the MCP tools.
@@ -43,7 +47,12 @@ func New(ctx context.Context, ws *workspace.Workspace, cfg *config.Config) (*Ser
 		Version: build.Version,
 	}, nil)
 
-	srv := &Server{rt: rt, mcp: mcpServer, maxSectionsPerResult: cfg.MaxSectionsPerResult()}
+	srv := &Server{
+		rt:                   rt,
+		mcp:                  mcpServer,
+		maxSectionsPerResult: cfg.MaxSectionsPerResult(),
+		maxContentChars:      cfg.MaxContentChars(),
+	}
 	srv.registerTools(cfg.IterativeRetrievalEnabled(), cfg.GroundingEnabled())
 
 	return srv, nil

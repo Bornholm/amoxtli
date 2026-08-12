@@ -45,6 +45,21 @@ type MCPConfig struct {
 	// Zero defers to DefaultMCPMaxSectionsPerResult; a negative value returns
 	// every section, as before.
 	MaxSectionsPerResult int `yaml:"max_sections_per_result"`
+
+	// MaxContentChars bounds the total inline section content of one search
+	// response, in characters, shared out between the sections returned.
+	//
+	// Bounding their number is not enough: sections vary wildly in size, and a
+	// handful of large ones is all it takes to blow past the limit a client
+	// applies to a tool result. That cut happens at the far end, on the
+	// serialized JSON, and takes whatever it lands on — so the response has to
+	// arrive already small enough. What is left out is recoverable: each
+	// truncated section reports its total_length and the next_offset to resume
+	// from with fetch_sections.
+	//
+	// Zero defers to DefaultMCPMaxContentChars; a negative value returns every
+	// section whole, as before.
+	MaxContentChars int `yaml:"max_content_chars"`
 }
 
 // DefaultMCPMaxSectionsPerResult is applied when MCPConfig.MaxSectionsPerResult
@@ -63,6 +78,25 @@ func (c *Config) MaxSectionsPerResult() int {
 		return 0
 	default:
 		return c.MCP.MaxSectionsPerResult
+	}
+}
+
+// DefaultMCPMaxContentChars is applied when MCPConfig.MaxContentChars is left
+// unset. Clients commonly cap a tool result at 16 KiB; 10000 characters of
+// content leaves room for the JSON envelope, the metadata and the section IDs
+// around it, and still keeps a response usable on its own.
+const DefaultMCPMaxContentChars = 10000
+
+// MaxContentChars resolves the configured budget, applying the default when
+// unset. A negative value resolves to 0, meaning "no bound".
+func (c *Config) MaxContentChars() int {
+	switch {
+	case c.MCP.MaxContentChars == 0:
+		return DefaultMCPMaxContentChars
+	case c.MCP.MaxContentChars < 0:
+		return 0
+	default:
+		return c.MCP.MaxContentChars
 	}
 }
 

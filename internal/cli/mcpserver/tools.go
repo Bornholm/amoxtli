@@ -31,6 +31,12 @@ type searchInput struct {
 type sectionResult struct {
 	ID      string `json:"id"`
 	Content string `json:"content,omitempty"`
+	// TotalLength and NextOffset are set only when the content was cut to fit
+	// the response budget, and say where to resume with fetch_sections. A
+	// section returned whole carries neither, so an untruncated result reads
+	// exactly as it did before.
+	TotalLength int `json:"total_length,omitempty"`
+	NextOffset  int `json:"next_offset,omitempty"`
 }
 
 type documentResult struct {
@@ -102,7 +108,10 @@ type collectionResult struct {
 type listDocumentsInput struct {
 	Collection string `json:"collection,omitempty" jsonschema:"restrict to a collection label or ID"`
 	SourceLike string `json:"source_like,omitempty" jsonschema:"only documents whose source matches this pattern"`
-	Limit      int    `json:"limit,omitempty" jsonschema:"maximum number of documents (default 50)"`
+	Limit      int    `json:"limit,omitempty" jsonschema:"maximum number of documents (default 20)"`
+	// Page walks a corpus larger than one response can carry, rather than
+	// having the client cut the listing mid-document.
+	Page int `json:"page,omitempty" jsonschema:"0-based page index, skipping page*limit documents (defaults to the first page); compare the number of documents returned with total to know whether another page follows"`
 }
 
 type listDocumentsOutput struct {
@@ -138,6 +147,13 @@ func (s *Server) registerTools(iterative, groundingEnabled bool) {
 		searchDescription += " Only the best scoring sections of each document are returned inline; omitted_sections counts those left out, which you can retrieve by ID with fetch_sections or by raising max_sections_per_result. A document showing omitted_sections has more to say than what you were given."
 	}
 
+	// A section cut to fit the response budget says so, for the same reason a
+	// trimmed list of sections does: the agent must be able to tell an excerpt
+	// from a whole section, and know how to get the rest.
+	if s.maxContentChars > 0 {
+		searchDescription += " Section contents are shared out over a size budget for the whole response: a section carrying total_length was cut short, and next_offset is where to resume reading it with fetch_sections."
+	}
+
 	// Images are described in text at index time; the description sits next to
 	// an amoxtli://images/<hash> reference the agent can dereference.
 	if s.rt.Codex.Blobs() != nil {
@@ -161,7 +177,7 @@ func (s *Server) registerTools(iterative, groundingEnabled bool) {
 
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name:        "list_documents",
-		Description: "List indexed documents, optionally restricted to a collection or source pattern.",
+		Description: "List indexed documents, optionally restricted to a collection or source pattern. Returns one page at a time: total is the number of matching documents, page walks through them.",
 	}, s.handleListDocuments)
 
 	// Only advertise image retrieval when there is a store to serve from,
@@ -369,15 +385,23 @@ func (s *Server) handleFetchSections(ctx context.Context, _ *mcp.CallToolRequest
 // a stale next_offset gets an empty slice and the real total length, which is
 // enough to correct itself.
 func sliceContent(content string, offset, length int) sectionContent {
+	if length <= 0 {
+		// No length asked for means "to the end of the section".
+		length = len([]rune(content))
+	}
+
+	return takeContent(content, offset, length)
+}
+
+// takeContent is sliceContent with a length taken literally, zero included —
+// the form a budget needs, where a section granted nothing must come back
+// empty rather than whole.
+func takeContent(content string, offset, length int) sectionContent {
 	runes := []rune(content)
 	total := len(runes)
 
 	start := min(max(offset, 0), total)
-
-	end := total
-	if length > 0 {
-		end = min(start+length, total)
-	}
+	end := min(start+max(length, 0), total)
 
 	sliced := sectionContent{
 		Content:     string(runes[start:end]),
@@ -411,12 +435,18 @@ func (s *Server) handleListCollections(ctx context.Context, _ *mcp.CallToolReque
 }
 
 func (s *Server) handleListDocuments(ctx context.Context, _ *mcp.CallToolRequest, in listDocumentsInput) (*mcp.CallToolResult, listDocumentsOutput, error) {
+	// A short page by default: documents carry their metadata, and fifty of
+	// them overshoot the size limit a client puts on a tool result — a listing
+	// cut at the far end loses its tail without saying so, where a page tells
+	// the agent there is more by way of total.
 	limit := in.Limit
 	if limit <= 0 {
-		limit = 50
+		limit = 20
 	}
 
-	query := ingest.QueryDocumentsOptions{HeaderOnly: true, Limit: &limit}
+	page := max(in.Page, 0)
+
+	query := ingest.QueryDocumentsOptions{HeaderOnly: true, Limit: &limit, Page: &page}
 	if in.SourceLike != "" {
 		query.SourcePattern = &in.SourceLike
 	}
@@ -489,6 +519,40 @@ func bestSections(r *index.SearchResult, maxSections int) []model.SectionID {
 	return kept
 }
 
+// shareBudget hands out a budget of characters between sections of the given
+// lengths, and returns what each one may keep, in the same order.
+//
+// The split is max-min fair rather than a flat cut: sections shorter than their
+// share release the surplus to the longer ones, so a response made of one large
+// section and four small ones spends its budget on the large one instead of
+// beheading all five. A section that fits is always returned whole.
+func shareBudget(lengths []int, budget int) []int {
+	allowed := make([]int, len(lengths))
+	if budget <= 0 {
+		copy(allowed, lengths)
+		return allowed
+	}
+
+	// Serve the shortest sections first: each one that fits under its share
+	// enlarges the share of those still to be served.
+	order := make([]int, len(lengths))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		return cmp.Compare(lengths[a], lengths[b])
+	})
+
+	remaining := budget
+	for left, i := range order {
+		share := remaining / (len(order) - left)
+		allowed[i] = min(lengths[i], share)
+		remaining -= allowed[i]
+	}
+
+	return allowed
+}
+
 func (s *Server) renderResults(ctx context.Context, results []*index.SearchResult, maxSections int) ([]documentResult, error) {
 	// Trim before fetching: the sections left out are neither read from the
 	// store nor rendered, so the bound saves the work as well as the bytes.
@@ -504,6 +568,27 @@ func (s *Server) renderResults(ctx context.Context, results []*index.SearchResul
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+
+	// Read every kept section before rendering any of it: the budget is shared
+	// out over the whole response, so how much of the first section travels
+	// depends on the size of the last one.
+	contents := make(map[model.SectionID]string, len(sections))
+	lengths := make([]int, 0, len(ids))
+	for _, id := range ids {
+		section, ok := sections[id]
+		if !ok {
+			continue
+		}
+		content, err := section.Content()
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		contents[id] = string(content)
+		lengths = append(lengths, len([]rune(contents[id])))
+	}
+
+	allowed := shareBudget(lengths, s.maxContentChars)
+	next := 0
 
 	rendered := make([]documentResult, 0, len(results))
 	for i, r := range results {
@@ -521,11 +606,19 @@ func (s *Server) renderResults(ctx context.Context, results []*index.SearchResul
 		for _, id := range kept[i] {
 			section := sectionResult{ID: string(id)}
 			if s, ok := sections[id]; ok {
-				content, err := s.Content()
-				if err != nil {
-					return nil, errors.WithStack(err)
+				sliced := takeContent(contents[id], 0, allowed[next])
+				next++
+
+				section.Content = sliced.Content
+				// Report the cut only when there was one: a section returned
+				// whole must not look like an excerpt, and one cut short must
+				// not pass for the whole section. total_length is what marks a
+				// partial section, next_offset being legitimately 0 for a
+				// section the budget could not afford at all.
+				if sliced.Length < sliced.TotalLength {
+					section.TotalLength = sliced.TotalLength
+					section.NextOffset = sliced.NextOffset
 				}
-				section.Content = string(content)
 
 				// Every section of a result belongs to the same document, so the
 				// first one that carries metadata settles it. Content() above

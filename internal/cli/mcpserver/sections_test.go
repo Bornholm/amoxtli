@@ -186,6 +186,102 @@ func TestSliceContentOutOfRange(t *testing.T) {
 	}
 }
 
+// TestShareBudgetUnbounded: without a budget, every section keeps its full
+// length.
+func TestShareBudgetUnbounded(t *testing.T) {
+	lengths := []int{10, 200, 3000}
+
+	if got := shareBudget(lengths, 0); !slices.Equal(got, lengths) {
+		t.Fatalf("expected the full lengths %v, got %v", lengths, got)
+	}
+	if got := shareBudget(lengths, -1); !slices.Equal(got, lengths) {
+		t.Fatalf("expected a negative budget to mean no bound, got %v", got)
+	}
+}
+
+// TestShareBudgetFitsWithoutCutting: a response already under the budget is
+// handed back whole — the bound must not cost anything when it does not bind.
+func TestShareBudgetFitsWithoutCutting(t *testing.T) {
+	lengths := []int{100, 200, 300}
+
+	if got := shareBudget(lengths, 1000); !slices.Equal(got, lengths) {
+		t.Fatalf("expected no cut under the budget, got %v", got)
+	}
+}
+
+// TestShareBudgetGivesSurplusToTheLongest: short sections releasing their
+// unused share is the whole point — a flat cut would behead every section
+// including the ones that fit.
+func TestShareBudgetGivesSurplusToTheLongest(t *testing.T) {
+	// A flat share would be 25 each, cutting the 10 and the 20 for nothing.
+	got := shareBudget([]int{10, 20, 5000, 5000}, 100)
+
+	if want := []int{10, 20, 35, 35}; !slices.Equal(got, want) {
+		t.Fatalf("expected the surplus given to the long sections %v, got %v", want, got)
+	}
+
+	total := 0
+	for _, n := range got {
+		total += n
+	}
+	if total > 100 {
+		t.Fatalf("expected the budget to be respected, got %d characters", total)
+	}
+}
+
+// TestShareBudgetStaysWithinBudget: whatever the mix of sizes, the sum of the
+// allowances never exceeds the budget — that is what keeps the response under
+// the client's cut.
+func TestShareBudgetStaysWithinBudget(t *testing.T) {
+	for _, lengths := range [][]int{
+		{1, 1, 1},
+		{7, 3000, 12, 900, 4},
+		{5000, 5000, 5000},
+	} {
+		total := 0
+		for _, n := range shareBudget(lengths, 33) {
+			total += n
+		}
+		if total > 33 {
+			t.Fatalf("expected at most 33 characters for %v, got %d", lengths, total)
+		}
+	}
+}
+
+// TestMaxContentCharsConfig: unset means the default budget, negative means no
+// budget at all.
+func TestMaxContentCharsConfig(t *testing.T) {
+	var cfg config.Config
+
+	if got := cfg.MaxContentChars(); got != config.DefaultMCPMaxContentChars {
+		t.Fatalf("expected the default budget %d, got %d", config.DefaultMCPMaxContentChars, got)
+	}
+
+	cfg.MCP.MaxContentChars = -1
+	if got := cfg.MaxContentChars(); got != 0 {
+		t.Fatalf("expected a negative setting to mean no budget, got %d", got)
+	}
+
+	cfg.MCP.MaxContentChars = 500
+	if got := cfg.MaxContentChars(); got != 500 {
+		t.Fatalf("expected the configured budget, got %d", got)
+	}
+}
+
+// TestTakeContentZeroLength: a section the budget could not afford comes back
+// empty, and its total_length says it was not read — a zero length must not be
+// read as "to the end".
+func TestTakeContentZeroLength(t *testing.T) {
+	got := takeContent("abc", 0, 0)
+
+	if got.Content != "" {
+		t.Fatalf("expected no content, got %q", got.Content)
+	}
+	if got.Length != 0 || got.TotalLength != 3 {
+		t.Fatalf("expected a zero-length slice of a 3 character section, got %+v", got)
+	}
+}
+
 // TestRenderResultsReportsOmittedSections: a trimmed result must never pass for
 // an exhaustive one — the agent has to know there is more to fetch before it
 // answers from an excerpt.
