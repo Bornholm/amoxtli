@@ -23,6 +23,47 @@ type Config struct {
 	Converter ConverterConfig `yaml:"converter"`
 	Indexing  IndexingConfig  `yaml:"indexing"`
 	Images    ImagesConfig    `yaml:"images"`
+	MCP       MCPConfig       `yaml:"mcp"`
+}
+
+// MCPConfig tunes what the MCP server hands back to its client. It is a
+// serving concern, not a retrieval one: the ranking is untouched, only how
+// much of it travels to the agent.
+type MCPConfig struct {
+	// MaxSectionsPerResult bounds how many sections of each matched document
+	// the search tool returns inline, keeping the best scoring ones.
+	//
+	// Without it, a single search returns every matched section of every
+	// document — a hundred sections, hundreds of kilobytes — saturating the
+	// agent's context window well before it has read any of it. Sections are
+	// already bounded individually at index time
+	// (indexing.max_words_per_section), so it is their number, not their size,
+	// that makes a response large. The ones left out stay reachable by ID
+	// through fetch_sections, which exists precisely to expand on a search
+	// result.
+	//
+	// Zero defers to DefaultMCPMaxSectionsPerResult; a negative value returns
+	// every section, as before.
+	MaxSectionsPerResult int `yaml:"max_sections_per_result"`
+}
+
+// DefaultMCPMaxSectionsPerResult is applied when MCPConfig.MaxSectionsPerResult
+// is left unset. Three sections carry the passage a document matched on plus
+// some of its surroundings, while keeping a five-document response to a couple
+// of dozen kilobytes.
+const DefaultMCPMaxSectionsPerResult = 3
+
+// MaxSectionsPerResult resolves the configured bound, applying the default when
+// unset. A negative value resolves to 0, meaning "no bound".
+func (c *Config) MaxSectionsPerResult() int {
+	switch {
+	case c.MCP.MaxSectionsPerResult == 0:
+		return DefaultMCPMaxSectionsPerResult
+	case c.MCP.MaxSectionsPerResult < 0:
+		return 0
+	default:
+		return c.MCP.MaxSectionsPerResult
+	}
 }
 
 // ImagesConfig configures the storage of the images referenced by the indexed

@@ -24,6 +24,10 @@ const shutdownTimeout = 10 * time.Second
 type Server struct {
 	rt  *runtime.Runtime
 	mcp *mcp.Server
+	// maxSectionsPerResult bounds how many sections of a matched document the
+	// search tool returns inline; 0 returns them all
+	// (cf. config.MCPConfig.MaxSectionsPerResult).
+	maxSectionsPerResult int
 }
 
 // New opens the workspace runtime and registers the MCP tools.
@@ -39,7 +43,7 @@ func New(ctx context.Context, ws *workspace.Workspace, cfg *config.Config) (*Ser
 		Version: build.Version,
 	}, nil)
 
-	srv := &Server{rt: rt, mcp: mcpServer}
+	srv := &Server{rt: rt, mcp: mcpServer, maxSectionsPerResult: cfg.MaxSectionsPerResult()}
 	srv.registerTools(cfg.IterativeRetrievalEnabled(), cfg.GroundingEnabled())
 
 	return srv, nil

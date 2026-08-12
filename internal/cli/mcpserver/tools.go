@@ -1,7 +1,9 @@
 package mcpserver
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/bornholm/amoxtli"
@@ -20,7 +22,10 @@ type searchInput struct {
 	Query       string   `json:"query" jsonschema:"the search query"`
 	MaxResults  int      `json:"max_results,omitempty" jsonschema:"maximum number of results (default 5)"`
 	Collections []string `json:"collections,omitempty" jsonschema:"restrict to these collection labels or IDs"`
-	Filters     []string `json:"filters,omitempty" jsonschema:"metadata filter expressions (key=value, key!=value, key>=value..., key? if the key is set, !key if it is not), e.g. type=code, language=go, or !type for documents carrying no type. Every operator except !key requires the key to be present, so key!=value never matches a document lacking the key"`
+	// MaxSectionsPerResult lets an agent widen the server-side bound for one
+	// call, when an excerpt of a document is not enough to answer.
+	MaxSectionsPerResult int      `json:"max_sections_per_result,omitempty" jsonschema:"maximum number of sections returned per matched document (defaults to the server setting); the omitted ones remain reachable through fetch_sections"`
+	Filters              []string `json:"filters,omitempty" jsonschema:"metadata filter expressions (key=value, key!=value, key>=value..., key? if the key is set, !key if it is not), e.g. type=code, language=go, or !type for documents carrying no type. Every operator except !key requires the key to be present, so key!=value never matches a document lacking the key"`
 }
 
 type sectionResult struct {
@@ -36,6 +41,10 @@ type documentResult struct {
 	// of guessing them.
 	Metadata map[string]any  `json:"metadata,omitempty"`
 	Sections []sectionResult `json:"sections"`
+	// OmittedSections counts the matched sections left out of this result by
+	// the max_sections_per_result bound. Reported so that a trimmed result is
+	// never mistaken for an exhaustive one.
+	OmittedSections int `json:"omitted_sections,omitempty"`
 }
 
 type groundingResult struct {
@@ -99,6 +108,13 @@ type documentHeader struct {
 // verdict, both derived from the configured retrieval profile.
 func (s *Server) registerTools(iterative, groundingEnabled bool) {
 	searchDescription := "Search the local document corpus. Returns matching documents with their most relevant sections inline, plus the metadata each document carries — read it to learn which keys and values the filters parameter accepts. Indexed source code carries type=code and language=<name> metadata: use filters like [\"type=code\"] to search code only, or [\"!type\"] for documentation only (every operator but !key requires the key to be present, so type!=code skips documents carrying no type at all)."
+
+	// A bounded result is announced as such: an agent told that a document has
+	// more to give can go and get it, where one left to assume it saw
+	// everything would answer from an excerpt without knowing.
+	if s.maxSectionsPerResult > 0 {
+		searchDescription += " Only the best scoring sections of each document are returned inline; omitted_sections counts those left out, which you can retrieve by ID with fetch_sections or by raising max_sections_per_result. A document showing omitted_sections has more to say than what you were given."
+	}
 
 	// Images are described in text at index time; the description sits next to
 	// an amoxtli://images/<hash> reference the agent can dereference.
@@ -226,6 +242,13 @@ func (s *Server) handleSearch(iterative, groundingEnabled bool) mcp.ToolHandlerF
 			maxResults = 5
 		}
 
+		// An explicit request wins over the server-side default, including a
+		// negative value, which asks for every section.
+		maxSections := s.maxSectionsPerResult
+		if in.MaxSectionsPerResult != 0 {
+			maxSections = max(in.MaxSectionsPerResult, 0)
+		}
+
 		collections, err := s.rt.ResolveCollections(ctx, in.Collections, false)
 		if err != nil {
 			return nil, searchOutput{}, err
@@ -253,7 +276,7 @@ func (s *Server) handleSearch(iterative, groundingEnabled bool) mcp.ToolHandlerF
 				return nil, searchOutput{}, errors.WithStack(err)
 			}
 
-			out.Results, err = s.renderResults(ctx, result.Results)
+			out.Results, err = s.renderResults(ctx, result.Results, maxSections)
 			if err != nil {
 				return nil, searchOutput{}, err
 			}
@@ -271,7 +294,7 @@ func (s *Server) handleSearch(iterative, groundingEnabled bool) mcp.ToolHandlerF
 				return nil, searchOutput{}, errors.WithStack(err)
 			}
 
-			out.Results, err = s.renderResults(ctx, page.Results)
+			out.Results, err = s.renderResults(ctx, page.Results, maxSections)
 			if err != nil {
 				return nil, searchOutput{}, err
 			}
@@ -377,10 +400,50 @@ func (s *Server) handleListDocuments(ctx context.Context, _ *mcp.CallToolRequest
 
 // renderResults fetches section contents inline so the agent gets usable
 // evidence in a single round-trip.
-func (s *Server) renderResults(ctx context.Context, results []*index.SearchResult) ([]documentResult, error) {
+// bestSections returns at most maxSections of a result's sections, the best
+// scoring ones first when the backend exposed per-section scores, otherwise the
+// leading ones — index order is already relevance order for the backends that
+// do not score individually.
+//
+// The original order is restored afterwards: sections of one document read as a
+// sequence, and handing them back shuffled by score would make an excerpt
+// harder to follow than it needs to be.
+func bestSections(r *index.SearchResult, maxSections int) []model.SectionID {
+	if maxSections <= 0 || len(r.Sections) <= maxSections {
+		return r.Sections
+	}
+
+	if len(r.SectionScores) == 0 {
+		return r.Sections[:maxSections]
+	}
+
+	ranked := slices.Clone(r.Sections)
+	slices.SortStableFunc(ranked, func(a, b model.SectionID) int {
+		// Missing scores sort last rather than first: an unscored section is
+		// not evidence of relevance.
+		return cmp.Compare(r.SectionScores[b], r.SectionScores[a])
+	})
+	ranked = ranked[:maxSections]
+
+	kept := make([]model.SectionID, 0, maxSections)
+	for _, id := range r.Sections {
+		if slices.Contains(ranked, id) {
+			kept = append(kept, id)
+		}
+	}
+
+	return kept
+}
+
+func (s *Server) renderResults(ctx context.Context, results []*index.SearchResult, maxSections int) ([]documentResult, error) {
+	// Trim before fetching: the sections left out are neither read from the
+	// store nor rendered, so the bound saves the work as well as the bytes.
+	kept := make([][]model.SectionID, 0, len(results))
 	ids := []model.SectionID{}
 	for _, r := range results {
-		ids = append(ids, r.Sections...)
+		sections := bestSections(r, maxSections)
+		kept = append(kept, sections)
+		ids = append(ids, sections...)
 	}
 
 	sections, err := s.rt.Codex.GetSectionsByIDs(ctx, ids)
@@ -389,13 +452,19 @@ func (s *Server) renderResults(ctx context.Context, results []*index.SearchResul
 	}
 
 	rendered := make([]documentResult, 0, len(results))
-	for _, r := range results {
-		doc := documentResult{Score: r.Score, Sections: make([]sectionResult, 0, len(r.Sections))}
+	for i, r := range results {
+		doc := documentResult{Score: r.Score, Sections: make([]sectionResult, 0, len(kept[i]))}
 		if r.Source != nil {
 			doc.Source = r.Source.String()
 		}
+		// Tell the agent what it is not seeing, so a partial view never passes
+		// for the whole document: it can widen the bound or fetch the rest by
+		// ID rather than conclude from an excerpt.
+		if omitted := len(r.Sections) - len(kept[i]); omitted > 0 {
+			doc.OmittedSections = omitted
+		}
 
-		for _, id := range r.Sections {
+		for _, id := range kept[i] {
 			section := sectionResult{ID: string(id)}
 			if s, ok := sections[id]; ok {
 				content, err := s.Content()

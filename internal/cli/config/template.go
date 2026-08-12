@@ -207,6 +207,19 @@ images:
   # Largest stored image, in bytes. 0 = default (10 MiB).
   max_size: 0
 
+# What the MCP server hands back to its client. A serving concern, not a
+# retrieval one: the ranking is untouched, only how much of it travels to the
+# agent.
+mcp:
+  # Sections of each matched document returned inline by the search tool, best
+  # scoring first. Sections are already bounded individually at index time, so
+  # it is their number that makes a response large: without this bound a single
+  # search can return a hundred sections and hundreds of kilobytes, saturating
+  # the agent's context window. The ones left out are reported as
+  # omitted_sections and stay reachable by ID through fetch_sections.
+  # 0 = default (3), negative = no bound.
+  max_sections_per_result: 0
+
 indexing:
   # 0 defers to the library defaults.
   max_words_per_section: 0
