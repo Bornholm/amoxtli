@@ -151,7 +151,7 @@ func (s *Server) registerTools(iterative, groundingEnabled bool) {
 	// trimmed list of sections does: the agent must be able to tell an excerpt
 	// from a whole section, and know how to get the rest.
 	if s.maxContentChars > 0 {
-		searchDescription += " Section contents are shared out over a size budget for the whole response: a section carrying total_length was cut short, and next_offset is where to resume reading it with fetch_sections."
+		searchDescription += " Section contents are subject to a size budget for the whole response, spent on the best scoring sections first: a section carrying total_length was not returned in full — it may even come back with no content at all — and fetch_sections returns the rest, from next_offset."
 	}
 
 	// Images are described in text at index time; the description sits next to
@@ -520,12 +520,15 @@ func bestSections(r *index.SearchResult, maxSections int) []model.SectionID {
 }
 
 // shareBudget hands out a budget of characters between sections of the given
-// lengths, and returns what each one may keep, in the same order.
+// lengths, taken in the order they are to be rendered — best scoring documents
+// first — and returns what each one may keep.
 //
-// The split is max-min fair rather than a flat cut: sections shorter than their
-// share release the surplus to the longer ones, so a response made of one large
-// section and four small ones spends its budget on the large one instead of
-// beheading all five. A section that fits is always returned whole.
+// Sections are served whole, in that order, until the budget runs out; what
+// follows comes back empty, announced by its total_length. Splitting the budget
+// evenly instead would look fairer but serves nobody: fifteen sections sharing
+// ten thousand characters get six hundred each, which is the top of a section
+// and not the passage that matched it. An agent can ask for a section it was
+// told about; it cannot ask for the part of a section it does not know was cut.
 func shareBudget(lengths []int, budget int) []int {
 	allowed := make([]int, len(lengths))
 	if budget <= 0 {
@@ -533,20 +536,9 @@ func shareBudget(lengths []int, budget int) []int {
 		return allowed
 	}
 
-	// Serve the shortest sections first: each one that fits under its share
-	// enlarges the share of those still to be served.
-	order := make([]int, len(lengths))
-	for i := range order {
-		order[i] = i
-	}
-	slices.SortStableFunc(order, func(a, b int) int {
-		return cmp.Compare(lengths[a], lengths[b])
-	})
-
 	remaining := budget
-	for left, i := range order {
-		share := remaining / (len(order) - left)
-		allowed[i] = min(lengths[i], share)
+	for i, length := range lengths {
+		allowed[i] = min(length, remaining)
 		remaining -= allowed[i]
 	}
 

@@ -219,12 +219,13 @@ mcp:
   # omitted_sections and stay reachable by ID through fetch_sections.
   # 0 = default (3), negative = no bound.
   max_sections_per_result: 0
-  # Total inline section content of one search response, in characters, shared
-  # out between the sections returned: the short ones release their unused
-  # share to the long ones. Bounding their number is not enough — a couple of
-  # large sections overshoot the size limit clients put on a tool result, and
-  # that cut lands wherever it lands. A section cut here reports its
-  # total_length and the next_offset to resume from with fetch_sections.
+  # Total inline section content of one search response, in characters, spent
+  # on the best scoring sections first and whole: bounding their number is not
+  # enough — a couple of large sections overshoot the size limit clients put on
+  # a tool result, and that cut lands wherever it lands. Sections the budget
+  # cannot afford come back without content; either way a section that was not
+  # returned in full reports its total_length and the next_offset to resume
+  # from with fetch_sections.
   # 0 = default (10000), negative = no bound.
   max_content_chars: 0
 

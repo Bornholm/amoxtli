@@ -398,10 +398,13 @@ ex. `["type=code", "language=go"]`), `fetch_sections`, `list_collections` et
 Les clients bornent la taille d'un résultat d'outil (souvent 16 Kio) et coupent
 au-delà, sans égard pour ce qui se trouve à l'endroit de la coupe. Le serveur
 répond donc déjà sous cette taille : `mcp.max_content_chars` (10000 caractères
-par défaut) borne le contenu total renvoyé inline par `search`, réparti entre
-les sections — les courtes cèdent leur part aux longues. Une section rognée
-porte `total_length` et `next_offset`, de quoi lire la suite avec
-`fetch_sections`. `list_documents` renvoie de son côté une page à la fois
+par défaut) borne le contenu total renvoyé inline par `search`. Ce budget est
+dépensé en sections entières, les mieux classées d'abord, plutôt que découpé en
+parts égales : quinze sections se partageant 10000 caractères reçoivent 666
+caractères chacune, soit le début de chaque section et rarement le passage qui a
+provoqué la correspondance. Les sections que le budget ne couvre plus reviennent
+sans contenu, et toute section non renvoyée en entier porte `total_length` et
+`next_offset`, de quoi lire la suite avec `fetch_sections`. `list_documents` renvoie de son côté une page à la fois
 (`limit`, 20 par défaut, et `page`), `total` indiquant s'il en reste.
 
 `fetch_sections` renvoie par défaut le contenu complet des sections demandées.

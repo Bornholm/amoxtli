@@ -47,7 +47,8 @@ type MCPConfig struct {
 	MaxSectionsPerResult int `yaml:"max_sections_per_result"`
 
 	// MaxContentChars bounds the total inline section content of one search
-	// response, in characters, shared out between the sections returned.
+	// response, in characters, spent on the best scoring sections first and
+	// whole rather than divided between all of them.
 	//
 	// Bounding their number is not enough: sections vary wildly in size, and a
 	// handful of large ones is all it takes to blow past the limit a client

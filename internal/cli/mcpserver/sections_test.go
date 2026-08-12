@@ -209,23 +209,16 @@ func TestShareBudgetFitsWithoutCutting(t *testing.T) {
 	}
 }
 
-// TestShareBudgetGivesSurplusToTheLongest: short sections releasing their
-// unused share is the whole point — a flat cut would behead every section
-// including the ones that fit.
-func TestShareBudgetGivesSurplusToTheLongest(t *testing.T) {
-	// A flat share would be 25 each, cutting the 10 and the 20 for nothing.
-	got := shareBudget([]int{10, 20, 5000, 5000}, 100)
+// TestShareBudgetServesWholeSectionsFirst: an excerpt is only useful whole, so
+// the budget buys complete sections in relevance order rather than an equal
+// stump of each — the ones it cannot afford come back empty and are fetched by
+// ID.
+func TestShareBudgetServesWholeSectionsFirst(t *testing.T) {
+	// An even share would be 25 each: five tops of sections, no full one.
+	got := shareBudget([]int{40, 30, 50, 20}, 100)
 
-	if want := []int{10, 20, 35, 35}; !slices.Equal(got, want) {
-		t.Fatalf("expected the surplus given to the long sections %v, got %v", want, got)
-	}
-
-	total := 0
-	for _, n := range got {
-		total += n
-	}
-	if total > 100 {
-		t.Fatalf("expected the budget to be respected, got %d characters", total)
+	if want := []int{40, 30, 30, 0}; !slices.Equal(got, want) {
+		t.Fatalf("expected whole sections while the budget lasts %v, got %v", want, got)
 	}
 }
 

@@ -110,10 +110,6 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 
 	err := ast.Walk(root, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
-			if !split && current.parent != nil && current.start == current.parent.start && current.end == current.parent.end {
-				current.parent.sections = slices.DeleteFunc(current.parent.sections, func(s *Section) bool { return s == current })
-			}
-
 			return ast.WalkContinue, nil
 		}
 
@@ -235,7 +231,52 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 		return nil, errors.WithStack(err)
 	}
 
+	document.sections = pruneRedundant(document.sections, nil)
+
 	return document, nil
+}
+
+// pruneRedundant drops the sections covering exactly the same range as their
+// parent — the section of a heading opening a document duplicates the whole
+// document — and puts their children in their place rather than dropping the
+// branch with them.
+//
+// It runs on the finished tree instead of during the walk: a heading looks
+// redundant the moment it is entered, before the sub-sections that make it a
+// branch even exist, so pruning it there took its whole subtree along. A
+// document starting with a title — most of them — was left with a single flat
+// section holding the entire file, indexed as one chunk and impossible to
+// return in a readable excerpt afterwards.
+func pruneRedundant(sections []*Section, parent *Section) []*Section {
+	kept := make([]*Section, 0, len(sections))
+
+	for _, s := range sections {
+		s.sections = pruneRedundant(s.sections, s)
+
+		if parent != nil && s.start == parent.start && s.end == parent.end {
+			for _, child := range s.sections {
+				child.parent = parent
+				rebranch(child, parent.branch)
+			}
+
+			kept = append(kept, s.sections...)
+
+			continue
+		}
+
+		kept = append(kept, s)
+	}
+
+	return kept
+}
+
+// rebranch rewrites the ancestry a lifted section carries, so that a branch
+// keeps naming the sections one actually has to walk through to reach it.
+func rebranch(s *Section, parentBranch []model.SectionID) {
+	s.branch = append(slices.Clone(parentBranch), s.id)
+	for _, child := range s.sections {
+		rebranch(child, s.branch)
+	}
 }
 
 // hoistMetadata lifts the YAML frontmatter into the document metadata, so that
