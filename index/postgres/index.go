@@ -13,6 +13,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/url"
 	"slices"
@@ -25,16 +26,33 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 type Index struct {
-	getPool       func(ctx context.Context) (*pgxpool.Pool, error)
-	llm           llm.Client
-	model         string
-	maxWords      int
-	vectorSize    int
-	defaultConfig string
+	getPool        func(ctx context.Context) (*pgxpool.Pool, error)
+	llm            llm.Client
+	model          string
+	maxWords       int
+	vectorSize     int
+	defaultConfig  string
+	efSearchFactor int
 }
+
+const (
+	// DefaultEFSearchFactor multiplies the requested limit to size the HNSW
+	// result heap. Scanning more candidates than are returned is what lets the
+	// graph traversal recover the neighbours it pruned early; 2 is the usual
+	// starting point in pgvector's own tuning guidance.
+	DefaultEFSearchFactor = 2
+
+	// minEFSearch is pgvector's own default: never scan less than the server
+	// would have on its own.
+	minEFSearch = 40
+
+	// maxEFSearch is pgvector's hard ceiling for hnsw.ef_search.
+	maxEFSearch = 1000
+)
 
 type Options struct {
 	// EmbeddingsModel identifies the embeddings model; snapshots generated
@@ -48,6 +66,11 @@ type Options struct {
 	// TextSearchConfig is the regconfig used when language detection is
 	// inconclusive (default "simple").
 	TextSearchConfig string
+	// EFSearchFactor multiplies a query's limit to size the HNSW result heap
+	// (hnsw.ef_search). Raising it trades vector search latency for recall;
+	// lowering it to 1 keeps the heap at the strict minimum. Defaults to
+	// DefaultEFSearchFactor.
+	EFSearchFactor int
 }
 
 type OptionFunc func(opts *Options)
@@ -76,11 +99,22 @@ func WithTextSearchConfig(config string) OptionFunc {
 	}
 }
 
+// WithEFSearchFactor sets the multiplier applied to a query's limit to size the
+// HNSW result heap (see Options.EFSearchFactor). A value below 1 is ignored.
+func WithEFSearchFactor(factor int) OptionFunc {
+	return func(opts *Options) {
+		if factor >= 1 {
+			opts.EFSearchFactor = factor
+		}
+	}
+}
+
 func NewOptions(funcs ...OptionFunc) *Options {
 	opts := &Options{
 		VectorSize:       DefaultVectorSize,
 		MaxWords:         2000,
 		TextSearchConfig: "simple",
+		EFSearchFactor:   DefaultEFSearchFactor,
 	}
 	for _, fn := range funcs {
 		fn(opts)
@@ -94,12 +128,13 @@ func NewOptions(funcs ...OptionFunc) *Options {
 func NewIndex(pool *pgxpool.Pool, client llm.Client, funcs ...OptionFunc) *Index {
 	opts := NewOptions(funcs...)
 	return &Index{
-		getPool:       createGetPool(pool, migrations(opts.VectorSize)),
-		llm:           client,
-		model:         opts.EmbeddingsModel,
-		maxWords:      opts.MaxWords,
-		vectorSize:    opts.VectorSize,
-		defaultConfig: opts.TextSearchConfig,
+		getPool:        createGetPool(pool, migrations(opts.VectorSize)),
+		llm:            client,
+		model:          opts.EmbeddingsModel,
+		maxWords:       opts.MaxWords,
+		vectorSize:     opts.VectorSize,
+		defaultConfig:  opts.TextSearchConfig,
+		efSearchFactor: opts.EFSearchFactor,
 	}
 }
 
@@ -439,17 +474,34 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		limit = 10
 	}
 
-	ftsHits, err := i.ftsSearch(ctx, pool, query, filter, opts, limit)
-	if err != nil {
-		return nil, errors.WithStack(err)
+	// The two legs are independent, and the vector one opens with a remote
+	// embeddings call: run sequentially, the full-text leg would sit idle for the
+	// whole round-trip. Concurrently, a hybrid search costs the slower of the two
+	// legs instead of their sum. pgxpool is safe for concurrent use, and the
+	// errgroup context cancels the surviving leg as soon as the other fails.
+	var (
+		ftsHits []chunkHit
+		vecHits []chunkHit
+	)
+
+	group, groupCtx := errgroup.WithContext(ctx)
+
+	group.Go(func() error {
+		var err error
+		ftsHits, err = i.ftsSearch(groupCtx, pool, query, filter, opts, limit)
+		return errors.WithStack(err)
+	})
+
+	if i.llm != nil {
+		group.Go(func() error {
+			var err error
+			vecHits, err = i.vecSearch(groupCtx, pool, query, filter, opts, limit)
+			return errors.WithStack(err)
+		})
 	}
 
-	var vecHits []chunkHit
-	if i.llm != nil {
-		vecHits, err = i.vecSearch(ctx, pool, query, filter, opts, limit)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
+	if err := group.Wait(); err != nil {
+		return nil, errors.WithStack(err)
 	}
 
 	// Fuse both legs with Reciprocal Rank Fusion
@@ -609,11 +661,70 @@ func (i *Index) vecSearch(ctx context.Context, pool *pgxpool.Pool, query string,
 
 	sql += fmt.Sprintf(` ORDER BY c.embedding <=> %s::vector LIMIT %d`, vecParam, limit)
 
-	return queryChunkHits(ctx, pool, sql, a.values...)
+	return i.queryANN(ctx, pool, limit, sql, a.values...)
 }
 
-func queryChunkHits(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) ([]chunkHit, error) {
-	rows, err := pool.Query(ctx, sql, args...)
+// queryANN runs the KNN query with hnsw.ef_search raised to cover the requested
+// limit.
+//
+// pgvector's default ef_search is 40: the HNSW scan keeps only 40 candidates in
+// its result heap, so a query asking for more than that silently comes back
+// short — and, well before that point, degraded. The candidate windows the
+// search pipeline uses go up to 500, so the default would quietly cap the recall
+// of the vector leg on exactly the searches that over-fetch the most (reranking,
+// deep pagination, selective metadata filters).
+//
+// The setting is transaction-scoped (SET LOCAL) so it cannot leak to the next
+// user of a pooled connection. A backend whose pgvector is too old to know the
+// GUC falls back to a plain query rather than failing the search.
+func (i *Index) queryANN(ctx context.Context, pool *pgxpool.Pool, limit int, sql string, args ...any) ([]chunkHit, error) {
+	efSearch := i.efSearch(limit)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer tx.Rollback(ctx)
+
+	// SET LOCAL takes no bind parameters; efSearch is an int this package
+	// computed and bounded, never caller-supplied text.
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL hnsw.ef_search = %d`, efSearch)); err != nil {
+		slog.WarnContext(ctx, "postgres: could not raise hnsw.ef_search, vector recall may be capped by the server default",
+			slog.Int("efSearch", efSearch),
+			slog.Any("error", errors.WithStack(err)),
+		)
+
+		// The failed statement aborted the transaction; the query has to be
+		// replayed on a clean connection.
+		return queryChunkHits(ctx, pool, sql, args...)
+	}
+
+	hits, err := queryChunkHits(ctx, tx, sql, args...)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return hits, nil
+}
+
+// efSearch sizes the HNSW result heap for a query returning limit rows. It never
+// goes below the requested limit — a heap smaller than the limit cannot fill it
+// — and applies the configured over-scan factor on top, since candidates are
+// pruned along the way.
+func (i *Index) efSearch(limit int) int {
+	ef := max(limit*i.efSearchFactor, minEFSearch)
+
+	return min(ef, maxEFSearch)
+}
+
+// querier is the subset of pgxpool.Pool / pgx.Tx the read path needs, so the
+// vector leg can run its query inside the transaction carrying its SET LOCAL.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func queryChunkHits(ctx context.Context, q querier, sql string, args ...any) ([]chunkHit, error) {
+	rows, err := q.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
