@@ -8,6 +8,7 @@ package llmx
 import (
 	"context"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"github.com/bornholm/genai/llm"
@@ -32,6 +33,7 @@ type RetryClient struct {
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
 	retryable   func(error) bool
+	retryAfter  func(error) (time.Duration, bool)
 }
 
 // Options configures a RetryClient.
@@ -40,13 +42,19 @@ type Options struct {
 	// (so a total of MaxRetries+1 attempts). A negative value disables retries.
 	MaxRetries int
 	// BaseBackoff is the delay before the first retry; it doubles on each
-	// subsequent retry, capped at MaxBackoff.
+	// subsequent retry, capped at MaxBackoff. The delay actually waited is
+	// drawn from [backoff/2, backoff) — see jitter.
 	BaseBackoff time.Duration
 	// MaxBackoff caps the backoff delay.
 	MaxBackoff time.Duration
 	// Retryable decides whether an error is worth retrying. Defaults to
 	// DefaultRetryable (everything except context cancellation/deadline).
 	Retryable func(error) bool
+	// RetryAfter extracts the delay a provider explicitly asked us to wait
+	// (an HTTP Retry-After header on a 429/503). When it reports a delay, that
+	// delay wins over the computed backoff — the provider knows when its quota
+	// window reopens, we only guess. Defaults to DefaultRetryAfter.
+	RetryAfter func(error) (time.Duration, bool)
 	// Limiter, when set, throttles every call (Wait before each attempt,
 	// including retries).
 	Limiter *rate.Limiter
@@ -72,6 +80,12 @@ func WithRetryable(fn func(error) bool) OptionFunc {
 	return func(o *Options) { o.Retryable = fn }
 }
 
+// WithRetryAfter overrides how a provider-mandated retry delay is extracted from
+// an error (see Options.RetryAfter).
+func WithRetryAfter(fn func(error) (time.Duration, bool)) OptionFunc {
+	return func(o *Options) { o.RetryAfter = fn }
+}
+
 // WithRateLimit throttles calls to at most r events per second with the given
 // burst. It applies to every attempt, retries included.
 func WithRateLimit(r rate.Limit, burst int) OptionFunc {
@@ -95,6 +109,32 @@ func DefaultRetryable(err error) bool {
 	return true
 }
 
+// RetryAfterError is implemented by errors carrying a provider-mandated retry
+// delay, typically parsed from an HTTP Retry-After header. Providers whose
+// errors implement it are honoured automatically by DefaultRetryAfter.
+type RetryAfterError interface {
+	error
+	// RetryAfter returns the delay to wait before retrying.
+	RetryAfter() time.Duration
+}
+
+// DefaultRetryAfter reports the delay carried by the first RetryAfterError in
+// err's chain, if any. A non-positive delay is ignored: it carries no
+// information, and honouring it would turn the backoff into a busy loop.
+func DefaultRetryAfter(err error) (time.Duration, bool) {
+	var retryAfter RetryAfterError
+	if !errors.As(err, &retryAfter) {
+		return 0, false
+	}
+
+	d := retryAfter.RetryAfter()
+	if d <= 0 {
+		return 0, false
+	}
+
+	return d, true
+}
+
 // NewRetryClient wraps client with retry (and optional rate-limit) behaviour.
 func NewRetryClient(client llm.Client, funcs ...OptionFunc) *RetryClient {
 	opts := &Options{
@@ -102,12 +142,16 @@ func NewRetryClient(client llm.Client, funcs ...OptionFunc) *RetryClient {
 		BaseBackoff: DefaultBaseBackoff,
 		MaxBackoff:  DefaultMaxBackoff,
 		Retryable:   DefaultRetryable,
+		RetryAfter:  DefaultRetryAfter,
 	}
 	for _, fn := range funcs {
 		fn(opts)
 	}
 	if opts.Retryable == nil {
 		opts.Retryable = DefaultRetryable
+	}
+	if opts.RetryAfter == nil {
+		opts.RetryAfter = DefaultRetryAfter
 	}
 
 	return &RetryClient{
@@ -117,6 +161,7 @@ func NewRetryClient(client llm.Client, funcs ...OptionFunc) *RetryClient {
 		baseBackoff: opts.BaseBackoff,
 		maxBackoff:  opts.MaxBackoff,
 		retryable:   opts.Retryable,
+		retryAfter:  opts.RetryAfter,
 	}
 }
 
@@ -181,23 +226,50 @@ func (c *RetryClient) do(ctx context.Context, op string, fn func() error) error 
 			return errors.WithStack(lastErr)
 		}
 
+		// A provider-mandated delay is authoritative; otherwise the exponential
+		// backoff is jittered so that several clients (or several concurrent
+		// calls of this one) that failed together do not retry in lockstep and
+		// re-create the very burst that rate-limited them.
+		wait, mandated := c.retryAfter(lastErr)
+		if mandated {
+			wait = min(wait, c.maxBackoff)
+		} else {
+			wait = jitter(backoff)
+		}
+
 		slog.WarnContext(ctx, "llmx: LLM call failed, retrying",
 			slog.String("op", op),
 			slog.Int("attempt", attempt+1),
-			slog.Duration("backoff", backoff),
+			slog.Duration("backoff", wait),
+			slog.Bool("retryAfter", mandated),
 			slog.Any("error", lastErr),
 		)
 
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return errors.WithStack(ctx.Err())
-		case <-time.After(backoff):
+		case <-timer.C:
 		}
 
 		if backoff = backoff * 2; backoff > c.maxBackoff {
 			backoff = c.maxBackoff
 		}
 	}
+}
+
+// jitter spreads a backoff delay over [d/2, d) — "equal jitter". Half the delay
+// is kept deterministic so the backoff still grows monotonically in expectation,
+// while the random half decorrelates retries across callers.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+
+	half := d / 2
+
+	return half + time.Duration(rand.Int64N(int64(half)+1))
 }
 
 var _ llm.Client = &RetryClient{}
