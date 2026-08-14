@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync/atomic"
 
 	"github.com/bornholm/genai/llm"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/singleflight"
 )
 
 // CachingClient decorates an llm.Client with a persistent on-disk cache for
@@ -32,7 +34,9 @@ import (
 // are cached below dir/chat under a key covering the messages, seed,
 // temperature and response schema. Files are written atomically (temp file +
 // rename) making the cache safe for concurrent use; an unreadable or corrupted
-// entry is treated as a miss and rewritten.
+// entry is treated as a miss and rewritten. Concurrent misses on the same key
+// are collapsed into a single call to the wrapped client, so a burst of
+// identical requests costs one round-trip rather than one per caller.
 //
 // The namespace must identify the embedding space — typically the model name.
 // Reusing a directory with a different model but the same namespace would serve
@@ -51,6 +55,12 @@ type CachingClient struct {
 
 	chatHits   atomic.Int64
 	chatMisses atomic.Int64
+
+	// inflight collapses concurrent misses on the same key into a single call
+	// to the wrapped client. The cache alone does not prevent them: it is only
+	// written once the call has returned, so N goroutines asking for the same
+	// embedding at the same time would all miss and all pay.
+	inflight singleflight.Group
 }
 
 // CachingOption configures a CachingClient.
@@ -140,27 +150,63 @@ func (c *CachingClient) ChatCompletion(ctx context.Context, funcs ...llm.ChatCom
 			llm.NewChatCompletionUsage(0, 0, 0),
 		), nil
 	}
-	c.chatMisses.Add(1)
 
-	res, err := c.inner.ChatCompletion(ctx, funcs...)
+	// A cacheable completion is deterministic by construction (same messages,
+	// same seed), so concurrent callers asking for it want the same answer: one
+	// of them performs the call and the others wait for its result. This is what
+	// keeps N parallel searches issuing the same HyDE or judge prompt from
+	// costing N calls.
+	// Set by whichever caller ends up performing the call, so that the ones
+	// merely waiting on it are not counted as misses they did not pay for.
+	var computed bool
+
+	res, err, _ := c.inflight.Do("chat:"+path, func() (any, error) {
+		// The winner re-checks the cache: it may have been written by a call
+		// that completed between our own lookup and our arrival here.
+		if entry, ok := c.loadChat(path); ok {
+			return llm.NewChatCompletionResponse(
+				llm.NewMessage(llm.Role(entry.Role), entry.Content),
+				llm.NewChatCompletionUsage(0, 0, 0),
+			), nil
+		}
+
+		computed = true
+		c.chatMisses.Add(1)
+
+		res, err := c.inner.ChatCompletion(ctx, funcs...)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		// Only plain text responses are cached: a response carrying tool calls
+		// (or no message at all) is returned as-is and recomputed next time.
+		if msg := res.Message(); msg != nil && len(res.ToolCalls()) == 0 && msg.Content() != "" {
+			entry := chatCacheEntry{Role: string(msg.Role()), Content: msg.Content()}
+			data, err := json.Marshal(entry)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			if err := c.storeBytes(path, data); err != nil {
+				return nil, errors.WithStack(err)
+			}
+		}
+
+		return res, nil
+	})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	// Only plain text responses are cached: a response carrying tool calls (or
-	// no message at all) is returned as-is and recomputed next time.
-	if msg := res.Message(); msg != nil && len(res.ToolCalls()) == 0 && msg.Content() != "" {
-		entry := chatCacheEntry{Role: string(msg.Role()), Content: msg.Content()}
-		data, err := json.Marshal(entry)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		if err := c.storeBytes(path, data); err != nil {
-			return nil, errors.WithStack(err)
-		}
+	completion, ok := res.(llm.ChatCompletionResponse)
+	if !ok {
+		return nil, errors.Errorf("llmx: unexpected chat completion result of type %T", res)
 	}
 
-	return res, nil
+	if !computed {
+		c.chatHits.Add(1)
+	}
+
+	return completion, nil
 }
 
 // chatPath derives the cache file path of a chat completion, reporting whether
@@ -246,29 +292,79 @@ func (c *CachingClient) Embeddings(ctx context.Context, inputs []string, funcs .
 
 	usage := llm.NewEmbeddingsUsage(0, 0)
 	if len(missInputs) > 0 {
-		res, err := c.inner.Embeddings(ctx, missInputs, funcs...)
+		missPaths := make([]string, len(missInputs))
+		for j, input := range missInputs {
+			missPaths[j] = c.path(input, opts)
+		}
+
+		// Same misses, same order, same key: concurrent callers embedding the
+		// same texts — the common case being several searches embedding the same
+		// query — share a single round-trip instead of each paying for one.
+		// Set by whichever caller ends up issuing the call — `shared` cannot say,
+		// since it is true for the caller that performed it as well as for the
+		// ones that waited on it.
+		var computed bool
+
+		fetch, err, _ := c.inflight.Do("embeddings:"+digest(missPaths), func() (any, error) {
+			computed = true
+
+			res, err := c.inner.Embeddings(ctx, missInputs, funcs...)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+
+			fetched := res.Embeddings()
+			if len(fetched) != len(missInputs) {
+				return nil, errors.Errorf("llmx: embeddings response has %d vectors for %d inputs", len(fetched), len(missInputs))
+			}
+
+			for j, path := range missPaths {
+				if err := c.store(path, fetched[j]); err != nil {
+					return nil, errors.WithStack(err)
+				}
+			}
+
+			return res, nil
+		})
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
 
-		fetched := res.Embeddings()
-		if len(fetched) != len(missInputs) {
-			return nil, errors.Errorf("llmx: embeddings response has %d vectors for %d inputs", len(fetched), len(missInputs))
+		res, ok := fetch.(llm.EmbeddingsResponse)
+		if !ok {
+			return nil, errors.Errorf("llmx: unexpected embeddings result of type %T", fetch)
 		}
+
+		fetched := res.Embeddings()
 
 		for j, i := range missIndexes {
-			embeddings[i] = fetched[j]
-			if err := c.store(c.path(missInputs[j], opts), fetched[j]); err != nil {
-				return nil, errors.WithStack(err)
+			vec := fetched[j]
+			// The result may be handed to several callers at once: everyone but
+			// the one that owns the original takes a copy, so that a caller
+			// normalising or truncating its vectors cannot corrupt another's.
+			if !computed {
+				vec = slices.Clone(vec)
 			}
+			embeddings[i] = vec
 		}
 
-		if u := res.Usage(); u != nil {
+		// Only the caller that actually issued the call was billed; the ones that
+		// merely waited on it report no usage.
+		if u := res.Usage(); u != nil && computed {
 			usage = llm.NewEmbeddingsUsage(u.PromptTokens(), u.TotalTokens())
 		}
 	}
 
 	return &cachedEmbeddingsResponse{embeddings: embeddings, usage: usage}, nil
+}
+
+// digest hashes the ordered cache paths of a batch into a singleflight key.
+func digest(paths []string) string {
+	h := sha256.New()
+	for _, p := range paths {
+		_, _ = fmt.Fprintf(h, "%s\x00", p)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // path derives the cache file path for one embeddings input: sha256 over the
