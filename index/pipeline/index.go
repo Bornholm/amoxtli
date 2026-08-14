@@ -13,8 +13,12 @@ import (
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/internal/syncx"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/bornholm/amoxtli/telemetry"
 	"github.com/bornholm/go-x/slogx"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type WeightedIndexes map[*IdentifiedIndex]float64
@@ -182,11 +186,32 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		collections = opts.Collections
 	}
 
-	results, err := fanOut(i.indexes, func(identified *IdentifiedIndex) (*indexSearchResults, error) {
+	// Each leg gets its own span: the retrieval fan-out is where the wall-clock
+	// time of a search is decided, and a single parent span cannot say which leg
+	// (lexical or vector, local or remote) is the slow one.
+	results, err := fanOut(i.indexes, func(identified *IdentifiedIndex) (res *indexSearchResults, err error) {
+		semantic := index.IsSemantic(identified.Index())
+
 		indexCtx := slogx.WithAttrs(ctx, slog.String("index_type", fmt.Sprintf("%T", identified.Index())))
 
+		indexCtx, span := telemetry.Tracer().Start(indexCtx, "pipeline.index_search",
+			trace.WithAttributes(
+				attribute.String(telemetry.AttrIndexType, fmt.Sprintf("%T", identified.Index())),
+				attribute.Bool(telemetry.AttrIndexSemantic, semantic),
+			),
+		)
+		defer func() {
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+			} else if res != nil {
+				span.SetAttributes(attribute.Int(telemetry.AttrCandidateCount, len(res.Results)))
+			}
+			span.End()
+		}()
+
 		variant := lexicalQueryOnce
-		if index.IsSemantic(identified.Index()) {
+		if semantic {
 			variant = semanticQueryOnce
 		}
 
@@ -229,7 +254,7 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		return nil, err
 	}
 
-	merged, err := i.mergeResults(results, maxResults)
+	merged, err := i.mergeResults(ctx, results, maxResults)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -303,18 +328,7 @@ func fanOut[T any](indexes WeightedIndexes, fn func(identified *IdentifiedIndex)
 // into neither marker. The result is the common input of both the lexical and
 // the semantic variants.
 func (i *Index) transformBaseQuery(ctx context.Context, query string, opts index.SearchOptions) (string, error) {
-	baseQuery := query
-	var err error
-	for _, t := range i.queryTransformers {
-		if scopeOf(t) != scopeUniversal {
-			continue
-		}
-		baseQuery, err = t.TransformQuery(ctx, baseQuery, opts)
-		if err != nil {
-			return "", errors.WithStack(err)
-		}
-	}
-	return baseQuery, nil
+	return i.transformQuery(ctx, "base", scopeUniversal, query, opts)
 }
 
 // transformLexicalQuery applies the lexical-only transformers (e.g. query
@@ -322,45 +336,79 @@ func (i *Index) transformBaseQuery(ctx context.Context, query string, opts index
 // counterpart it is only invoked — lazily, from Search — when at least one
 // lexical index needs it, so a purely semantic pipeline never pays for it.
 func (i *Index) transformLexicalQuery(ctx context.Context, baseQuery string, opts index.SearchOptions) (string, error) {
-	lexicalQuery := baseQuery
-	var err error
-	for _, t := range i.queryTransformers {
-		if scopeOf(t) != scopeLexical {
-			continue
-		}
-		lexicalQuery, err = t.TransformQuery(ctx, lexicalQuery, opts)
-		if err != nil {
-			return "", errors.WithStack(err)
-		}
-	}
-	return lexicalQuery, nil
+	return i.transformQuery(ctx, "lexical", scopeLexical, baseQuery, opts)
 }
 
 // transformSemanticQuery applies the semantic-only transformers (e.g. HyDE, an
 // LLM call) on top of the already base-transformed query. It is only invoked —
 // lazily, from Search — when at least one semantic index needs it.
 func (i *Index) transformSemanticQuery(ctx context.Context, baseQuery string, opts index.SearchOptions) (string, error) {
-	semanticQuery := baseQuery
-	var err error
+	return i.transformQuery(ctx, "semantic", scopeSemantic, baseQuery, opts)
+}
+
+// transformQuery applies, in order, every query transformer declaring the given
+// scope. Each transformer gets its own span: several of them (HyDE, translation)
+// are LLM round-trips, and knowing which one dominates a search is the whole
+// point of instrumenting the stage rather than the pipeline.
+func (i *Index) transformQuery(ctx context.Context, variant string, scope transformerScope, query string, opts index.SearchOptions) (string, error) {
 	for _, t := range i.queryTransformers {
-		if scopeOf(t) != scopeSemantic {
+		if scopeOf(t) != scope {
 			continue
 		}
-		semanticQuery, err = t.TransformQuery(ctx, semanticQuery, opts)
+
+		transformed, err := func() (string, error) {
+			ctx, span := telemetry.Tracer().Start(ctx, "pipeline.transform_query."+variant,
+				trace.WithAttributes(attribute.String(telemetry.AttrTransformerType, fmt.Sprintf("%T", t))),
+			)
+			defer span.End()
+
+			transformed, err := t.TransformQuery(ctx, query, opts)
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return "", errors.WithStack(err)
+			}
+
+			return transformed, nil
+		}()
 		if err != nil {
-			return "", errors.WithStack(err)
+			return "", err
 		}
+
+		query = transformed
 	}
-	return semanticQuery, nil
+
+	return query, nil
 }
 
 func (i *Index) transformResults(ctx context.Context, query string, results []*index.SearchResult, opts index.SearchOptions) ([]*index.SearchResult, error) {
-	var err error
 	for _, t := range i.resultsTransformers {
-		results, err = t.TransformResults(ctx, query, results, opts)
+		transformed, err := func() ([]*index.SearchResult, error) {
+			ctx, span := telemetry.Tracer().Start(ctx, "pipeline.transform_results",
+				trace.WithAttributes(
+					attribute.String(telemetry.AttrTransformerType, fmt.Sprintf("%T", t)),
+					attribute.Int(telemetry.AttrCandidateCount, len(results)),
+					attribute.Int(telemetry.AttrSectionCount, countSections(results)),
+				),
+			)
+			defer span.End()
+
+			transformed, err := t.TransformResults(ctx, query, results, opts)
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return nil, errors.WithStack(err)
+			}
+
+			span.SetAttributes(attribute.Int(telemetry.AttrResultCount, len(transformed)))
+
+			return transformed, nil
+		}()
 		if err != nil {
-			return nil, errors.WithStack(err)
+			return nil, err
 		}
+
+		results = transformed
 
 		if emptyResults(results) {
 			return []*index.SearchResult{}, nil
@@ -368,6 +416,17 @@ func (i *Index) transformResults(ctx context.Context, query string, results []*i
 	}
 
 	return results, nil
+}
+
+// countSections totals the sections carried by results — the quantity that
+// actually drives the cost of the LLM-backed transformers, unlike the number of
+// results.
+func countSections(results []*index.SearchResult) int {
+	total := 0
+	for _, r := range results {
+		total += len(r.Sections)
+	}
+	return total
 }
 
 // rrfK is the standard Reciprocal Rank Fusion smoothing constant. A larger k
@@ -382,7 +441,10 @@ const rrfK = 60
 // this is rank-sensitive: a result ranked first weighs more than one ranked
 // tenth, and results corroborated by several indexes accumulate. The fused
 // scores are exposed on the returned SearchResult (Score / SectionScores).
-func (i *Index) mergeResults(indexResults []*indexSearchResults, maxResults int) ([]*index.SearchResult, error) {
+func (i *Index) mergeResults(ctx context.Context, indexResults []*indexSearchResults, maxResults int) ([]*index.SearchResult, error) {
+	_, span := telemetry.Tracer().Start(ctx, "pipeline.merge_results")
+	defer span.End()
+
 	sourceScores := map[string]float64{}
 	sectionScores := map[string]map[model.SectionID]float64{}
 
@@ -450,6 +512,8 @@ func (i *Index) mergeResults(indexResults []*indexSearchResults, maxResults int)
 	if maxResults > 0 && len(merged) > maxResults {
 		merged = merged[:maxResults]
 	}
+
+	span.SetAttributes(attribute.Int(telemetry.AttrCandidateCount, len(merged)))
 
 	return merged, nil
 }

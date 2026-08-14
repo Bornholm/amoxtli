@@ -21,9 +21,12 @@ import (
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/amoxtli/task"
+	"github.com/bornholm/amoxtli/telemetry"
 	"github.com/bornholm/go-x/slogx"
 	"github.com/pkg/errors"
 	"github.com/rs/xid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type ManagerOptions struct {
@@ -299,7 +302,14 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 	}
 
 	if m.reranker != nil {
-		results, err = rerankTop(ctx, m.reranker, query, results, pageSize)
+		// The reranker is typically an LLM round-trip — the single most expensive
+		// step of a search. It gets its own span, carrying how many candidates it
+		// was actually handed, since that is what its cost scales with.
+		rerankCtx, span := telemetry.Tracer().Start(ctx, "ingest.rerank",
+			trace.WithAttributes(attribute.Int(telemetry.AttrCandidateCount, len(results))),
+		)
+		results, err = rerankTop(rerankCtx, m.reranker, query, results, pageSize)
+		span.End()
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -349,7 +359,18 @@ func rerankTop(ctx context.Context, reranker Reranker, query string, results []*
 // until enough results survive, the backend runs out of candidates, or the hard
 // bound is reached. The growth is deterministic — it depends only on target —
 // so replaying a page fetches the same window and returns the same ordering.
-func (m *Manager) searchCandidates(ctx context.Context, query string, collections []model.CollectionID, opts *SearchOptions, target int) ([]*index.SearchResult, error) {
+func (m *Manager) searchCandidates(ctx context.Context, query string, collections []model.CollectionID, opts *SearchOptions, target int) (candidates []*index.SearchResult, err error) {
+	// The over-fetch loop below can query the index several times: the span
+	// reports the window that ended up being needed, next to the number of
+	// candidates that survived the filter.
+	ctx, span := telemetry.Tracer().Start(ctx, "ingest.search_candidates",
+		trace.WithAttributes(attribute.Int("amoxtli.search.target", target)),
+	)
+	defer func() {
+		span.SetAttributes(attribute.Int(telemetry.AttrCandidateCount, len(candidates)))
+		span.End()
+	}()
+
 	// When the index applies the filter inside its own query, its top-k is
 	// already k matching results: no over-fetching, no metadata reload, no
 	// second round. The contract of index.FilterableIndex — enforced by the

@@ -32,6 +32,19 @@ const (
 	AttrQueryLength = "amoxtli.search.query_length"
 	// AttrResultCount is the number of results returned by a search.
 	AttrResultCount = "amoxtli.search.result_count"
+	// AttrCandidateCount is the number of candidates a search stage produced,
+	// recorded on each stage span so the funnel from retrieval to the returned
+	// page can be read directly off a trace.
+	AttrCandidateCount = "amoxtli.search.candidate_count"
+	// AttrIndexType is the Go type of the index backing a retrieval leg.
+	AttrIndexType = "amoxtli.index.type"
+	// AttrIndexSemantic reports whether a retrieval leg is a vector index.
+	AttrIndexSemantic = "amoxtli.index.semantic"
+	// AttrTransformerType is the Go type of a query or results transformer.
+	AttrTransformerType = "amoxtli.pipeline.transformer"
+	// AttrSectionCount is the number of sections handled by a stage (hydrated,
+	// judged, reranked).
+	AttrSectionCount = "amoxtli.search.section_count"
 	// AttrVisionOutcome labels how an image description ended: "ok",
 	// "error" or "rejected" (refused before any call, e.g. an oversized
 	// image).
