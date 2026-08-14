@@ -27,63 +27,15 @@ type Index struct {
 
 // DeleteByID implements index.Index.
 func (i *Index) DeleteByID(ctx context.Context, ids ...model.SectionID) error {
-	count := len(i.indexes)
-	errs := make(chan error, count)
-	defer close(errs)
+	_, err := fanOut(i.indexes, func(identified *IdentifiedIndex) (struct{}, error) {
+		internalIndex := identified.Index()
 
-	var wg sync.WaitGroup
+		slog.DebugContext(ctx, "deleting indexed section", slog.String("indexType", fmt.Sprintf("%T", internalIndex)))
 
-	wg.Add(count)
+		return struct{}{}, errors.WithStack(internalIndex.DeleteByID(ctx, ids...))
+	})
 
-	aggregatedErr := NewAggregatedError()
-
-	for identified := range i.indexes {
-		go func(identified *IdentifiedIndex) {
-			defer func() {
-				if r := recover(); r != nil {
-					if err, ok := r.(error); ok {
-						aggregatedErr.Add(errors.WithStack(err))
-					} else {
-						panic(r)
-					}
-				}
-			}()
-			defer wg.Done()
-
-			internalIndex := identified.Index()
-
-			slog.DebugContext(ctx, "deleting indexed section", slog.String("indexType", fmt.Sprintf("%T", internalIndex)))
-
-			if err := internalIndex.DeleteByID(ctx, ids...); err != nil {
-				errs <- errors.WithStack(err)
-				return
-			}
-
-			errs <- nil
-		}(identified)
-	}
-
-	wg.Wait()
-
-	idx := 0
-
-	for e := range errs {
-		if e != nil {
-			aggregatedErr.Add(e)
-		}
-
-		if idx >= count-1 {
-			break
-		}
-
-		idx++
-	}
-
-	if aggregatedErr.Len() > 0 {
-		return errors.WithStack(aggregatedErr.OrOnlyOne())
-	}
-
-	return nil
+	return err
 }
 
 type indexSearchResults struct {
@@ -93,59 +45,11 @@ type indexSearchResults struct {
 
 // DeleteBySource implements index.Index.
 func (i *Index) DeleteBySource(ctx context.Context, source *url.URL) error {
-	count := len(i.indexes)
-	errs := make(chan error, count)
-	defer close(errs)
+	_, err := fanOut(i.indexes, func(identified *IdentifiedIndex) (struct{}, error) {
+		return struct{}{}, errors.WithStack(identified.Index().DeleteBySource(ctx, source))
+	})
 
-	var wg sync.WaitGroup
-
-	wg.Add(count)
-
-	aggregatedErr := NewAggregatedError()
-
-	for identified := range i.indexes {
-		go func(identified *IdentifiedIndex) {
-			defer func() {
-				if r := recover(); r != nil {
-					if err, ok := r.(error); ok {
-						aggregatedErr.Add(errors.WithStack(err))
-					} else {
-						panic(r)
-					}
-				}
-			}()
-			defer wg.Done()
-
-			if err := identified.Index().DeleteBySource(ctx, source); err != nil {
-				errs <- errors.WithStack(err)
-				return
-			}
-
-			errs <- nil
-		}(identified)
-	}
-
-	wg.Wait()
-
-	idx := 0
-
-	for e := range errs {
-		if e != nil {
-			aggregatedErr.Add(e)
-		}
-
-		if idx >= count-1 {
-			break
-		}
-
-		idx++
-	}
-
-	if aggregatedErr.Len() > 0 {
-		return errors.WithStack(aggregatedErr.OrOnlyOne())
-	}
-
-	return nil
+	return err
 }
 
 // Index implements index.Index.
@@ -155,87 +59,49 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 	var progress syncx.Map[index.Index, float32]
 
 	count := len(i.indexes)
-	errs := make(chan error, count)
-	defer close(errs)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
-	var wg sync.WaitGroup
-
-	wg.Add(count)
-
-	aggregatedErr := NewAggregatedError()
 
 	ctx = slogx.WithAttrs(ctx, slog.String("documentID", string(document.ID())))
 
 	slog.DebugContext(ctx, "pipeline: indexing document", slog.Int("indexCount", count))
 
-	for identified := range i.indexes {
-		go func(identified *IdentifiedIndex) {
-			defer func() {
-				if r := recover(); r != nil {
-					if err, ok := r.(error); ok {
-						err = errors.WithStack(err)
-						aggregatedErr.Add(err)
-						errs <- err
-					} else {
-						panic(r)
-					}
-				}
-			}()
-			defer wg.Done()
+	_, err := fanOut(i.indexes, func(identified *IdentifiedIndex) (struct{}, error) {
+		indexCtx := slogx.WithAttrs(ctx, slog.String("indexType", fmt.Sprintf("%T", identified.Index())))
 
-			indexCtx := slogx.WithAttrs(ctx, slog.String("indexType", fmt.Sprintf("%T", identified.Index())))
+		indexOptions := []index.OptionFunc{}
 
-			indexOptions := []index.OptionFunc{}
+		if opts.OnProgress != nil {
+			indexOptions = append(indexOptions, index.WithOnProgress(func(p float32) {
+				progress.Store(identified.Index(), p)
+				var globalProgress float32
+				progress.Range(func(_ index.Index, p float32) bool {
+					globalProgress += p
+					return true
+				})
+				globalProgress /= float32(count)
+				opts.OnProgress(globalProgress)
+			}))
 
-			if opts.OnProgress != nil {
-				indexOptions = append(indexOptions, index.WithOnProgress(func(p float32) {
-					progress.Store(identified.Index(), p)
-					var globalProgress float32
-					progress.Range(func(_ index.Index, p float32) bool {
-						globalProgress += p
-						return true
-					})
-					globalProgress /= float32(count)
-					opts.OnProgress(globalProgress)
-				}))
-
-				defer opts.OnProgress(1)
-			}
-
-			slog.DebugContext(indexCtx, "pipeline: calling Index() on underlying index")
-			if err := identified.Index().Index(indexCtx, document, indexOptions...); err != nil {
-				err = errors.WithStack(err)
-				slog.ErrorContext(indexCtx, "could not index document", slog.Any("error", err))
-				errs <- err
-				cancel()
-				return
-			}
-
-			errs <- nil
-		}(identified)
-	}
-
-	wg.Wait()
-
-	idx := 0
-
-	for e := range errs {
-		if e != nil {
-			aggregatedErr.Add(e)
+			defer opts.OnProgress(1)
 		}
 
-		if idx >= count-1 {
-			break
+		slog.DebugContext(indexCtx, "pipeline: calling Index() on underlying index")
+		if err := identified.Index().Index(indexCtx, document, indexOptions...); err != nil {
+			err = errors.WithStack(err)
+			slog.ErrorContext(indexCtx, "could not index document", slog.Any("error", err))
+			// Indexing is all-or-nothing across the legs: once one has failed the
+			// document will not be considered indexed, so the others stop early
+			// rather than finish work that is about to be discarded.
+			cancel()
+			return struct{}{}, err
 		}
 
-		idx++
-	}
-
-	if aggregatedErr.Len() > 0 {
-		return errors.WithStack(aggregatedErr.OrOnlyOne())
+		return struct{}{}, nil
+	})
+	if err != nil {
+		return err
 	}
 
 	slog.DebugContext(ctx, "document indexed")
@@ -306,20 +172,6 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		return i.transformLexicalQuery(ctx, baseQuery, opts)
 	})
 
-	count := len(i.indexes)
-
-	type Message struct {
-		Results *indexSearchResults
-		Err     error
-	}
-
-	messages := make(chan *Message, count)
-	defer close(messages)
-
-	var wg sync.WaitGroup
-
-	wg.Add(count)
-
 	maxResults := 3
 	if opts.MaxResults != 0 {
 		maxResults = opts.MaxResults
@@ -330,97 +182,51 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		collections = opts.Collections
 	}
 
-	aggregatedErr := NewAggregatedError()
+	results, err := fanOut(i.indexes, func(identified *IdentifiedIndex) (*indexSearchResults, error) {
+		indexCtx := slogx.WithAttrs(ctx, slog.String("index_type", fmt.Sprintf("%T", identified.Index())))
 
-	for identified := range i.indexes {
-		go func(identified *IdentifiedIndex) {
-			defer func() {
-				if r := recover(); r != nil {
-					if err, ok := r.(error); ok {
-						aggregatedErr.Add(errors.WithStack(err))
-					} else {
-						panic(r)
-					}
-				}
-			}()
-			defer wg.Done()
-
-			indexCtx := slogx.WithAttrs(ctx, slog.String("index_type", fmt.Sprintf("%T", identified.Index())))
-
-			variant := lexicalQueryOnce
-			if index.IsSemantic(identified.Index()) {
-				variant = semanticQueryOnce
-			}
-
-			indexQuery, err := variant()
-			if err != nil {
-				err = errors.WithStack(err)
-				slog.ErrorContext(indexCtx, "could not transform query", slog.Any("error", err))
-				messages <- &Message{
-					Err: err,
-				}
-				return
-			}
-
-			legOpts := index.SearchOptions{
-				MaxResults:  maxResults * 2,
-				Collections: collections,
-			}
-
-			// Push the filter into the leg when it can apply it inside its own
-			// query: its top-k is then k *matching* results, instead of a top-k
-			// the filter may empty afterwards. Filterable above guarantees every
-			// leg can, so there is no unfiltered leg to reconcile here.
-			var results []*index.SearchResult
-			if filterable, ok := index.AsFilterable(identified.Index()); ok && len(filter) > 0 {
-				results, err = filterable.SearchFiltered(indexCtx, indexQuery, filter, legOpts)
-			} else {
-				results, err = identified.Index().Search(indexCtx, indexQuery, legOpts)
-			}
-			if err != nil {
-				err = errors.WithStack(err)
-				slog.ErrorContext(indexCtx, "could not search documents", slog.Any("error", err))
-				messages <- &Message{
-					Err: err,
-				}
-				return
-			}
-
-			slog.DebugContext(indexCtx, "found documents", slog.Int("total", len(results)))
-
-			messages <- &Message{
-				Results: &indexSearchResults{
-					Results: results,
-					Index:   identified,
-				},
-			}
-		}(identified)
-	}
-
-	wg.Wait()
-
-	results := make([]*indexSearchResults, 0)
-
-	idx := 0
-
-	for m := range messages {
-		if m.Err != nil {
-			aggregatedErr.Add(m.Err)
+		variant := lexicalQueryOnce
+		if index.IsSemantic(identified.Index()) {
+			variant = semanticQueryOnce
 		}
 
-		if m.Results != nil {
-			results = append(results, m.Results)
+		indexQuery, err := variant()
+		if err != nil {
+			err = errors.WithStack(err)
+			slog.ErrorContext(indexCtx, "could not transform query", slog.Any("error", err))
+			return nil, err
 		}
 
-		if idx >= count-1 {
-			break
+		legOpts := index.SearchOptions{
+			MaxResults:  maxResults * 2,
+			Collections: collections,
 		}
 
-		idx++
-	}
+		// Push the filter into the leg when it can apply it inside its own
+		// query: its top-k is then k *matching* results, instead of a top-k
+		// the filter may empty afterwards. Filterable above guarantees every
+		// leg can, so there is no unfiltered leg to reconcile here.
+		var legResults []*index.SearchResult
+		if filterable, ok := index.AsFilterable(identified.Index()); ok && len(filter) > 0 {
+			legResults, err = filterable.SearchFiltered(indexCtx, indexQuery, filter, legOpts)
+		} else {
+			legResults, err = identified.Index().Search(indexCtx, indexQuery, legOpts)
+		}
+		if err != nil {
+			err = errors.WithStack(err)
+			slog.ErrorContext(indexCtx, "could not search documents", slog.Any("error", err))
+			return nil, err
+		}
 
-	if aggregatedErr.Len() > 0 {
-		return nil, errors.WithStack(aggregatedErr.OrOnlyOne())
+		slog.DebugContext(indexCtx, "found documents", slog.Int("total", len(legResults)))
+
+		return &indexSearchResults{
+			Results: legResults,
+			Index:   identified,
+		}, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	merged, err := i.mergeResults(results, maxResults)
@@ -434,6 +240,63 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 	}
 
 	return transformed, nil
+}
+
+// fanOut runs fn concurrently over every leg of the pipeline and returns the
+// per-leg values, or the aggregation of the errors when at least one leg failed.
+//
+// It also converts a panic raised inside a leg into an error. A panic in a
+// goroutine is otherwise unrecoverable by the caller and takes the whole process
+// down, and — with the previous per-leg result channel — could leave the
+// collecting loop waiting forever for a message the panicking goroutine never
+// sent.
+func fanOut[T any](indexes WeightedIndexes, fn func(identified *IdentifiedIndex) (T, error)) ([]T, error) {
+	type outcome struct {
+		value T
+		err   error
+	}
+
+	outcomes := make([]outcome, len(indexes))
+
+	var wg sync.WaitGroup
+	wg.Add(len(indexes))
+
+	slot := 0
+	for identified := range indexes {
+		go func(slot int, identified *IdentifiedIndex) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					outcomes[slot].err = errors.Errorf("pipeline: panic in index %T: %v", identified.Index(), r)
+				}
+			}()
+
+			outcomes[slot].value, outcomes[slot].err = fn(identified)
+		}(slot, identified)
+		slot++
+	}
+
+	wg.Wait()
+
+	// Aggregation happens after Wait, on this goroutine only: no lock is needed
+	// on the accumulator, unlike the concurrent Add it replaces.
+	aggregatedErr := NewAggregatedError()
+	values := make([]T, 0, len(outcomes))
+
+	for _, o := range outcomes {
+		if o.err != nil {
+			aggregatedErr.Add(o.err)
+			continue
+		}
+
+		values = append(values, o.value)
+	}
+
+	if aggregatedErr.Len() > 0 {
+		return nil, errors.WithStack(aggregatedErr.OrOnlyOne())
+	}
+
+	return values, nil
 }
 
 // transformBaseQuery applies the universal query transformers — those opting
