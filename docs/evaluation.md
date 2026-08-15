@@ -133,6 +133,49 @@ Comparer le rapport lexical et le rapport hybride sur le **même** jeu (mêmes
 > dont le passage a été écarté par la troncature sont automatiquement retirées
 > (`Dataset.KeepAnswerable`), pour ne pas fausser le recall.
 
+### Embeddings en process (llama.cpp via yzma)
+
+L'ingestion vectorielle domine le temps d'une évaluation, et c'est presque
+entièrement le service d'embeddings. `llmx/yzma` fait tourner le modèle
+**dans le processus de test**, via les bibliothèques llama.cpp chargées par
+purego — sans cgo, sans serveur, et surtout **en batchant** les entrées, ce
+qu'Ollama ne fait pas sur `/v1/embeddings`. Mesuré ×5,9 sur la machine de
+référence (0,30 → 1,78 documents/s), voir
+[embeddings-backend-eval.md](embeddings-backend-eval.md).
+
+Ces variables prennent le pas sur `AMOXTLI_EVAL_EMBED_BASE_URL` :
+
+| Variable | Rôle | Défaut |
+|---|---|---|
+| `AMOXTLI_EVAL_EMBED_YZMA_MODEL` | Chemin du GGUF d'embeddings (active le backend) | — |
+| `AMOXTLI_EVAL_EMBED_YZMA_LIB` | Répertoire des `.so` llama.cpp — **prendre le build Vulkan** | recherche par défaut de yzma |
+| `AMOXTLI_EVAL_EMBED_YZMA_BATCH` | Entrées empaquetées par batch llama.cpp | 8 |
+| `AMOXTLI_EVAL_EMBED_YZMA_GPU_LAYERS` | Couches déchargées sur le GPU (0 = CPU seul) | 999 |
+| `AMOXTLI_EVAL_EMBED_YZMA_THREADS` | Threads CPU | défaut llama.cpp |
+
+`AMOXTLI_EVAL_EMBED_MAX_WORDS` sert aussi de plafond de tokens par entrée : il
+doit rester **≤ la fenêtre du modèle** (512 pour mxbai). Au-delà, l'entrée est
+tronquée avec un avertissement — llama.cpp interrompt le processus par un
+`GGML_ASSERT` si un batch dépasse `n_ubatch`, ce que le dimensionnement du
+contexte et l'empaquetage rendent inatteignable.
+
+```bash
+AMOXTLI_EVAL_EMBED_YZMA_MODEL=$HOME/models/mxbai-embed-large-q8_0.gguf \
+AMOXTLI_EVAL_EMBED_YZMA_LIB=$HOME/opt/llama.cpp-vulkan \
+AMOXTLI_EVAL_EMBED_MODEL=mxbai-embed-large \
+AMOXTLI_EVAL_EMBED_DIM=1024 \
+AMOXTLI_EVAL_EMBED_MAX_WORDS=350 \
+make eval-beir EVAL_BEIR=scifact
+```
+
+Le même client est aussi exposé en serveur compatible OpenAI, pour garder un
+modèle chargé entre plusieurs runs au lieu de le recharger à chaque `go test` :
+
+```bash
+go run ./llmx/yzma/cmd/amoxtli-embed -model mxbai-embed-large-q8_0.gguf -lib ~/opt/llama.cpp-vulkan
+export AMOXTLI_EVAL_EMBED_BASE_URL=http://127.0.0.1:8081/v1/
+```
+
 ### Étages LLM de récupération (chat)
 
 Pour évaluer les étages pilotés par LLM, configurez un client chat
@@ -151,6 +194,42 @@ Ces étages reproduisent les profils CLI : *fast* = aucun (0 appel chat),
 *balanced* = `HYDE`, *precision* = `HYDE` + `GROUNDING`. Le coût des appels chat
 (HyDE, grounding, reranker) est reporté dans la section `LLM cost [evaluation]`
 du rapport, à côté des embeddings.
+
+### Reranker sans modèle
+
+`AMOXTLI_EVAL_LEXICAL_RERANK=1` active `retrieval.LexicalReranker`, qui réordonne
+les candidats à partir de la seule requête et du texte déjà récupéré (BM25 avec
+IDF calculé sur le pool de candidats, couverture des termes, proximité, phrase
+exacte), mélangés au score fusionné. Il n'exige **aucun client chat** : c'est la
+seule configuration de reranking mesurable face à un run lexical pur, et la seule
+qui ne domine pas la latence de recherche.
+
+Mutuellement exclusif avec `AMOXTLI_EVAL_RERANK`. Les poids des signaux se
+règlent sans recompiler, pour balayer l'espace de configuration :
+
+| Variable | Signal | Défaut |
+|---|---|---|
+| `AMOXTLI_EVAL_LEXRERANK_PRIOR` | Score fusionné (RRF) entrant | 1.0 |
+| `AMOXTLI_EVAL_LEXRERANK_BM25` | BM25 sur le contenu de la section | 1.0 |
+| `AMOXTLI_EVAL_LEXRERANK_COVERAGE` | Part de l'IDF de la requête couverte | 0 |
+| `AMOXTLI_EVAL_LEXRERANK_PROXIMITY` | Regroupement des termes appariés | 0 |
+| `AMOXTLI_EVAL_LEXRERANK_PHRASE` | Occurrence verbatim de la requête | 0 |
+
+Mesuré sur SciFact (300 requêtes, 1000 documents, hybride bleve + vecteur) :
+
+| Configuration | MRR | Recall@10 | nDCG@10 |
+|---|---|---|---|
+| Baseline (sans reranking) | 0,582 | 0,836 | 0,635 |
+| `prior + bm25` (défaut) | **0,757** | **0,879** | **0,780** |
+| `prior + bm25 + cov + prox + phrase` | 0,755 | 0,869 | 0,777 |
+| `bm25` seul (prior à 0) | 0,737 | 0,866 | 0,761 |
+| `prior` seul (bm25 à 0) | 0,645 | 0,866 | 0,692 |
+
+Les trois signaux correctifs sont des fonctions des mêmes positions de termes que
+BM25 consomme déjà ; sur ce corpus ils n'ont rien apporté qu'il n'ait extrait. Ils
+restent disponibles : SciFact est anglophone avec un court résumé par document,
+et c'est sur des documents longs ou des requêtes où l'ordre des mots compte que
+proximité et phrase devraient peser.
 
 ## Benchmarks BEIR (dont FEVER)
 
