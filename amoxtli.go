@@ -219,11 +219,24 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 
 		managerOpts = append(managerOpts, ingest.WithManagerImageEnrichment(imagetext.New(enrichOptions...)))
 	}
+	if opts.reranking && opts.lexicalReranking {
+		return nil, errors.New("amoxtli: WithReranking and WithLexicalReranking are mutually exclusive, the search pipeline holds a single reranker")
+	}
 	if rerankClient := opts.clientFor(StageRerank); opts.reranking && rerankClient != nil {
 		managerOpts = append(managerOpts,
 			ingest.WithManagerReranker(retrieval.NewLLMReranker(rerankClient, store, opts.maxTotalWords,
 				retrieval.WithMaxSectionWords(opts.maxSectionWords))),
 		)
+	}
+	if opts.lexicalReranking {
+		lexicalOpts := []retrieval.LexicalOption{}
+		if opts.lexicalWeights != (retrieval.LexicalWeights{}) {
+			lexicalOpts = append(lexicalOpts, retrieval.WithLexicalWeights(opts.lexicalWeights))
+		}
+		if opts.lexicalTokenizer != nil {
+			lexicalOpts = append(lexicalOpts, retrieval.WithTokenizer(opts.lexicalTokenizer))
+		}
+		managerOpts = append(managerOpts, ingest.WithManagerReranker(retrieval.NewLexicalReranker(store, lexicalOpts...)))
 	}
 
 	manager := ingest.NewManager(store, idx, taskRunner, managerOpts...)

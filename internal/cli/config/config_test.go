@@ -499,3 +499,81 @@ func TestImagesConfigRejectsUnknownBackend(t *testing.T) {
 		t.Fatal("expected a validation error for an unknown backend")
 	}
 }
+
+// TestLexicalRerankingResolution covers the two-way decision: the model-free
+// reranker is on unless a workspace explicitly turns it off, in every profile.
+func TestLexicalRerankingResolution(t *testing.T) {
+	const chat = "llm:\n  chat:\n    provider: openai\n    model: m\n"
+
+	for _, tc := range []struct {
+		name     string
+		raw      string
+		expected bool
+	}{
+		{
+			name:     "on by default with no profile",
+			raw:      "version: 1\n",
+			expected: true,
+		},
+		{
+			name:     "on in the fast profile",
+			raw:      "version: 1\nretrieval:\n  profile: fast\n",
+			expected: true,
+		},
+		{
+			name:     "on in the precision profile",
+			raw:      "version: 1\n" + chat + "retrieval:\n  profile: precision\n",
+			expected: true,
+		},
+		{
+			// The distinction a plain bool could not express: opting out of a
+			// default that is on.
+			name:     "explicit false opts out",
+			raw:      "version: 1\nretrieval:\n  profile: fast\n  lexical_reranking: false\n",
+			expected: false,
+		},
+		{
+			// The LLM reranker is the explicitly configured, costlier choice and
+			// the pipeline holds a single slot.
+			name:     "llm reranking wins over the default",
+			raw:      "version: 1\n" + chat + "retrieval:\n  reranking: true\n",
+			expected: false,
+		},
+		// `reranking: true` without a chat client is not covered here: Validate
+		// rejects that configuration outright, so the HasChat guard in
+		// LexicalRerankingEnabled only ever sees a reachable state.
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Parse(tc.raw, noEnv)
+			if err != nil {
+				t.Fatalf("unexpected error: %+v", err)
+			}
+
+			if got := cfg.LexicalRerankingEnabled(); got != tc.expected {
+				t.Errorf("LexicalRerankingEnabled() = %v, want %v", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestLexicalRerankingRejectsBothRerankers(t *testing.T) {
+	raw := "version: 1\nllm:\n  chat:\n    provider: openai\n    model: m\n" +
+		"retrieval:\n  reranking: true\n  lexical_reranking: true\n"
+
+	if _, err := Parse(raw, noEnv); err == nil {
+		t.Fatal("expected a validation error when both rerankers are enabled")
+	}
+}
+
+// The model-free reranker needs no chat client: it must not appear in the
+// "requires llm.chat" validation that gates the LLM-backed stages.
+func TestLexicalRerankingNeedsNoChatClient(t *testing.T) {
+	cfg, err := Parse("version: 1\nretrieval:\n  lexical_reranking: true\n", noEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	if !cfg.LexicalRerankingEnabled() {
+		t.Error("LexicalRerankingEnabled() = false without a chat client, want true")
+	}
+}

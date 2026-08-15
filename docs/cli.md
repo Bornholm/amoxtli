@@ -62,6 +62,37 @@ par-dessus :
 
 `fast` fonctionne sans `llm.chat` ; `balanced` et `precision` l'exigent.
 
+### Reranking sans modèle
+
+`retrieval.lexical_reranking` réordonne les résultats fusionnés à partir de la
+seule requête et du texte déjà récupéré : BM25 dont l'IDF est calculé **sur le
+pool de candidats**, mélangé au score fusionné. Aucun appel chat, aucun token,
+quelques millisecondes.
+
+Il existe parce que la fusion RRF est volontairement aveugle à la magnitude des
+scores : un candidat sorti au rang 1 par la branche vectorielle y pèse autant
+qu'une correspondance lexicale parfaite au rang 1. Rescorer sur le contenu remet
+les deux branches sur une échelle unique.
+
+| Jeu | nDCG@10 sans | avec | Δ |
+|---|---|---|---|
+| BEIR SciFact (EN) | 0,635 | 0,780 | +23 % |
+| PIAF (FR) | 0,733 | 0,777 | +6 % |
+| BEIR nfcorpus (EN, médical) | 0,318 | 0,328 | +3 % |
+
+Aucune régression sur les trois, le gain se concentrant en tête de classement.
+Il est donc **activé par défaut dans tous les profils** : aucune configuration
+n'existe dans laquelle il soit l'option coûteuse. `lexical_reranking: false`
+l'éteint.
+
+Une conséquence à connaître : il réécrit les scores en `1/(1+rang)` et modifie
+donc l'ordre *et* l'échelle des scores retournés. Si vous dépendez des scores
+bruts de la fusion, ou de curseurs de pagination émis avant cette version,
+désactivez-le explicitement.
+
+Mutuellement exclusif avec `reranking` (la variante LLM) : le pipeline n'a qu'un
+emplacement de reranker.
+
 Le grounding (`grounding_check`, ou le profil `precision`) applique son verdict
 selon `retrieval.grounding_mode` : **`demote` (défaut)** garde tous les
 documents mais relègue les non pertinents en fin de liste — il préserve le

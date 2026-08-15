@@ -358,6 +358,9 @@ func retrievalOptions(cfg *config.Config, client llm.Client, stageClients map[st
 
 	if cfg.Retrieval.Reranking {
 		opts = append(opts, amoxtli.WithReranking())
+	} else if cfg.LexicalRerankingEnabled() {
+		// Zero weights select retrieval.DefaultLexicalWeights.
+		opts = append(opts, amoxtli.WithLexicalReranking(retrieval.LexicalWeights{}))
 	}
 
 	if groundingCheck {

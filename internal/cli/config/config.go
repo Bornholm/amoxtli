@@ -330,10 +330,20 @@ type RetrievalConfig struct {
 	// evaluator). Empty keeps the historical default (HyDE + Judge when
 	// llm.chat is configured). Explicit keys below still apply on top of the
 	// profile (they can enable more stages, not disable the profile's).
-	Profile           string `yaml:"profile"`
-	Reranking         bool   `yaml:"reranking"`
-	GroundingCheck    bool   `yaml:"grounding_check"`
-	GroundingFailOpen bool   `yaml:"grounding_fail_open"`
+	Profile   string `yaml:"profile"`
+	Reranking bool   `yaml:"reranking"`
+	// LexicalReranking reorders the fused results with the model-free reranker
+	// (BM25 over the candidate pool, blended with the fused score). It needs no
+	// chat client and costs single-digit milliseconds, and it is on by default
+	// in every profile — see LexicalRerankingEnabled for the measurements.
+	//
+	// A pointer rather than a bool so an unset key stays distinguishable from
+	// an explicit `false`, which is what lets the default be "on" while a
+	// workspace can still opt out.
+	// Mutually exclusive with Reranking: the pipeline holds one reranker.
+	LexicalReranking  *bool `yaml:"lexical_reranking"`
+	GroundingCheck    bool  `yaml:"grounding_check"`
+	GroundingFailOpen bool  `yaml:"grounding_fail_open"`
 	// GroundingMode is how the grounding verdict is applied to the evidence:
 	// "demote" (default) keeps every document but ranks irrelevant ones last —
 	// preserving recall@k while improving ranking; "filter" drops the
@@ -564,6 +574,31 @@ func (c *Config) GroundingEnabled() bool {
 		c.Retrieval.Profile == ProfilePrecision
 }
 
+// LexicalRerankingEnabled reports whether the model-free reranker runs on every
+// search. It is on unless explicitly disabled, in every profile.
+//
+// The measurements behind that default, each on the same index with and without
+// the reranker: +23% nDCG@10 on BEIR SciFact, +6% on French PIAF, +3% on BEIR
+// nfcorpus, and no regression on any metric of any of the three. It needs no
+// chat client, issues no network call and costs single-digit milliseconds, so
+// there is no configuration in which it is the expensive option.
+//
+// The LLM reranker wins when both are on: it is the explicitly configured, more
+// expensive choice, and the pipeline holds a single reranker. Validate rejects
+// that combination anyway; this only decides what happens if it is ever
+// bypassed.
+func (c *Config) LexicalRerankingEnabled() bool {
+	if c.Retrieval.Reranking && c.HasChat() {
+		return false
+	}
+
+	if c.Retrieval.LexicalReranking != nil {
+		return *c.Retrieval.LexicalReranking
+	}
+
+	return true
+}
+
 // HasEmbeddings reports whether an embeddings client is configured.
 func (c *Config) HasEmbeddings() bool {
 	return c.LLM.Embeddings != nil && c.LLM.Embeddings.Model != ""
@@ -709,6 +744,12 @@ func (c *Config) Validate() error {
 
 	if m := c.Retrieval.GroundingMode; m != "" && !strings.EqualFold(m, "demote") && !strings.EqualFold(m, "filter") {
 		return errors.Errorf("retrieval.grounding_mode: unknown mode %q (expected \"demote\" or \"filter\")", m)
+	}
+
+	// The search pipeline holds one reranker slot. Asking for both is a
+	// configuration mistake worth naming, rather than silently honouring one.
+	if c.Retrieval.Reranking && c.Retrieval.LexicalReranking != nil && *c.Retrieval.LexicalReranking {
+		return errors.New("retrieval.reranking and retrieval.lexical_reranking are mutually exclusive, the search pipeline holds a single reranker")
 	}
 
 	if !c.HasChat() {

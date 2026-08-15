@@ -80,6 +80,12 @@ type options struct {
 	decompositionMaxSubQueries int
 	// Reranking reorders fused results with an LLM before pagination.
 	reranking bool
+	// lexicalReranking reorders fused results with the model-free lexical
+	// reranker. Mutually exclusive with reranking: the manager holds a single
+	// reranker slot.
+	lexicalReranking bool
+	lexicalWeights   retrieval.LexicalWeights
+	lexicalTokenizer retrieval.Tokenizer
 	// Indexers composing the search pipeline.
 	indexers []Indexer
 	// Explicit components.
@@ -404,6 +410,37 @@ func WithQueryDecomposition(maxSubQueries int) Option {
 func WithReranking() Option {
 	return func(o *options) {
 		o.reranking = true
+	}
+}
+
+// WithLexicalReranking enables model-free reranking of the fused search results
+// before pagination. It reorders the candidates using only the query and the
+// text already retrieved — BM25 with candidate-pool IDF, query-term coverage,
+// term proximity and exact phrase match — blended with the fused score.
+//
+// Unlike WithReranking it needs no LLM client, issues no network call and costs
+// microseconds rather than a round-trip, which makes it the reranking option
+// that does not dominate search latency. The two are mutually exclusive: the
+// search pipeline holds a single reranker.
+//
+// Passing a zero LexicalWeights selects retrieval.DefaultLexicalWeights.
+func WithLexicalReranking(weights retrieval.LexicalWeights) Option {
+	return func(o *options) {
+		o.lexicalReranking = true
+		o.lexicalWeights = weights
+	}
+}
+
+// WithLexicalRerankTokenizer overrides how the model-free reranker splits text
+// into terms. The default, retrieval.SimpleTokenizer, is right for
+// space-separated scripts; supply a segmenter here for a Chinese or Japanese
+// corpus, where it would otherwise yield one term per sentence.
+//
+// Stemming analyzers were measured on this and rejected — see
+// retrieval.SimpleTokenizer for the numbers.
+func WithLexicalRerankTokenizer(tokenizer retrieval.Tokenizer) Option {
+	return func(o *options) {
+		o.lexicalTokenizer = tokenizer
 	}
 }
 
