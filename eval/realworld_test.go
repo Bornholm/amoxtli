@@ -17,14 +17,18 @@ import (
 	"github.com/bornholm/amoxtli/eval/hfqa"
 	"github.com/bornholm/amoxtli/index"
 	bleveIndex "github.com/bornholm/amoxtli/index/bleve"
+	postgresIndex "github.com/bornholm/amoxtli/index/postgres"
 	sqlitevecIndex "github.com/bornholm/amoxtli/index/sqlitevec"
+	"github.com/bornholm/amoxtli/ingest"
 	gormStore "github.com/bornholm/amoxtli/ingest/gorm"
 	"github.com/bornholm/amoxtli/llmx"
+	"github.com/bornholm/amoxtli/llmx/yzma"
 	"github.com/bornholm/amoxtli/retrieval"
 	"github.com/bornholm/amoxtli/task"
 	"github.com/bornholm/genai/llm"
 	"github.com/bornholm/genai/llm/provider"
 	"github.com/bornholm/genai/llm/provider/openai"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
 	"golang.org/x/time/rate"
@@ -60,6 +64,16 @@ import (
 //	AMOXTLI_EVAL_EMBED_CACHE_DIR=...  (optional persistent on-disk embeddings
 //	                                   cache, keyed by model — re-runs cost zero
 //	                                   remote calls)
+//
+// Or, instead of an HTTP endpoint, run the model in-process through llama.cpp —
+// measured 6.2x faster than Ollama on the same model, which is what turns a
+// two-and-a-half-hour ingestion into a 25-minute one. It takes precedence over
+// AMOXTLI_EVAL_EMBED_BASE_URL when set:
+//
+//	AMOXTLI_EVAL_EMBED_YZMA_MODEL=/path/to/mxbai-embed-large-q8_0.gguf
+//	AMOXTLI_EVAL_EMBED_YZMA_LIB=/path/to/llama.cpp/libs   (use the Vulkan build)
+//	AMOXTLI_EVAL_EMBED_YZMA_BATCH=8                       (inputs per batch)
+//	AMOXTLI_EVAL_EMBED_YZMA_GPU_LAYERS=999                (0 for CPU only)
 func TestEvaluateRealWorld(t *testing.T) {
 	if os.Getenv("AMOXTLI_EVAL") == "" {
 		t.Skip("set AMOXTLI_EVAL=1 to run the real-world evaluation benchmark")
@@ -154,34 +168,50 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 	bleveWeight := envFloat(t, "AMOXTLI_EVAL_BLEVE_WEIGHT", 0.5)
 	vectorWeight := envFloat(t, "AMOXTLI_EVAL_VECTOR_WEIGHT", 0.5)
 
-	bleveIdx, err := bleveIndex.OpenOrCreate(ctx, filepath.Join(dir, "index.bleve"))
-	if err != nil {
-		t.Fatalf("open bleve: %+v", errors.WithStack(err))
-	}
-	defer bleveIdx.Close()
+	var (
+		store    ingest.Store
+		indexers []amoxtli.Indexer
+		mode     string
+	)
 
-	store, err := gormStore.NewSQLiteStore(filepath.Join(dir, "data.sqlite"))
-	if err != nil {
-		t.Fatalf("open store: %+v", errors.WithStack(err))
-	}
-	defer store.Close()
-
-	indexers := []amoxtli.Indexer{{ID: "bleve", Index: bleveIdx, Weight: bleveWeight}}
-	mode := "lexical (bleve)"
-
-	if client, embedModel := embeddingsClient(t); client != nil {
-		vecDB, err := sqlite3.Open(filepath.Join(dir, "vectors.sqlite"))
+	// AMOXTLI_EVAL_POSTGRES_DSN swaps both the store and the index for their
+	// PostgreSQL counterparts: the gorm postgres store, and the single hybrid
+	// index doing its own full-text/pgvector fusion. It is a different retrieval
+	// engine, not a different storage location — which is why it deserves its own
+	// measurement rather than an extrapolation from the local one.
+	if dsn := os.Getenv("AMOXTLI_EVAL_POSTGRES_DSN"); dsn != "" {
+		store, indexers, mode = postgresBackend(t, ctx, dsn)
+	} else {
+		bleveIdx, err := bleveIndex.OpenOrCreate(ctx, filepath.Join(dir, "index.bleve"))
 		if err != nil {
-			t.Fatalf("open sqlite-vec: %+v", errors.WithStack(err))
+			t.Fatalf("open bleve: %+v", errors.WithStack(err))
 		}
-		defer vecDB.Close()
-		vecIdx := sqlitevecIndex.NewIndex(vecDB, client,
-			sqlitevecIndex.WithEmbeddingsModel(embedModel),
-			sqlitevecIndex.WithVectorSize(envInt(t, "AMOXTLI_EVAL_EMBED_DIM", 768)),
-			sqlitevecIndex.WithMaxWords(envInt(t, "AMOXTLI_EVAL_EMBED_MAX_WORDS", 500)),
-		)
-		indexers = append(indexers, amoxtli.Indexer{ID: "vector", Index: vecIdx, Weight: vectorWeight})
-		mode = fmt.Sprintf("hybrid (bleve %.2f / vector %.2f)", bleveWeight, vectorWeight)
+		defer bleveIdx.Close()
+
+		sqliteStore, err := gormStore.NewSQLiteStore(filepath.Join(dir, "data.sqlite"))
+		if err != nil {
+			t.Fatalf("open store: %+v", errors.WithStack(err))
+		}
+		defer sqliteStore.Close()
+		store = sqliteStore
+
+		indexers = []amoxtli.Indexer{{ID: "bleve", Index: bleveIdx, Weight: bleveWeight}}
+		mode = "lexical (bleve)"
+
+		if client, embedModel := embeddingsClient(t); client != nil {
+			vecDB, err := sqlite3.Open(filepath.Join(dir, "vectors.sqlite"))
+			if err != nil {
+				t.Fatalf("open sqlite-vec: %+v", errors.WithStack(err))
+			}
+			defer vecDB.Close()
+			vecIdx := sqlitevecIndex.NewIndex(vecDB, client,
+				sqlitevecIndex.WithEmbeddingsModel(embedModel),
+				sqlitevecIndex.WithVectorSize(envInt(t, "AMOXTLI_EVAL_EMBED_DIM", 768)),
+				sqlitevecIndex.WithMaxWords(envInt(t, "AMOXTLI_EVAL_EMBED_MAX_WORDS", 500)),
+			)
+			indexers = append(indexers, amoxtli.Indexer{ID: "vector", Index: vecIdx, Weight: vectorWeight})
+			mode = fmt.Sprintf("hybrid (bleve %.2f / vector %.2f)", bleveWeight, vectorWeight)
+		}
 	}
 
 	// Feature toggles. Iterative mode drives codex.SearchIterative through the
@@ -190,6 +220,10 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 	// feature needs a chat client (AMOXTLI_EVAL_CHAT_*).
 	iterative := os.Getenv("AMOXTLI_EVAL_ITERATIVE") != ""
 	rerank := os.Getenv("AMOXTLI_EVAL_RERANK") != ""
+	// The model-free reranker. It needs no chat client, so it is the one
+	// reranking configuration that can be measured against a lexical-only run.
+	// Mutually exclusive with AMOXTLI_EVAL_RERANK.
+	lexicalRerank := os.Getenv("AMOXTLI_EVAL_LEXICAL_RERANK") != ""
 	hyde := iterative || os.Getenv("AMOXTLI_EVAL_HYDE") != ""
 	// grounding (non-iterative) applies the fused evidence evaluator as a
 	// relevance filter on a plain codex.Search — this is exactly the CLI
@@ -240,6 +274,15 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 			amoxtli.WithMaxTotalWords(envInt(t, "AMOXTLI_EVAL_RERANK_MAX_WORDS", 3000)),
 		)
 		mode += " + rerank"
+	}
+	if lexicalRerank {
+		if rerank {
+			t.Fatal("AMOXTLI_EVAL_RERANK and AMOXTLI_EVAL_LEXICAL_RERANK are mutually exclusive")
+		}
+		weights := lexicalWeightsFromEnv(t)
+		codexOpts = append(codexOpts, amoxtli.WithLexicalReranking(weights))
+		mode += fmt.Sprintf(" + lexrerank(p%.2f/b%.2f/c%.2f/x%.2f/f%.2f)",
+			weights.Prior, weights.BM25, weights.Coverage, weights.Proximity, weights.Phrase)
 	}
 	if iterative {
 		rounds := envInt(t, "AMOXTLI_EVAL_ITERATIVE_ROUNDS", 2)
@@ -444,6 +487,13 @@ func passageContent(doc eval.Document) string {
 func embeddingsClient(t *testing.T) (llm.Client, string) {
 	t.Helper()
 
+	// In-process llama.cpp takes precedence over any HTTP endpoint: it is the
+	// same model without the per-request round-trip, and it batches, which is
+	// where most of the measured 6.2x over Ollama comes from.
+	if client, model := yzmaEmbeddingsClient(t); client != nil {
+		return client, model
+	}
+
 	baseURL := os.Getenv("AMOXTLI_EVAL_EMBED_BASE_URL")
 	model := os.Getenv("AMOXTLI_EVAL_EMBED_MODEL")
 	if baseURL == "" || model == "" {
@@ -465,6 +515,123 @@ func embeddingsClient(t *testing.T) (llm.Client, string) {
 	// Observe inside the cache: only actual remote fetches (cache misses) are
 	// counted as LLM calls in the cost report.
 	return withEmbeddingsCache(t, llmx.NewObservableClient(withRetry(t, client)), model), model
+}
+
+// postgresBackend opens the gorm PostgreSQL store and the hybrid PostgreSQL
+// index against the same database, replacing bleve + sqlite-vec entirely.
+//
+// Unlike the local backend, the two legs live inside one index that fuses them
+// itself, so there is a single indexer and no RRF weight to tune here.
+//
+// The pool and the store are closed through t.Cleanup rather than a defer in the
+// caller, since they outlive the branch that creates them.
+func postgresBackend(t *testing.T, ctx context.Context, dsn string) (ingest.Store, []amoxtli.Indexer, string) {
+	t.Helper()
+
+	store, err := gormStore.NewPostgresStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open postgres store: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open postgres index pool: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(pool.Close)
+
+	client, embedModel := embeddingsClient(t)
+
+	pgOpts := []postgresIndex.OptionFunc{}
+	mode := "postgres (full-text only)"
+	if client != nil {
+		pgOpts = append(pgOpts,
+			postgresIndex.WithEmbeddingsModel(embedModel),
+			postgresIndex.WithVectorSize(envInt(t, "AMOXTLI_EVAL_EMBED_DIM", 768)),
+			postgresIndex.WithMaxWords(envInt(t, "AMOXTLI_EVAL_EMBED_MAX_WORDS", 500)),
+		)
+		mode = "postgres (hybrid full-text + pgvector)"
+	}
+	if cfg := os.Getenv("AMOXTLI_EVAL_POSTGRES_TEXT_SEARCH_CONFIG"); cfg != "" {
+		pgOpts = append(pgOpts, postgresIndex.WithTextSearchConfig(cfg))
+	}
+	// ts_rank normalization bit mask. Query-side only, so sweeping it needs no
+	// reindex.
+	if norm := envInt(t, "AMOXTLI_EVAL_POSTGRES_RANK_NORM", 0); norm > 0 {
+		pgOpts = append(pgOpts, postgresIndex.WithRankNormalization(norm))
+		mode += fmt.Sprintf(" + rank_norm(%d)", norm)
+	}
+	// Whether the tsvector unions the language config with 'simple'. This one
+	// decides what gets *stored*, so switching it requires a fresh index.
+	if os.Getenv("AMOXTLI_EVAL_POSTGRES_NO_SIMPLE_UNION") != "" {
+		pgOpts = append(pgOpts, postgresIndex.WithSimpleConfigUnion(false))
+		mode += " + no_simple_union"
+	}
+
+	return store, []amoxtli.Indexer{{
+		ID:     "postgres",
+		Index:  postgresIndex.NewIndex(pool, client, pgOpts...),
+		Weight: 1.0,
+	}}, mode
+}
+
+// yzmaEmbeddingsClient builds the in-process llama.cpp embeddings client when a
+// GGUF model is configured, or returns (nil, "") to fall through to the HTTP
+// endpoint:
+//
+//	AMOXTLI_EVAL_EMBED_YZMA_MODEL=/path/to/mxbai-embed-large-q8_0.gguf
+//	AMOXTLI_EVAL_EMBED_YZMA_LIB=/path/to/llama.cpp/libs   (Vulkan build)
+//	AMOXTLI_EVAL_EMBED_YZMA_BATCH=8                       (inputs per batch)
+//	AMOXTLI_EVAL_EMBED_YZMA_GPU_LAYERS=999                (0 for CPU only)
+//	AMOXTLI_EVAL_EMBED_YZMA_MAX_TOKENS=512                (encoder window)
+//
+// AMOXTLI_EVAL_EMBED_MODEL still names the model for the cache key and the
+// report; it defaults to the GGUF's file name.
+func yzmaEmbeddingsClient(t *testing.T) (llm.Client, string) {
+	t.Helper()
+
+	modelPath := os.Getenv("AMOXTLI_EVAL_EMBED_YZMA_MODEL")
+	if modelPath == "" {
+		return nil, ""
+	}
+
+	// Deliberately not derived from AMOXTLI_EVAL_EMBED_MAX_WORDS: that one caps
+	// the chunker in *words*, this one caps the encoder in *tokens*, and the
+	// ratio is around 1.4 on prose. Feeding the word budget in as a token budget
+	// would silently truncate most chunks.
+	client, err := yzma.New(modelPath,
+		yzma.WithLibraryPath(os.Getenv("AMOXTLI_EVAL_EMBED_YZMA_LIB")),
+		yzma.WithMaxSequences(envInt(t, "AMOXTLI_EVAL_EMBED_YZMA_BATCH", yzma.DefaultMaxSequences)),
+		yzma.WithMaxSequenceTokens(envInt(t, "AMOXTLI_EVAL_EMBED_YZMA_MAX_TOKENS", yzma.DefaultMaxSequenceTokens)),
+		yzma.WithGPULayers(envInt(t, "AMOXTLI_EVAL_EMBED_YZMA_GPU_LAYERS", yzma.DefaultGPULayers)),
+		yzma.WithThreads(envInt(t, "AMOXTLI_EVAL_EMBED_YZMA_THREADS", 0)),
+	)
+	if err != nil {
+		t.Fatalf("create yzma embeddings client: %+v", errors.WithStack(err))
+	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("closing yzma client: %+v", err)
+		}
+	})
+
+	model := os.Getenv("AMOXTLI_EVAL_EMBED_MODEL")
+	if model == "" {
+		model = filepath.Base(modelPath)
+	}
+
+	// A vector index created with the wrong dimension fails at insert time, deep
+	// into ingestion; saying it here costs nothing and points straight at the
+	// misconfigured variable.
+	if dim := envInt(t, "AMOXTLI_EVAL_EMBED_DIM", 0); dim > 0 && dim != client.Dimensions() {
+		t.Fatalf("AMOXTLI_EVAL_EMBED_DIM=%d but %s produces %d dimensions", dim, model, client.Dimensions())
+	}
+
+	t.Logf("embeddings: in-process llama.cpp (yzma), model %s, %d dimensions", model, client.Dimensions())
+
+	// No retry wrapper: an in-process call has no transient failure to retry,
+	// and no rate limit to respect. The cache still earns its place across runs.
+	return withEmbeddingsCache(t, llmx.NewObservableClient(client), model), model
 }
 
 // withEmbeddingsCache wraps client with a persistent on-disk embeddings cache
@@ -598,6 +765,21 @@ func chatClient(t *testing.T) llm.Client {
 	// grounding evaluator and the reranker — otherwise the evaluation cost
 	// report only accounts for embeddings.
 	return llmx.NewObservableClient(withRetry(t, client))
+}
+
+// lexicalWeightsFromEnv reads the model-free reranker's signal weights, so a
+// sweep can be driven from the command line without rebuilding. Each defaults
+// to its value in retrieval.DefaultLexicalWeights.
+func lexicalWeightsFromEnv(t *testing.T) retrieval.LexicalWeights {
+	t.Helper()
+	def := retrieval.DefaultLexicalWeights
+	return retrieval.LexicalWeights{
+		Prior:     envFloat(t, "AMOXTLI_EVAL_LEXRERANK_PRIOR", def.Prior),
+		BM25:      envFloat(t, "AMOXTLI_EVAL_LEXRERANK_BM25", def.BM25),
+		Coverage:  envFloat(t, "AMOXTLI_EVAL_LEXRERANK_COVERAGE", def.Coverage),
+		Proximity: envFloat(t, "AMOXTLI_EVAL_LEXRERANK_PROXIMITY", def.Proximity),
+		Phrase:    envFloat(t, "AMOXTLI_EVAL_LEXRERANK_PHRASE", def.Phrase),
+	}
 }
 
 func envFloat(t *testing.T, name string, def float64) float64 {
