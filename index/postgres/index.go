@@ -30,13 +30,19 @@ import (
 )
 
 type Index struct {
-	getPool        func(ctx context.Context) (*pgxpool.Pool, error)
-	llm            llm.Client
-	model          string
-	maxWords       int
-	vectorSize     int
-	defaultConfig  string
-	efSearchFactor int
+	getPool       func(ctx context.Context) (*pgxpool.Pool, error)
+	llm           llm.Client
+	model         string
+	maxWords      int
+	vectorSize    int
+	defaultConfig string
+	// rankNormalization is the ts_rank normalization bit mask, and simpleUnion
+	// whether the tsvector unions the language config with 'simple'. Both are
+	// ranking knobs; simpleUnion additionally decides what gets stored, so it
+	// must not be changed without a reindex.
+	rankNormalization int
+	simpleUnion       bool
+	efSearchFactor    int
 }
 
 const (
@@ -71,7 +77,45 @@ type Options struct {
 	// lowering it to 1 keeps the heap at the strict minimum. Defaults to
 	// DefaultEFSearchFactor.
 	EFSearchFactor int
+	// RankNormalization is the third argument of ts_rank, a bit mask deciding
+	// how the score accounts for document length. PostgreSQL's default of 0
+	// means *no* length normalization at all: a long chunk accumulates matches
+	// and outranks a short, precise one, where BM25 would have divided by
+	// length. See RankNormalization* for the flags.
+	RankNormalization int
+	// SimpleConfigUnion keeps the historical tsvector construction, which
+	// unions the detected language's tsvector with the 'simple' one, both when
+	// indexing and when querying:
+	//
+	//	to_tsvector('english', …) || to_tsvector('simple', …)
+	//
+	// It buys recall — an unstemmed query term still matches — at a ranking
+	// cost that is easy to miss: a word whose stem equals its surface form
+	// contributes one lexeme, a word with irregular morphology contributes two,
+	// so ts_rank silently weighs irregular words double. Defaults to true, the
+	// behaviour every existing index was built with.
+	SimpleConfigUnion bool
 }
+
+// ts_rank normalization flags, as documented by PostgreSQL. They are a bit
+// mask: combine with |.
+const (
+	// RankNormalizationNone is PostgreSQL's default: the score ignores document
+	// length entirely.
+	RankNormalizationNone = 0
+	// RankNormalizationLogLength divides the rank by 1 + the logarithm of the
+	// document length. The gentlest length correction, and the closest in
+	// spirit to BM25's b parameter.
+	RankNormalizationLogLength = 1
+	// RankNormalizationLength divides the rank by the document length.
+	RankNormalizationLength = 2
+	// RankNormalizationUniqueWords divides the rank by the number of unique
+	// words in the document.
+	RankNormalizationUniqueWords = 8
+	// RankNormalizationScale maps the rank into [0,1) as rank/(rank+1). It does
+	// not correct for length on its own, but makes scores comparable.
+	RankNormalizationScale = 32
+)
 
 type OptionFunc func(opts *Options)
 
@@ -109,12 +153,37 @@ func WithEFSearchFactor(factor int) OptionFunc {
 	}
 }
 
+// WithRankNormalization sets the ts_rank normalization bit mask (see
+// Options.RankNormalization). Negative values are ignored.
+func WithRankNormalization(flags int) OptionFunc {
+	return func(opts *Options) {
+		if flags >= 0 {
+			opts.RankNormalization = flags
+		}
+	}
+}
+
+// WithSimpleConfigUnion controls whether the tsvector unions the detected
+// language's lexemes with the 'simple' ones (see Options.SimpleConfigUnion).
+//
+// It must match between indexing and querying: turning it off only at query
+// time searches for stemmed lexemes in an index that also stores unstemmed
+// ones, which changes the ranking without changing what was stored. Switching
+// it therefore requires a reindex.
+func WithSimpleConfigUnion(union bool) OptionFunc {
+	return func(opts *Options) {
+		opts.SimpleConfigUnion = union
+	}
+}
+
 func NewOptions(funcs ...OptionFunc) *Options {
 	opts := &Options{
-		VectorSize:       DefaultVectorSize,
-		MaxWords:         2000,
-		TextSearchConfig: "simple",
-		EFSearchFactor:   DefaultEFSearchFactor,
+		VectorSize:        DefaultVectorSize,
+		MaxWords:          2000,
+		TextSearchConfig:  "simple",
+		EFSearchFactor:    DefaultEFSearchFactor,
+		RankNormalization: RankNormalizationNone,
+		SimpleConfigUnion: true,
 	}
 	for _, fn := range funcs {
 		fn(opts)
@@ -128,13 +197,15 @@ func NewOptions(funcs ...OptionFunc) *Options {
 func NewIndex(pool *pgxpool.Pool, client llm.Client, funcs ...OptionFunc) *Index {
 	opts := NewOptions(funcs...)
 	return &Index{
-		getPool:        createGetPool(pool, migrations(opts.VectorSize)),
-		llm:            client,
-		model:          opts.EmbeddingsModel,
-		maxWords:       opts.MaxWords,
-		vectorSize:     opts.VectorSize,
-		defaultConfig:  opts.TextSearchConfig,
-		efSearchFactor: opts.EFSearchFactor,
+		getPool:           createGetPool(pool, migrations(opts.VectorSize)),
+		llm:               client,
+		model:             opts.EmbeddingsModel,
+		maxWords:          opts.MaxWords,
+		vectorSize:        opts.VectorSize,
+		defaultConfig:     opts.TextSearchConfig,
+		efSearchFactor:    opts.EFSearchFactor,
+		rankNormalization: opts.RankNormalization,
+		simpleUnion:       opts.SimpleConfigUnion,
 	}
 }
 
@@ -296,7 +367,7 @@ func (i *Index) insertChunk(ctx context.Context, tx pgx.Tx, item *indexableChunk
 	err := tx.QueryRow(ctx, `
 		INSERT INTO amoxtli_chunks (source, section_id, chunk_index, content, lang, tsv, embedding)
 		VALUES ($1, $2, $3, $4, $5,
-			to_tsvector($5::text::regconfig, unaccent($4)) || to_tsvector('simple', unaccent($4)),
+			`+i.tsvectorExpr("$5::text::regconfig", "$4")+`,
 			$6::vector)
 		RETURNING id;
 	`,
@@ -564,6 +635,29 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 	return searchResults, nil
 }
 
+// tsvectorExpr builds the SQL producing a chunk's (or a query's) tsvector.
+// Indexing and querying must use the same expression, or the query would look
+// for lexemes the index never stored.
+func (i *Index) tsvectorExpr(configExpr, textExpr string) string {
+	lang := "to_tsvector(" + configExpr + ", unaccent(" + textExpr + "))"
+	if !i.simpleUnion {
+		return lang
+	}
+
+	return lang + " || to_tsvector('simple', unaccent(" + textExpr + "))"
+}
+
+// rankExpr builds the ts_rank call ordering the full-text leg. The
+// normalization argument is omitted when zero so that an index configured with
+// the defaults emits exactly the SQL it always did.
+func (i *Index) rankExpr(tsvExpr, queryExpr string) string {
+	if i.rankNormalization == RankNormalizationNone {
+		return "ts_rank(" + tsvExpr + ", " + queryExpr + ")"
+	}
+
+	return fmt.Sprintf("ts_rank(%s, %s, %d)", tsvExpr, queryExpr, i.rankNormalization)
+}
+
 // ftsSearch runs the full-text leg. The query is normalized (unaccent +
 // stemming for the detected language and the 'simple' config) then rewritten
 // as a disjunction of lexemes, mirroring the OR semantics of a bleve match
@@ -581,7 +675,7 @@ func (i *Index) ftsSearch(ctx context.Context, pool *pgxpool.Pool, query string,
 			FROM (
 				SELECT '''' || replace(lexeme, '''', '''''') || '''' AS quoted
 				FROM unnest(tsvector_to_array(
-					to_tsvector(` + configParam + `::regconfig, unaccent(` + queryParam + `)) || to_tsvector('simple', unaccent(` + queryParam + `))
+					` + i.tsvectorExpr(configParam+"::regconfig", queryParam) + `
 				)) AS lexeme
 			) lexemes
 		)
@@ -612,7 +706,7 @@ func (i *Index) ftsSearch(ctx context.Context, pool *pgxpool.Pool, query string,
 		sql += ` AND (` + clause + `)`
 	}
 
-	sql += fmt.Sprintf(` ORDER BY ts_rank(c.tsv, q.query) DESC LIMIT %d`, limit)
+	sql += fmt.Sprintf(` ORDER BY %s DESC LIMIT %d`, i.rankExpr("c.tsv", "q.query"), limit)
 
 	return queryChunkHits(ctx, pool, sql, a.values...)
 }
