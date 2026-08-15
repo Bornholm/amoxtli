@@ -169,10 +169,13 @@ func (i *Index) restoreRecords(ctx context.Context, records ...*SnapshottedRecor
 
 	for _, record := range records {
 		var chunkID int64
+		// Same tsvector expression as insertChunk: a snapshot restored with a
+		// different construction would index lexemes the searches never look
+		// for.
 		err := tx.QueryRow(ctx, `
 			INSERT INTO amoxtli_chunks (source, section_id, chunk_index, content, lang, tsv, embedding)
 			VALUES ($1, $2, $3, $4, $5,
-				to_tsvector($5::text::regconfig, unaccent($4)) || to_tsvector('simple', unaccent($4)),
+				`+i.tsvectorExpr("$5::text::regconfig", "$4")+`,
 				NULLIF($6, '')::vector)
 			RETURNING id;
 		`, record.Source, record.SectionID, record.ChunkIndex, record.Content, record.Lang, record.Embedding).Scan(&chunkID)
