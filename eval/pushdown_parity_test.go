@@ -60,6 +60,10 @@ func (c *topicClient) ChatCompletionStream(context.Context, ...llm.ChatCompletio
 	return nil, errors.New("not implemented")
 }
 
+func (c *topicClient) Transcription(context.Context, []byte, ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 type topicEmbeddingsResponse struct{ vectors [][]float64 }
 
 func (r topicEmbeddingsResponse) Embeddings() [][]float64    { return r.vectors }

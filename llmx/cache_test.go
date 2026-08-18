@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bornholm/genai/llm"
+	"github.com/pkg/errors"
 )
 
 func TestCachingClientServesHitsWithoutInnerCalls(t *testing.T) {
@@ -172,6 +173,10 @@ func (e *embedderStub) ChatCompletionStream(ctx context.Context, funcs ...llm.Ch
 	ch := make(chan llm.StreamChunk)
 	close(ch)
 	return ch, nil
+}
+
+func (e *embedderStub) Transcription(context.Context, []byte, ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return nil, errors.New("not implemented")
 }
 
 type stubEmbeddingsResponse struct{ vecs [][]float64 }

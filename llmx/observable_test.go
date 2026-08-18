@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bornholm/genai/llm"
+	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -31,6 +32,10 @@ func (s *stubClient) ChatCompletionStream(_ context.Context, _ ...llm.ChatComple
 	ch := make(chan llm.StreamChunk)
 	close(ch)
 	return ch, s.err
+}
+
+func (s *stubClient) Transcription(context.Context, []byte, ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return nil, errors.New("not implemented")
 }
 
 func (s *stubClient) Embeddings(_ context.Context, inputs []string, _ ...llm.EmbeddingsOptionFunc) (llm.EmbeddingsResponse, error) {

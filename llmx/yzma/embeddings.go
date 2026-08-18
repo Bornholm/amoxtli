@@ -314,6 +314,11 @@ func (c *Client) ChatCompletionStream(ctx context.Context, funcs ...llm.ChatComp
 	return nil, errors.New("yzma: this client only provides embeddings, not chat completion")
 }
 
+// Transcription implements [llm.TranscriptionClient].
+func (c *Client) Transcription(ctx context.Context, audio []byte, funcs ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return nil, errors.New("yzma: this client only provides embeddings, not transcription")
+}
+
 var _ llm.Client = &Client{}
 
 // packBatches groups input indexes into batches that respect both the token

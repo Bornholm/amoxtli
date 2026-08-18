@@ -189,6 +189,13 @@ func (c *RetryClient) ChatCompletionStream(ctx context.Context, funcs ...llm.Cha
 	return ch, err
 }
 
+// Transcription implements llm.TranscriptionClient by delegation, without
+// retries (not exercised by amoxtli; it exists only so RetryClient keeps
+// satisfying llm.Client, whose surface is broader than what amoxtli uses).
+func (c *RetryClient) Transcription(ctx context.Context, audio []byte, funcs ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return c.inner.Transcription(ctx, audio, funcs...)
+}
+
 // Embeddings implements llm.EmbeddingsClient with retries.
 func (c *RetryClient) Embeddings(ctx context.Context, inputs []string, funcs ...llm.EmbeddingsOptionFunc) (llm.EmbeddingsResponse, error) {
 	var res llm.EmbeddingsResponse

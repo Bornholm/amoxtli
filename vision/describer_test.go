@@ -288,6 +288,10 @@ func (c *stubClient) ChatCompletionStream(ctx context.Context, funcs ...llm.Chat
 	return nil, errors.New("not implemented")
 }
 
+func (c *stubClient) Transcription(context.Context, []byte, ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (c *stubClient) Embeddings(ctx context.Context, inputs []string, funcs ...llm.EmbeddingsOptionFunc) (llm.EmbeddingsResponse, error) {
 	return nil, errors.New("not implemented")
 }

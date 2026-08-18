@@ -216,6 +216,10 @@ func (m *mockClient) ChatCompletionStream(ctx context.Context, funcs ...llm.Chat
 	return ch, nil
 }
 
+func (m *mockClient) Transcription(context.Context, []byte, ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 type mockEmbeddings struct{}
 
 func (mockEmbeddings) Embeddings() [][]float64    { return [][]float64{{1}} }

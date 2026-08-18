@@ -150,6 +150,10 @@ func (f failingLLM) ChatCompletionStream(ctx context.Context, funcs ...llm.ChatC
 	return nil, f.err
 }
 
+func (f failingLLM) Transcription(context.Context, []byte, ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (f failingLLM) Embeddings(ctx context.Context, inputs []string, funcs ...llm.EmbeddingsOptionFunc) (llm.EmbeddingsResponse, error) {
 	return nil, f.err
 }
@@ -257,6 +261,10 @@ func (irrelevantLLM) ChatCompletion(ctx context.Context, funcs ...llm.ChatComple
 }
 
 func (irrelevantLLM) ChatCompletionStream(ctx context.Context, funcs ...llm.ChatCompletionOptionFunc) (<-chan llm.StreamChunk, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (irrelevantLLM) Transcription(context.Context, []byte, ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
 	return nil, errors.New("not implemented")
 }
 

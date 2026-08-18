@@ -60,6 +60,10 @@ func (c *keywordClient) ChatCompletionStream(ctx context.Context, funcs ...llm.C
 	return nil, errors.New("not implemented")
 }
 
+func (c *keywordClient) Transcription(context.Context, []byte, ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 type keywordEmbeddingsResponse struct{ vectors [][]float64 }
 
 func (r keywordEmbeddingsResponse) Embeddings() [][]float64    { return r.vectors }

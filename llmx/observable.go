@@ -53,6 +53,13 @@ func (c *ObservableClient) ChatCompletionStream(ctx context.Context, funcs ...ll
 	return ch, err
 }
 
+// Transcription implements llm.TranscriptionClient. Not instrumented (no
+// amoxtli code path exercises it; it exists only so ObservableClient keeps
+// satisfying llm.Client, whose surface is broader than what amoxtli uses).
+func (c *ObservableClient) Transcription(ctx context.Context, audio []byte, funcs ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return c.inner.Transcription(ctx, audio, funcs...)
+}
+
 // Embeddings implements llm.EmbeddingsClient with instrumentation.
 func (c *ObservableClient) Embeddings(ctx context.Context, inputs []string, funcs ...llm.EmbeddingsOptionFunc) (llm.EmbeddingsResponse, error) {
 	ctx, end := c.startCall(ctx, "embeddings")

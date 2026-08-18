@@ -269,6 +269,13 @@ func (c *CachingClient) ChatCompletionStream(ctx context.Context, funcs ...llm.C
 	return c.inner.ChatCompletionStream(ctx, funcs...)
 }
 
+// Transcription implements llm.TranscriptionClient by delegation, uncached
+// (not exercised by amoxtli; it exists only so CachingClient keeps
+// satisfying llm.Client, whose surface is broader than what amoxtli uses).
+func (c *CachingClient) Transcription(ctx context.Context, audio []byte, funcs ...llm.TranscriptionOptionFunc) (llm.TranscriptionResponse, error) {
+	return c.inner.Transcription(ctx, audio, funcs...)
+}
+
 // Embeddings implements llm.EmbeddingsClient: served from the cache when every
 // input is known, otherwise the misses are fetched from the wrapped client in a
 // single batch and stored before assembling the response in input order.
