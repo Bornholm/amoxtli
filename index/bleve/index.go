@@ -15,6 +15,11 @@ import (
 
 type Index struct {
 	index bleve.Index
+	// recreated reports that OpenOrCreate rebuilt the index from scratch —
+	// because it did not exist, or because the mapping changed. A recreated
+	// index is empty: whoever owns the corpus must reindex it, and without
+	// this signal the loss is silent — searches simply return nothing.
+	recreated bool
 }
 
 // DeleteByID implements index.Index.
@@ -295,6 +300,12 @@ func NewIndex(index bleve.Index) *Index {
 	return &Index{
 		index: index,
 	}
+}
+
+// Recreated reports whether OpenOrCreate rebuilt this index empty. Callers
+// should trigger a reindex of their corpus when it returns true.
+func (i *Index) Recreated() bool {
+	return i.recreated
 }
 
 var _ index.Index = &Index{}

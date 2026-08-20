@@ -33,7 +33,10 @@ func OpenOrCreate(ctx context.Context, indexPath string) (*Index, error) {
 		return nil, errors.WithStack(err)
 	}
 
-	var bleveIdx bleve.Index
+	var (
+		bleveIdx  bleve.Index
+		recreated bool
+	)
 
 	if stat == nil {
 		m := IndexMapping()
@@ -42,6 +45,7 @@ func OpenOrCreate(ctx context.Context, indexPath string) (*Index, error) {
 		if err != nil {
 			return nil, errors.Wrap(err, "could not create bleve index")
 		}
+		recreated = true
 
 		hash, err := mappingHash(m)
 		if err != nil {
@@ -79,13 +83,16 @@ func OpenOrCreate(ctx context.Context, indexPath string) (*Index, error) {
 					if err != nil {
 						return nil, errors.Wrap(err, "could not create new bleve index")
 					}
+					recreated = true
 				}
 
 				if err := os.WriteFile(hashFile, []byte(currentHash), 0600); err != nil {
 					slog.WarnContext(ctx, "could not store mapping hash", slog.Any("error", err))
 				}
 
-				return NewIndex(bleveIdx), nil
+				idx := NewIndex(bleveIdx)
+				idx.recreated = recreated
+				return idx, nil
 			}
 		}
 
@@ -95,5 +102,8 @@ func OpenOrCreate(ctx context.Context, indexPath string) (*Index, error) {
 		}
 	}
 
-	return NewIndex(bleveIdx), nil
+	idx := NewIndex(bleveIdx)
+	idx.recreated = recreated
+
+	return idx, nil
 }
