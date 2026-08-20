@@ -16,7 +16,7 @@ import (
 // The caller does not need any extra replace directive; the PostgreSQL driver
 // is pulled through this subpackage only. Wire the resulting store into the
 // facade with amoxtli.WithStore.
-func NewPostgresStore(ctx context.Context, dsn string) (*Store, error) {
+func NewPostgresStore(ctx context.Context, dsn string, funcs ...StoreOptionFunc) (*Store, error) {
 	db, err := gorm.Open(gormpostgres.Open(dsn), &gorm.Config{
 		Logger: newLogger(),
 	})
@@ -33,5 +33,5 @@ func NewPostgresStore(ctx context.Context, dsn string) (*Store, error) {
 		return nil, errors.Wrap(err, "could not reach postgres database")
 	}
 
-	return NewStore(db), nil
+	return NewStore(db, funcs...), nil
 }

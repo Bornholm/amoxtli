@@ -16,7 +16,7 @@ import (
 //
 // Wire the resulting store into the facade with amoxtli.WithStore; the caller
 // owns the store and must Close it.
-func NewSQLiteStore(dsn string) (*Store, error) {
+func NewSQLiteStore(dsn string, funcs ...StoreOptionFunc) (*Store, error) {
 	db, err := gorm.Open(gormlite.Open(dsn), &gorm.Config{
 		Logger: newLogger(),
 	})
@@ -41,5 +41,5 @@ func NewSQLiteStore(dsn string) (*Store, error) {
 		return nil, errors.WithStack(err)
 	}
 
-	return NewStore(db), nil
+	return NewStore(db, funcs...), nil
 }

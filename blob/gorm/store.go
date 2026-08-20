@@ -8,6 +8,7 @@ import (
 	"context"
 
 	"github.com/bornholm/amoxtli/blob"
+	"github.com/bornholm/amoxtli/crypto"
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -35,10 +36,31 @@ type Store struct {
 	db          *gorm.DB
 	maxBytes    int64
 	getDatabase func(ctx context.Context) (*gorm.DB, error)
+	// cipher, when set, seals blob bytes at rest. The hash keys stay those
+	// of the clear content: they are identifiers, deduplication relies on
+	// them, and revealing that two documents share an image is part of the
+	// accepted envelope.
+	cipher *crypto.Cipher
 }
 
 // Option configures a Store.
 type Option func(*Store)
+
+// WithEncryptionKey seals blob bytes at rest with a key of at least 32
+// bytes. Use the same key as the ingest store: the images belong to the
+// same corpus as the documents that reference them.
+func WithEncryptionKey(key string) Option {
+	return func(s *Store) {
+		cipher, err := crypto.NewCipher(key)
+		if err != nil {
+			s.getDatabase = func(ctx context.Context) (*gorm.DB, error) {
+				return nil, errors.WithStack(err)
+			}
+			return
+		}
+		s.cipher = cipher
+	}
+}
 
 // WithMaxBytes bounds the size of a single blob; <= 0 keeps the default
 // (blob.DefaultMaxBytes).
@@ -84,11 +106,21 @@ func (s *Store) Put(ctx context.Context, mimeType string, data []byte) (blob.Has
 		return "", errors.WithStack(err)
 	}
 
+	// Size describes the clear content — it is what callers and quotas
+	// reason about — so it is captured before sealing.
 	entry := Blob{
 		Hash:     string(hash),
 		MimeType: mimeType,
 		Size:     int64(len(data)),
 		Data:     data,
+	}
+
+	if s.cipher != nil {
+		sealed, err := s.cipher.Seal(data)
+		if err != nil {
+			return "", errors.WithStack(err)
+		}
+		entry.Data = sealed
 	}
 
 	// The hash *is* the content: an existing row holds the same bytes, so a
@@ -121,7 +153,16 @@ func (s *Store) Get(ctx context.Context, hash blob.Hash) ([]byte, *blob.Info, er
 		return nil, nil, errors.WithStack(err)
 	}
 
-	return entry.Data, &blob.Info{
+	data := entry.Data
+	if s.cipher != nil {
+		clear, err := s.cipher.Open(data)
+		if err != nil {
+			return nil, nil, errors.WithStack(err)
+		}
+		data = clear
+	}
+
+	return data, &blob.Info{
 		Hash:     blob.Hash(entry.Hash),
 		MimeType: entry.MimeType,
 		Size:     entry.Size,

@@ -1,6 +1,7 @@
 package gorm
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -88,4 +89,46 @@ func startPostgresContainer(t *testing.T, ctx context.Context) string {
 	}
 
 	return connectionStr
+}
+
+// Blob bytes are content too: a photo attached to a note deserves the same
+// protection as the note.
+func TestStore_EncryptsBlobBytes(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "blobs.sqlite")
+
+	db, err := gorm.Open(gormlite.Open(path), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("could not open database: %+v", err)
+	}
+
+	store := NewStore(db, WithEncryptionKey("a-test-key-with-at-least-32-bytes!"))
+
+	payload := []byte("BINARY-IMAGE-PAYLOAD-1234567890")
+	hash, err := store.Put(ctx, "image/png", payload)
+	if err != nil {
+		t.Fatalf("Put: %+v", err)
+	}
+
+	data, info, err := store.Get(ctx, hash)
+	if err != nil {
+		t.Fatalf("Get: %+v", err)
+	}
+	if !bytes.Equal(data, payload) {
+		t.Errorf("Get returned %q, want the clear payload", data)
+	}
+	if info.Size != int64(len(payload)) {
+		t.Errorf("Size = %d, want the clear size %d", info.Size, len(payload))
+	}
+
+	sqlDB, _ := db.DB()
+	_ = sqlDB.Close()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("could not read database file: %+v", err)
+	}
+	if bytes.Contains(raw, []byte("BINARY-IMAGE-PAYLOAD")) {
+		t.Error("the database file carries the blob in clear")
+	}
 }
