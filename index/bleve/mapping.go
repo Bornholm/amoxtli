@@ -14,10 +14,15 @@ func IndexMapping() *mapping.IndexMappingImpl {
 
 	resourceMapping := bleve.NewDocumentMapping()
 
+	// Term vectors record the position of every term in the field. They
+	// only serve highlighting and positional queries, and Search uses
+	// neither: carrying them typically doubles the index size for nothing.
+	// DocValues serve sorting and faceting, equally unused.
 	contentFieldMapping := bleve.NewTextFieldMapping()
 	contentFieldMapping.Analyzer = AnalyzerDynamicLang
 	contentFieldMapping.Store = false
-	contentFieldMapping.IncludeTermVectors = true
+	contentFieldMapping.IncludeTermVectors = false
+	contentFieldMapping.DocValues = false
 	resourceMapping.AddFieldMappingsAt("content", contentFieldMapping)
 
 	// source is an exact identifier queried with a TermQuery (DeleteBySource,
@@ -26,7 +31,8 @@ func IndexMapping() *mapping.IndexMappingImpl {
 	sourceFieldMapping := bleve.NewTextFieldMapping()
 	sourceFieldMapping.Analyzer = keyword.Name
 	sourceFieldMapping.Store = true
-	sourceFieldMapping.IncludeTermVectors = true
+	sourceFieldMapping.IncludeTermVectors = false
+	sourceFieldMapping.DocValues = false
 	resourceMapping.AddFieldMappingsAt("source", sourceFieldMapping)
 
 	// collections holds exact identifiers matched with a TermQuery; keyword
@@ -34,7 +40,8 @@ func IndexMapping() *mapping.IndexMappingImpl {
 	collectionsFieldMapping := bleve.NewTextFieldMapping()
 	collectionsFieldMapping.Analyzer = keyword.Name
 	collectionsFieldMapping.Store = false
-	collectionsFieldMapping.IncludeTermVectors = true
+	collectionsFieldMapping.IncludeTermVectors = false
+	collectionsFieldMapping.DocValues = false
 	resourceMapping.AddFieldMappingsAt("collections", collectionsFieldMapping)
 
 	mapping.AddDocumentMapping("resource", resourceMapping)
