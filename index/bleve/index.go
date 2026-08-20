@@ -308,4 +308,17 @@ func (i *Index) Recreated() bool {
 	return i.recreated
 }
 
+// DocCount returns the number of indexed entries. Combined with a count of
+// the corpus, it detects an index left empty by an interrupted reindex —
+// a state Recreated cannot see, since the rebuild happened on an earlier
+// start.
+func (i *Index) DocCount() (uint64, error) {
+	count, err := i.index.DocCount()
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	return count, nil
+}
+
 var _ index.Index = &Index{}
