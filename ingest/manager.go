@@ -618,10 +618,10 @@ func decodeCursor(cursor string) (searchCursor, error) {
 	var c searchCursor
 	data, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil {
-		return c, errors.Wrap(err, "invalid search cursor")
+		return c, errors.Wrap(ErrInvalidCursor, err.Error())
 	}
 	if err := json.Unmarshal(data, &c); err != nil {
-		return c, errors.Wrap(err, "invalid search cursor")
+		return c, errors.Wrap(ErrInvalidCursor, err.Error())
 	}
 	return c, nil
 }

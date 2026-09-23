@@ -11,6 +11,8 @@ var (
 	// would silently return duplicated or skipped results. Clients receiving it
 	// must restart from the first page.
 	ErrCursorFilterMismatch = errors.New("search cursor was issued for a different filter")
+	// ErrInvalidCursor reports a search cursor that cannot be decoded.
+	ErrInvalidCursor = errors.New("invalid search cursor")
 
 	// ErrStagedFileMissing is returned when an indexing task cannot find the
 	// file staged by IndexFile. When several processes share a persistent task
