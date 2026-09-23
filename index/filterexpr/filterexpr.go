@@ -1,3 +1,6 @@
+// Package filterexpr parses the textual metadata filters and values shared by
+// the command line, the MCP server and applications built on amoxtli:
+// key=value, key>=2024, key? and !key.
 package filterexpr
 
 import (

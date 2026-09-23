@@ -10,7 +10,7 @@ import (
 	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/ingest"
-	"github.com/bornholm/amoxtli/internal/filterexpr"
+	"github.com/bornholm/amoxtli/index/filterexpr"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/pkg/errors"

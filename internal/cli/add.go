@@ -11,7 +11,7 @@ import (
 
 	"github.com/bornholm/amoxtli"
 	"github.com/bornholm/amoxtli/internal/cli/runtime"
-	"github.com/bornholm/amoxtli/internal/filterexpr"
+	"github.com/bornholm/amoxtli/index/filterexpr"
 	"github.com/bornholm/amoxtli/internal/ignore"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/task"
