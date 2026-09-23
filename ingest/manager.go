@@ -696,9 +696,21 @@ type IndexFileOptions struct {
 	Collections []model.CollectionID
 	// Arbitrary document metadata used for filtering at search time.
 	Metadata map[string]any
+	// OnProgress, when set, receives the progress events of a synchronous
+	// indexing (IndexFileSync). It is ignored by IndexFile, whose progress is
+	// read from the task runner.
+	OnProgress func(progress float32, message string)
 }
 
 type IndexFileOptionFunc func(opts *IndexFileOptions)
+
+// WithIndexFileProgress receives the progress of a synchronous indexing
+// (IndexFileSync): progress in [0, 1] and the last status message.
+func WithIndexFileProgress(fn func(progress float32, message string)) IndexFileOptionFunc {
+	return func(opts *IndexFileOptions) {
+		opts.OnProgress = fn
+	}
+}
 
 // WithIndexFileMetadata attaches arbitrary metadata to the indexed document,
 // used for metadata filtering at search time.
@@ -780,6 +792,74 @@ func (m *Manager) IndexFile(ctx context.Context, filename string, r io.Reader, f
 	return indexFileTask.ID(), nil
 }
 
+// IndexFileSync indexes a file within the call, without going through the
+// task runner: the document is searchable as soon as it returns. The file is
+// copied to a private temporary file, so nothing depends on a staging
+// directory shared with other processes. It is meant for callers that
+// distribute the indexing work themselves.
+func (m *Manager) IndexFileSync(ctx context.Context, filename string, r io.Reader, funcs ...IndexFileOptionFunc) error {
+	opts := NewIndexFileOptions(funcs...)
+
+	file, err := os.CreateTemp("", tempDirPrefix+"sync-*"+filepath.Ext(filename))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	path := file.Name()
+
+	_, err = io.Copy(file, r)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			slog.WarnContext(ctx, "could not remove temporary file", slog.String("path", path), slog.Any("error", errors.WithStack(removeErr)))
+		}
+		return errors.WithStack(err)
+	}
+
+	// The handler removes the file once it is done with it.
+	indexFileTask := NewIndexFileTask(path, filename, opts.ETag, opts.Source, opts.Collections, opts.Metadata,
+		WithIndexFileTaskImageBaseDir(opts.ImageBaseDir),
+	)
+
+	events := make(chan task.Event, 100)
+	drained := make(chan struct{})
+
+	go func() {
+		defer close(drained)
+
+		var (
+			progress float32
+			message  string
+		)
+
+		for e := range events {
+			if opts.OnProgress == nil {
+				continue
+			}
+			if e.Progress != nil {
+				progress = *e.Progress
+			}
+			if e.Message != nil {
+				message = *e.Message
+			}
+			opts.OnProgress(progress, message)
+		}
+	}()
+
+	err = m.newIndexFileHandler().Handle(ctx, indexFileTask, events)
+
+	close(events)
+	<-drained
+
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
+}
+
 func (m *Manager) CleanupIndex(ctx context.Context, collections ...model.CollectionID) (task.ID, error) {
 	cleanupIndexTask := NewCleanupTask(collections)
 
@@ -811,10 +891,7 @@ func (m *Manager) Reindex(ctx context.Context) (task.ID, error) {
 // factories are registered too so pending tasks can be rebuilt and resumed
 // after a restart.
 func (m *Manager) RegisterHandlers(runner task.Runner) {
-	runner.RegisterTask(TaskTypeIndexFile, NewIndexFileHandler(m.Store, m.fileConverter, m.index, m.maxWordPerSection,
-		WithIndexFileHandlerSourceCode(m.sourceCode),
-		WithIndexFileHandlerImageEnrichment(m.imageEnricher),
-	))
+	runner.RegisterTask(TaskTypeIndexFile, m.newIndexFileHandler())
 	runner.RegisterTask(TaskTypeCleanup, NewCleanupHandler(m.index, m.Store, WithCleanupBlobStore(m.blobs)))
 	runner.RegisterTask(TaskTypeReindex, NewReindexHandler(m.Store, m.index, m.maxWordPerSection))
 
@@ -823,6 +900,13 @@ func (m *Manager) RegisterHandlers(runner task.Runner) {
 		persistent.RegisterFactory(TaskTypeCleanup, CleanupTaskFactory)
 		persistent.RegisterFactory(TaskTypeReindex, ReindexTaskFactory)
 	}
+}
+
+func (m *Manager) newIndexFileHandler() *IndexFileHandler {
+	return NewIndexFileHandler(m.Store, m.fileConverter, m.index, m.maxWordPerSection,
+		WithIndexFileHandlerSourceCode(m.sourceCode),
+		WithIndexFileHandlerImageEnrichment(m.imageEnricher),
+	)
 }
 
 func NewManager(store Store, idx index.Index, taskRunner task.Runner, funcs ...ManagerOptionFunc) *Manager {

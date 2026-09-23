@@ -368,6 +368,9 @@ func (h *IndexFileHandler) Handle(ctx context.Context, tsk task.Task, events cha
 			func(ctx context.Context) error {
 				file, err := os.Open(indexFileTask.path)
 				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						return errors.Wrapf(ErrStagedFileMissing, "%s", indexFileTask.path)
+					}
 					return errors.WithStack(err)
 				}
 

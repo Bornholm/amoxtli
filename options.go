@@ -511,6 +511,9 @@ type IndexFileOptions struct {
 	ImageBaseDir string
 	// Metadata is arbitrary document metadata used for filtering at search time.
 	Metadata map[string]any
+	// OnProgress receives the progress of IndexFileSync (see
+	// WithIndexFileProgress).
+	OnProgress func(progress float32, message string)
 }
 
 // IndexFileOption configures an IndexFile call.
@@ -549,6 +552,15 @@ func WithIndexFileImageBaseDir(dir string) IndexFileOption {
 func WithIndexFileCollections(ids ...model.CollectionID) IndexFileOption {
 	return func(o *IndexFileOptions) {
 		o.Collections = ids
+	}
+}
+
+// WithIndexFileProgress receives the progress of IndexFileSync: progress in
+// [0, 1] and the last status message. IndexFile ignores it; its progress is
+// read with TaskState.
+func WithIndexFileProgress(fn func(progress float32, message string)) IndexFileOption {
+	return func(o *IndexFileOptions) {
+		o.OnProgress = fn
 	}
 }
 

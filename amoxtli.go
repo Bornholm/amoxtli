@@ -325,6 +325,28 @@ func newOrchestrator(opts *options, manager *ingest.Manager, evaluator retrieval
 // IndexFile indexes a file into the given collection.
 // Returns a task.ID that can be used to track progress via TaskState.
 func (c *Codex) IndexFile(ctx context.Context, collectionID model.CollectionID, filename string, r io.Reader, funcs ...IndexFileOption) (task.ID, error) {
+	taskID, err := c.manager.IndexFile(ctx, filename, r, indexFileOptions(collectionID, funcs)...)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+
+	return taskID, nil
+}
+
+// IndexFileSync indexes a file into the given collection within the call,
+// without going through the task runner: the document is searchable as soon as
+// it returns, and no staging directory is involved. It is meant for callers
+// distributing the indexing work themselves, e.g. across several processes;
+// see WithIndexFileProgress to follow its progress.
+func (c *Codex) IndexFileSync(ctx context.Context, collectionID model.CollectionID, filename string, r io.Reader, funcs ...IndexFileOption) error {
+	if err := c.manager.IndexFileSync(ctx, filename, r, indexFileOptions(collectionID, funcs)...); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
+}
+
+func indexFileOptions(collectionID model.CollectionID, funcs []IndexFileOption) []ingest.IndexFileOptionFunc {
 	opts := &IndexFileOptions{
 		Collections: []model.CollectionID{collectionID},
 	}
@@ -347,13 +369,11 @@ func (c *Codex) IndexFile(ctx context.Context, collectionID model.CollectionID, 
 	if len(opts.Metadata) > 0 {
 		ingestOpts = append(ingestOpts, ingest.WithIndexFileMetadata(opts.Metadata))
 	}
-
-	taskID, err := c.manager.IndexFile(ctx, filename, r, ingestOpts...)
-	if err != nil {
-		return "", errors.WithStack(err)
+	if opts.OnProgress != nil {
+		ingestOpts = append(ingestOpts, ingest.WithIndexFileProgress(opts.OnProgress))
 	}
 
-	return taskID, nil
+	return ingestOpts
 }
 
 // searchCandidatePool is the fused candidate window fetched by SearchPage so
