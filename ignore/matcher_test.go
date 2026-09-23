@@ -85,3 +85,31 @@ func TestIgnoredOutsideRoot(t *testing.T) {
 		t.Fatal("file outside the workspace root should not be ignored by root rules")
 	}
 }
+
+func TestIgnoredWithAliasFileNames(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, FileName), "*.log\n")
+	writeFile(t, filepath.Join(root, "sub", ".corpusignore"), "brouillon/\n")
+
+	m := NewWithFileNames(root, FileName, ".corpusignore")
+
+	for path, want := range map[string]bool{
+		"a.log":                   true,
+		"sub/brouillon/note.md":   true,
+		"sub/final/note.md":       false,
+		"brouillon/hors-perim.md": false,
+	} {
+		ignored, _, err := m.Ignored(filepath.Join(root, path))
+		if err != nil {
+			t.Fatalf("Ignored(%s): %+v", path, err)
+		}
+		if ignored != want {
+			t.Errorf("Ignored(%s) = %v, want %v", path, ignored, want)
+		}
+	}
+
+	// The default name alone ignores the alias.
+	if ignored, _, _ := New(root).Ignored(filepath.Join(root, "sub/brouillon/note.md")); ignored {
+		t.Error("New must read .amoxtlignore only")
+	}
+}

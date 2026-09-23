@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/bornholm/amoxtli/internal/cli/runtime"
-	"github.com/bornholm/amoxtli/internal/ignore"
+	"github.com/bornholm/amoxtli/ignore"
 	"github.com/bornholm/amoxtli/task"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"

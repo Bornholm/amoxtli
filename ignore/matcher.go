@@ -1,5 +1,6 @@
 // Package ignore implements .amoxtlignore support: gitignore-style exclusion
-// rules that decide whether a file should be skipped by "amoxtli add".
+// rules that decide whether a file should be skipped by "amoxtli add" and
+// "amoxtli sync", or by any application walking a tree for amoxtli.
 package ignore
 
 import (
@@ -21,21 +22,40 @@ const FileName = ".amoxtlignore"
 // directory so a batch of files under the same tree only parses each ignore
 // file once. A Matcher is not safe for concurrent use.
 type Matcher struct {
-	root  string
-	cache map[string]*patternmatcher.PatternMatcher // dir -> matcher, nil = no ignore file
+	root      string
+	fileNames []string
+	cache     map[string][]fileMatcher // dir -> matchers of its ignore files
+}
+
+// fileMatcher is the compiled rules of one ignore file.
+type fileMatcher struct {
+	path    string
+	matcher *patternmatcher.PatternMatcher
 }
 
 // New returns a Matcher anchored at root (the workspace root, i.e. the
 // directory whose subtree the .amoxtlignore files govern).
 func New(root string) *Matcher {
+	return NewWithFileNames(root, FileName)
+}
+
+// NewWithFileNames returns a Matcher reading, in each directory, the ignore
+// files of the given names — an application may accept its own name besides
+// .amoxtlignore. The rules of all of them apply.
+func NewWithFileNames(root string, fileNames ...string) *Matcher {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		abs = root
 	}
 
+	if len(fileNames) == 0 {
+		fileNames = []string{FileName}
+	}
+
 	return &Matcher{
-		root:  filepath.Clean(abs),
-		cache: make(map[string]*patternmatcher.PatternMatcher),
+		root:      filepath.Clean(abs),
+		fileNames: fileNames,
+		cache:     make(map[string][]fileMatcher),
 	}
 }
 
@@ -53,12 +73,9 @@ func (m *Matcher) Ignored(absPath string) (ignored bool, source string, err erro
 	abs = filepath.Clean(abs)
 
 	for _, dir := range m.cascade(filepath.Dir(abs)) {
-		pm, err := m.matcherFor(dir)
+		matchers, err := m.matchersFor(dir)
 		if err != nil {
 			return false, "", err
-		}
-		if pm == nil {
-			continue
 		}
 
 		rel, err := filepath.Rel(dir, abs)
@@ -66,13 +83,15 @@ func (m *Matcher) Ignored(absPath string) (ignored bool, source string, err erro
 			continue
 		}
 
-		matched, err := pm.MatchesOrParentMatches(rel)
-		if err != nil {
-			return false, "", errors.Wrapf(err, "matching %q against %s", rel, filepath.Join(dir, FileName))
-		}
-		if matched {
-			ignored = true
-			source = filepath.Join(dir, FileName)
+		for _, fm := range matchers {
+			matched, err := fm.matcher.MatchesOrParentMatches(rel)
+			if err != nil {
+				return false, "", errors.Wrapf(err, "matching %q against %s", rel, fm.path)
+			}
+			if matched {
+				ignored = true
+				source = fm.path
+			}
 		}
 	}
 
@@ -110,29 +129,35 @@ func (m *Matcher) cascade(dir string) []string {
 	return dirs
 }
 
-// matcherFor lazily loads and compiles the .amoxtlignore in dir, caching the
-// result (including a nil matcher when the file is absent) so it is read once.
-func (m *Matcher) matcherFor(dir string) (*patternmatcher.PatternMatcher, error) {
-	if pm, ok := m.cache[dir]; ok {
-		return pm, nil
+// matchersFor lazily loads and compiles the ignore files of dir, caching the
+// result (including their absence) so each is read once.
+func (m *Matcher) matchersFor(dir string) ([]fileMatcher, error) {
+	if matchers, ok := m.cache[dir]; ok {
+		return matchers, nil
 	}
 
-	patterns, err := readPatterns(filepath.Join(dir, FileName))
-	if err != nil {
-		return nil, err
-	}
+	var matchers []fileMatcher
+	for _, name := range m.fileNames {
+		path := filepath.Join(dir, name)
 
-	var pm *patternmatcher.PatternMatcher
-	if len(patterns) > 0 {
-		pm, err = patternmatcher.New(patterns)
+		patterns, err := readPatterns(path)
 		if err != nil {
-			return nil, errors.Wrapf(err, "invalid patterns in %s", filepath.Join(dir, FileName))
+			return nil, err
 		}
+		if len(patterns) == 0 {
+			continue
+		}
+
+		pm, err := patternmatcher.New(patterns)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid patterns in %s", path)
+		}
+		matchers = append(matchers, fileMatcher{path: path, matcher: pm})
 	}
 
-	m.cache[dir] = pm
+	m.cache[dir] = matchers
 
-	return pm, nil
+	return matchers, nil
 }
 
 // readPatterns reads an ignore file, dropping blank lines and # comments like
