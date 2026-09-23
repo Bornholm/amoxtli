@@ -172,3 +172,34 @@ func TestCodexSetDocumentCollections(t *testing.T) {
 		t.Errorf("document not found in its new collection: %v", sources)
 	}
 }
+
+func TestCodexListDocumentsFilter(t *testing.T) {
+	ctx := context.Background()
+	codex, collID := newBleveCodex(t)
+
+	indexSync(t, codex, collID, "https://example.net/a.md", map[string]any{"type": "contrat", "tags": []any{"bail", "loyer"}})
+	indexSync(t, codex, collID, "https://example.net/b.md", map[string]any{"type": "note"})
+	indexSync(t, codex, collID, "https://example.net/c.md", map[string]any{"type": "contrat"})
+
+	documents, total, err := codex.ListDocuments(ctx, collID, ListDocumentsOptions{Filter: index.Filter{index.Eq("type", "contrat")}, Limit: 1})
+	if err != nil {
+		t.Fatalf("ListDocuments: %+v", errors.WithStack(err))
+	}
+	if total != 2 || len(documents) != 1 {
+		t.Errorf("expected 1 document of 2, got %d of %d", len(documents), total)
+	}
+
+	second, _, err := codex.ListDocuments(ctx, collID, ListDocumentsOptions{Filter: index.Filter{index.Eq("type", "contrat")}, Limit: 1, Page: 1})
+	if err != nil || len(second) != 1 || second[0].ID() == documents[0].ID() {
+		t.Errorf("expected the other contract on the second page, got %v %+v", second, err)
+	}
+
+	tagged, total, err := codex.ListDocuments(ctx, collID, ListDocumentsOptions{Filter: index.Filter{index.Any("tags", "loyer")}})
+	if err != nil || total != 1 || len(tagged) != 1 || tagged[0].Source().String() != "https://example.net/a.md" {
+		t.Errorf("expected the tagged document only, got %d %+v", total, err)
+	}
+
+	if _, _, err := codex.ListDocuments(ctx, collID, ListDocumentsOptions{Filter: index.Filter{index.Eq("bad key", "x")}}); err == nil {
+		t.Error("expected an invalid filter key to be rejected")
+	}
+}

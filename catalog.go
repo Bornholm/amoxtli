@@ -74,6 +74,10 @@ type ListDocumentsOptions struct {
 	Limit int
 	// SourcePattern keeps the documents whose source contains it.
 	SourcePattern string
+	// Filter keeps the documents whose metadata it matches — a facet value
+	// picked by a user, typically. Like facets, it is evaluated over the
+	// document headers: the whole collection is read to count the total.
+	Filter index.Filter
 }
 
 // ListDocuments returns a page of the documents of a collection, headers only,
@@ -94,12 +98,59 @@ func (c *Codex) ListDocuments(ctx context.Context, collectionID model.Collection
 		query.SourcePattern = &opts.SourcePattern
 	}
 
+	if len(opts.Filter) > 0 {
+		return c.listFilteredDocuments(ctx, collectionID, query, opts.Filter, page, limit)
+	}
+
 	documents, total, err := c.store.QueryDocumentsByCollectionID(ctx, collectionID, query)
 	if err != nil {
 		return nil, 0, errors.WithStack(err)
 	}
 
 	return documents, total, nil
+}
+
+// listFilteredDocuments pages through the documents of the collection
+// matching the metadata filter.
+func (c *Codex) listFilteredDocuments(ctx context.Context, collectionID model.CollectionID, query ingest.QueryDocumentsOptions, filter index.Filter, page, limit int) ([]model.PersistedDocument, int64, error) {
+	if err := filter.Validate(); err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+
+	var (
+		matching []model.PersistedDocument
+		total    int64
+		skip     = page * limit
+	)
+
+	pageSize := facetPageSize
+	query.Limit = &pageSize
+
+	for storePage := 0; ; storePage++ {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, errors.WithStack(err)
+		}
+
+		query.Page = &storePage
+		documents, _, err := c.store.QueryDocumentsByCollectionID(ctx, collectionID, query)
+		if err != nil {
+			return nil, 0, errors.WithStack(err)
+		}
+
+		for _, d := range documents {
+			if !filter.Matches(model.Metadata(d)) {
+				continue
+			}
+			if total >= int64(skip) && len(matching) < limit {
+				matching = append(matching, d)
+			}
+			total++
+		}
+
+		if len(documents) < pageSize {
+			return matching, total, nil
+		}
+	}
 }
 
 // GetDocument returns a document with its sections and collections.
