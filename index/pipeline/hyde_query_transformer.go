@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/internal/stagectx"
 	"github.com/bornholm/amoxtli/internal/text"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/genai/llm"
@@ -40,6 +41,10 @@ This this the available collections of documents in the database. Use them to or
 
 // TransformQuery implements QueryTransformer.
 func (t *HyDEQueryTransformer) TransformQuery(ctx context.Context, query string, opts index.SearchOptions) (string, error) {
+	if stagectx.Skipped(ctx, StageHyDE) {
+		return query, nil
+	}
+
 	collections, err := t.collections.ListCollections(ctx, opts.Collections)
 	if err != nil {
 		return "", errors.WithStack(err)

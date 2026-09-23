@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/internal/stagectx"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -154,7 +155,7 @@ func (o *Orchestrator) Search(ctx context.Context, query string, maxResults int,
 	// iterative re-retrieval.
 	var grounding *GroundingResult
 	rounds := 0
-	if o.evaluator != nil {
+	if o.evaluator != nil && !stagectx.Skipped(ctx, StageGrounding) {
 		for len(results) > 0 {
 			evaluation, err := o.evaluator.Evaluate(ctx, query, results)
 			if err != nil {
@@ -174,7 +175,7 @@ func (o *Orchestrator) Search(ctx context.Context, query string, maxResults int,
 			grounding = &verdict
 
 			confident := verdict.Status == GroundingValid && verdict.Score >= o.minScore
-			if confident || o.reformulator == nil || rounds >= o.maxRounds {
+			if confident || o.reformulator == nil || stagectx.Skipped(ctx, StageReformulate) || rounds >= o.maxRounds {
 				break
 			}
 
@@ -218,7 +219,7 @@ const retrieveConcurrency = 4
 // configured, it searches the original query plus each sub-question and fuses
 // the evidence; otherwise it is a plain SearchFunc call.
 func (o *Orchestrator) retrieve(ctx context.Context, query string, maxResults int, collections []model.CollectionID) ([]*index.SearchResult, error) {
-	if o.decomposer == nil {
+	if o.decomposer == nil || stagectx.Skipped(ctx, StageDecompose) {
 		results, err := o.search(ctx, query, maxResults, collections)
 		if err != nil {
 			return nil, errors.WithStack(err)

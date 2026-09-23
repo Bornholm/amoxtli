@@ -7,6 +7,7 @@ import (
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/internal/lang"
+	"github.com/bornholm/amoxtli/internal/stagectx"
 	"github.com/bornholm/amoxtli/internal/text"
 	"github.com/bornholm/genai/llm"
 	"github.com/bornholm/genai/llm/prompt"
@@ -60,6 +61,10 @@ unchanged for that language.
 
 // TransformQuery implements QueryTransformer.
 func (t *TranslateQueryTransformer) TransformQuery(ctx context.Context, query string, opts index.SearchOptions) (string, error) {
+	if stagectx.Skipped(ctx, StageTranslate) {
+		return query, nil
+	}
+
 	targets, err := t.targetLanguages(ctx, query, opts)
 	if err != nil {
 		return "", errors.WithStack(err)

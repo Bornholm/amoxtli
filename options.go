@@ -1,6 +1,7 @@
 package amoxtli
 
 import (
+	"context"
 	"net/url"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/bornholm/amoxtli/convert"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/ingest"
+	"github.com/bornholm/amoxtli/internal/stagectx"
 	"github.com/bornholm/amoxtli/markdown/imagetext"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
@@ -420,8 +422,9 @@ func WithReranking() Option {
 //
 // Unlike WithReranking it needs no LLM client, issues no network call and costs
 // microseconds rather than a round-trip, which makes it the reranking option
-// that does not dominate search latency. The two are mutually exclusive: the
-// search pipeline holds a single reranker.
+// that does not dominate search latency. Both can be enabled: the LLM
+// reranker then runs, and the lexical one takes over for the searches whose
+// profile skips StageRerank (see WithSearchProfile).
 //
 // Passing a zero LexicalWeights selects retrieval.DefaultLexicalWeights.
 func WithLexicalReranking(weights retrieval.LexicalWeights) Option {
@@ -583,10 +586,38 @@ type SearchOptions struct {
 	Filter index.Filter
 	// Cursor resumes pagination after a previous SearchPage (empty = first page).
 	Cursor string
+	// Profile, when set, restricts the optional stages run for this search
+	// (see WithSearchProfile).
+	Profile *SearchProfile
+}
+
+// stageContext returns ctx carrying the stages allowed by the profile, or ctx
+// itself when no profile is set.
+func (o *SearchOptions) stageContext(ctx context.Context) context.Context {
+	if o.Profile == nil {
+		return ctx
+	}
+
+	stages := make([]string, 0, len(o.Profile.Stages))
+	for _, s := range o.Profile.Stages {
+		stages = append(stages, string(s))
+	}
+
+	return stagectx.WithAllowed(ctx, stages...)
 }
 
 // SearchOption configures a Search call.
 type SearchOption func(*SearchOptions)
+
+// WithSearchProfile restricts, for this search, the optional stages to those
+// of the profile: a stage outside it is skipped even when configured. It never
+// enables a stage the Codex was not configured with. Without a profile every
+// configured stage runs.
+func WithSearchProfile(profile SearchProfile) SearchOption {
+	return func(o *SearchOptions) {
+		o.Profile = &profile
+	}
+}
 
 // WithSearchMaxResults sets the maximum number of search results (page size).
 func WithSearchMaxResults(n int) SearchOption {

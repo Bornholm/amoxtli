@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/internal/stagectx"
 	"github.com/bornholm/amoxtli/internal/text"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/genai/llm"
@@ -68,6 +69,10 @@ If no documents are relevant:
 
 // TransformResults implements ResultsTransformer.
 func (t *JudgeResultsTransformer) TransformResults(ctx context.Context, query string, results []*index.SearchResult, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	if stagectx.Skipped(ctx, StageJudge) {
+		return results, nil
+	}
+
 	systemPrompt, err := prompt.Template(defaultJudgeResultsTransformer, struct {
 	}{})
 	if err != nil {

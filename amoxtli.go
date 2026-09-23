@@ -15,6 +15,7 @@ import (
 	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/index/pipeline"
 	"github.com/bornholm/amoxtli/ingest"
+	"github.com/bornholm/amoxtli/internal/stagectx"
 	"github.com/bornholm/amoxtli/llmx"
 	"github.com/bornholm/amoxtli/markdown/imagetext"
 	"github.com/bornholm/amoxtli/model"
@@ -219,14 +220,10 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 
 		managerOpts = append(managerOpts, ingest.WithManagerImageEnrichment(imagetext.New(enrichOptions...)))
 	}
-	if opts.reranking && opts.lexicalReranking {
-		return nil, errors.New("amoxtli: WithReranking and WithLexicalReranking are mutually exclusive, the search pipeline holds a single reranker")
-	}
+	var reranker stagedReranker
 	if rerankClient := opts.clientFor(StageRerank); opts.reranking && rerankClient != nil {
-		managerOpts = append(managerOpts,
-			ingest.WithManagerReranker(retrieval.NewLLMReranker(rerankClient, store, opts.maxTotalWords,
-				retrieval.WithMaxSectionWords(opts.maxSectionWords))),
-		)
+		reranker.llm = retrieval.NewLLMReranker(rerankClient, store, opts.maxTotalWords,
+			retrieval.WithMaxSectionWords(opts.maxSectionWords))
 	}
 	if opts.lexicalReranking {
 		lexicalOpts := []retrieval.LexicalOption{}
@@ -236,7 +233,10 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 		if opts.lexicalTokenizer != nil {
 			lexicalOpts = append(lexicalOpts, retrieval.WithTokenizer(opts.lexicalTokenizer))
 		}
-		managerOpts = append(managerOpts, ingest.WithManagerReranker(retrieval.NewLexicalReranker(store, lexicalOpts...)))
+		reranker.lexical = retrieval.NewLexicalReranker(store, lexicalOpts...)
+	}
+	if reranker.llm != nil || reranker.lexical != nil {
+		managerOpts = append(managerOpts, ingest.WithManagerReranker(&reranker))
 	}
 
 	manager := ingest.NewManager(store, idx, taskRunner, managerOpts...)
@@ -289,6 +289,9 @@ func newOrchestrator(opts *options, manager *ingest.Manager, evaluator retrieval
 		}
 		if len(collections) > 0 {
 			ingestOpts = append(ingestOpts, ingest.WithSearchCollections(collections...))
+		}
+		if filter := iterativeFilter(ctx); len(filter) > 0 {
+			ingestOpts = append(ingestOpts, ingest.WithSearchFilter(filter))
 		}
 		res, err := manager.Search(ctx, query, ingestOpts...)
 		if err != nil {
@@ -444,6 +447,8 @@ func (c *Codex) searchPage(ctx context.Context, query string, candidatePool int,
 		fn(opts)
 	}
 
+	ctx = opts.stageContext(ctx)
+
 	ingestOpts := []ingest.SearchOptionFunc{
 		ingest.WithSearchMaxResults(opts.MaxResults),
 	}
@@ -472,7 +477,7 @@ func (c *Codex) searchPage(ctx context.Context, query string, candidatePool int,
 	// verdict is surfaced on the returned page so callers get it without a
 	// second, redundant evaluation (see CheckGrounding for the standalone form).
 	var grounding *retrieval.GroundingResult
-	if c.evaluator != nil {
+	if c.evaluator != nil && !stagectx.Skipped(ctx, retrieval.StageGrounding) {
 		evaluation, err := c.evaluator.Evaluate(ctx, query, results)
 		if err != nil {
 			// Fail-open: a transient evaluator (LLM) failure returns the
@@ -532,6 +537,10 @@ func (c *Codex) SearchIterative(ctx context.Context, query string, funcs ...Sear
 	for _, fn := range funcs {
 		fn(opts)
 	}
+
+	// The orchestrator's search function only takes collections: the filter
+	// reaches it through the context.
+	ctx = withIterativeFilter(opts.stageContext(ctx), opts.Filter)
 
 	result, err := c.orchestrator.Search(ctx, query, opts.MaxResults, opts.Collections)
 	if err != nil {
