@@ -2,6 +2,7 @@ package amoxtli
 
 import (
 	"context"
+	"net/url"
 
 	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/index"
@@ -156,6 +157,26 @@ func (c *Codex) listFilteredDocuments(ctx context.Context, collectionID model.Co
 // GetDocument returns a document with its sections and collections.
 func (c *Codex) GetDocument(ctx context.Context, id model.DocumentID) (model.PersistedDocument, error) {
 	document, err := c.store.GetDocumentByID(ctx, id)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return document, nil
+}
+
+// GetDocumentBySource returns the document indexed from a source, with its
+// sections and collections, or ErrNotFound.
+func (c *Codex) GetDocumentBySource(ctx context.Context, source *url.URL) (model.PersistedDocument, error) {
+	limit := 1
+	documents, _, err := c.store.QueryDocuments(ctx, ingest.QueryDocumentsOptions{MatchingSource: source, Limit: &limit, HeaderOnly: true})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if len(documents) == 0 {
+		return nil, errors.WithStack(ErrNotFound)
+	}
+
+	document, err := c.store.GetDocumentByID(ctx, documents[0].ID())
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

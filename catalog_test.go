@@ -203,3 +203,25 @@ func TestCodexListDocumentsFilter(t *testing.T) {
 		t.Error("expected an invalid filter key to be rejected")
 	}
 }
+
+func TestCodexGetDocumentBySource(t *testing.T) {
+	ctx := context.Background()
+	codex, collID := newBleveCodex(t)
+
+	indexSync(t, codex, collID, "https://example.net/a.md", nil)
+	indexSync(t, codex, collID, "https://example.net/b.md", nil)
+
+	source, _ := url.Parse("https://example.net/b.md")
+	document, err := codex.GetDocumentBySource(ctx, source)
+	if err != nil {
+		t.Fatalf("GetDocumentBySource: %+v", errors.WithStack(err))
+	}
+	if document.Source().String() != source.String() || len(document.Collections()) != 1 {
+		t.Errorf("unexpected document %s with %d collections", document.Source(), len(document.Collections()))
+	}
+
+	missing, _ := url.Parse("https://example.net/c.md")
+	if _, err := codex.GetDocumentBySource(ctx, missing); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got %+v", err)
+	}
+}
