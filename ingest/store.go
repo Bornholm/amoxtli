@@ -97,3 +97,12 @@ type CollectionUpdates struct {
 	Label       *string
 	Description *string
 }
+
+// DocumentUpdater is an optional capability of a Store able to change a
+// document's metadata and collections in place, without saving it again.
+type DocumentUpdater interface {
+	// UpdateDocumentMetadata replaces the metadata of a document.
+	UpdateDocumentMetadata(ctx context.Context, id model.DocumentID, metadata map[string]any) error
+	// SetDocumentCollections replaces the collections a document belongs to.
+	SetDocumentCollections(ctx context.Context, id model.DocumentID, collections []model.CollectionID) error
+}

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/bornholm/amoxtli/ingest"
+	"github.com/bornholm/amoxtli/internal/filternorm"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
@@ -815,3 +816,67 @@ func (s *Store) QueryDocumentsByCollectionID(ctx context.Context, collectionID m
 
 	return wrappedDocuments, total, nil
 }
+
+// UpdateDocumentMetadata implements ingest.DocumentUpdater.
+func (s *Store) UpdateDocumentMetadata(ctx context.Context, id model.DocumentID, metadata map[string]any) error {
+	var encoded []byte
+
+	// Canonicalized like on save, so filters see the same values whatever the
+	// write path.
+	if m := filternorm.Metadata(metadata); len(m) > 0 {
+		var err error
+		if encoded, err = json.Marshal(m); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+
+	err := s.withRetry(ctx, true, func(ctx context.Context, db *gorm.DB) error {
+		res := db.Model(&Document{}).Where("id = ?", string(id)).Update("metadata", encoded)
+		if res.Error != nil {
+			return errors.WithStack(res.Error)
+		}
+		if res.RowsAffected == 0 {
+			return errors.WithStack(ingest.ErrNotFound)
+		}
+		return nil
+	}, sqlite3.LOCKED, sqlite3.BUSY)
+
+	return errors.WithStack(err)
+}
+
+// SetDocumentCollections implements ingest.DocumentUpdater.
+func (s *Store) SetDocumentCollections(ctx context.Context, id model.DocumentID, collections []model.CollectionID) error {
+	err := s.withRetry(ctx, true, func(ctx context.Context, db *gorm.DB) error {
+		document := &Document{ID: string(id)}
+		if err := db.Select("id").First(document).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.WithStack(ingest.ErrNotFound)
+			}
+			return errors.WithStack(err)
+		}
+
+		targets := make([]*Collection, 0, len(collections))
+		if len(collections) > 0 {
+			ids := make([]string, 0, len(collections))
+			for _, c := range collections {
+				ids = append(ids, string(c))
+			}
+			if err := db.Where("id IN ?", ids).Find(&targets).Error; err != nil {
+				return errors.WithStack(err)
+			}
+			if len(targets) != len(ids) {
+				return errors.Wrap(ingest.ErrNotFound, "unknown collection")
+			}
+		}
+
+		if err := db.Model(document).Association("Collections").Replace(targets); err != nil {
+			return errors.WithStack(err)
+		}
+
+		return nil
+	}, sqlite3.LOCKED, sqlite3.BUSY)
+
+	return errors.WithStack(err)
+}
+
+var _ ingest.DocumentUpdater = &Store{}

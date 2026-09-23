@@ -555,3 +555,15 @@ func emptyResults(results []*index.SearchResult) bool {
 
 	return true
 }
+
+// UpdateMetadata implements index.MetadataUpdater, forwarding the update to
+// every underlying index that keeps a metadata copy.
+func (i *Index) UpdateMetadata(ctx context.Context, source *url.URL, metadata map[string]any) error {
+	_, err := fanOut(i.indexes, func(identified *IdentifiedIndex) (struct{}, error) {
+		return struct{}{}, errors.WithStack(index.UpdateMetadata(ctx, identified.Index(), source, metadata))
+	})
+
+	return err
+}
+
+var _ index.MetadataUpdater = &Index{}

@@ -3,6 +3,8 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -200,3 +202,33 @@ func ordered(key string, operand any, op string, a *args) string {
 			" AND dm.metadata -> " + a.bind(key) + " " + op + " to_jsonb(" + a.bind(number) + "::numeric))"
 	}
 }
+
+// UpdateMetadata implements index.MetadataUpdater.
+func (i *Index) UpdateMetadata(ctx context.Context, source *url.URL, metadata map[string]any) error {
+	pool, err := i.getPool(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			slog.WarnContext(ctx, "could not rollback metadata update", slog.Any("error", errors.WithStack(err)))
+		}
+	}()
+
+	if _, err := tx.Exec(ctx, `DELETE FROM amoxtli_document_metadata WHERE source = $1`, source.String()); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := writeDocumentMetadata(ctx, tx, source.String(), metadata); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return errors.WithStack(tx.Commit(ctx))
+}
+
+var _ index.MetadataUpdater = &Index{}

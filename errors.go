@@ -1,6 +1,8 @@
 package amoxtli
 
 import (
+	"errors"
+
 	"github.com/bornholm/amoxtli/ingest"
 	"github.com/bornholm/amoxtli/task"
 )
@@ -16,4 +18,8 @@ var (
 	// staged file, typically because the staging directory is not shared by
 	// the processes sharing a persistent task runner.
 	ErrStagedFileMissing = ingest.ErrStagedFileMissing
+
+	// ErrUnsupported is returned when the configured store lacks an optional
+	// capability an operation needs.
+	ErrUnsupported = errors.New("operation not supported by the configured store")
 )

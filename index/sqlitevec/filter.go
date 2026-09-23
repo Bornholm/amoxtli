@@ -1,7 +1,9 @@
 package sqlitevec
 
 import (
+	"context"
 	"encoding/json"
+	"net/url"
 	"strings"
 
 	"github.com/bornholm/amoxtli/index"
@@ -277,3 +279,19 @@ func bindArgs(stmt *sqlite3.Stmt, start int, args []any) (int, error) {
 
 	return position, nil
 }
+
+// UpdateMetadata implements index.MetadataUpdater.
+func (i *Index) UpdateMetadata(ctx context.Context, source *url.URL, metadata map[string]any) error {
+	i.rwLock.Lock()
+	defer i.rwLock.Unlock()
+
+	return i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		if err := deleteDocumentMetadata(conn, source.String()); err != nil {
+			return errors.WithStack(err)
+		}
+
+		return errors.WithStack(writeDocumentMetadata(conn, source.String(), metadata))
+	}, sqlite3.BUSY, sqlite3.LOCKED)
+}
+
+var _ index.MetadataUpdater = &Index{}

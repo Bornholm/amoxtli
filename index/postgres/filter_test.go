@@ -267,3 +267,42 @@ func sources(results []*index.SearchResult) []string {
 	}
 	return out
 }
+
+// UpdateMetadata must replace the metadata copy without reindexing, and an
+// empty map must remove it.
+func TestUpdateMetadataReplacesTheCopy(t *testing.T) {
+	pool := requirePostgres(t)
+	ctx := context.Background()
+
+	idx := NewIndex(pool, nil)
+	source, _ := url.Parse("mem://doc")
+
+	matches := func(filter index.Filter) bool {
+		results, err := idx.SearchFiltered(ctx, filterTestQuery, filter, index.SearchOptions{MaxResults: 10})
+		if err != nil {
+			t.Fatalf("SearchFiltered: %+v", err)
+		}
+		return len(results) > 0
+	}
+
+	if err := indexWithMetadata(ctx, idx, source.String(), map[string]any{"lang": "fr"}); err != nil {
+		t.Fatalf("index: %+v", err)
+	}
+
+	if err := idx.UpdateMetadata(ctx, source, map[string]any{"lang": "en", "_acl": []any{"google:user:a@example.net"}}); err != nil {
+		t.Fatalf("UpdateMetadata: %+v", err)
+	}
+	if matches(index.Filter{index.Eq("lang", "fr")}) {
+		t.Error("the former metadata survived the update")
+	}
+	if !matches(index.Filter{index.Eq("lang", "en")}) {
+		t.Error("the updated metadata is not filterable")
+	}
+
+	if err := idx.UpdateMetadata(ctx, source, nil); err != nil {
+		t.Fatalf("UpdateMetadata(nil): %+v", err)
+	}
+	if matches(index.Filter{index.Exists("lang")}) {
+		t.Error("an empty update must remove the metadata")
+	}
+}
