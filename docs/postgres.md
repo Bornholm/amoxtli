@@ -49,3 +49,20 @@ réindexer, et sa cohérence est verrouillée par un test différentiel contre
 `blob.ScanHashes`.
 
 **Volumétrie.** Chaque image décrite occupe une ligne `bytea` : à surveiller sur un corpus riche en images. Les parades sont `images.max_size` (10 Mio par défaut), la déduplication par hash (une image partagée n'est stockée qu'une fois) et le ramasse-miettes de la tâche de nettoyage, qui supprime les blobs qu'aucun document ne référence plus.
+
+## Plusieurs instances isolées dans une même base
+
+Plusieurs `Codex` peuvent partager une base PostgreSQL en restant isolés : chacun se connecte avec son propre `search_path`, dont le premier schéma reçoit ses tables. Toutes les requêtes utilisent des noms non qualifiés, donc chaque instance ne voit que son schéma.
+
+```text
+postgres://user:pass@host/db?sslmode=disable&search_path=org_a%2Cpublic
+```
+
+Le même DSN sert au store (`gorm.NewPostgresStore`), au pool de l'index (`pgxpool.New` puis `postgres.NewIndex`) et donc au runner de tâches persistant, qui partage la connexion du store.
+
+Deux précautions :
+
+- **Extensions** : `vector` et `unaccent` doivent exister avant la première migration, dans un schéma commun à tous les `search_path` (`public` ci-dessus). Sinon la migration de l'index les crée dans le schéma de la première instance, où les autres ne les voient pas.
+- **Schémas** : le schéma de chaque instance doit exister (`CREATE SCHEMA org_a`) ; la migration ne le crée pas.
+
+`TestPostgresSchemaIsolation` (`AMOXTLI_TEST_POSTGRES=1`) vérifie cette isolation : documents, collections et tables restent propres à chaque schéma.
