@@ -611,3 +611,77 @@ func TestCodexCleanupCollectsOrphanedBlobs(t *testing.T) {
 		t.Errorf("the blob of a deleted document must be collected, got %+v", err)
 	}
 }
+
+// TestCodexImageEnrichmentWithBlobStoreOnly checks that a blob store alone,
+// with neither a describer nor an LLM client, keeps the embedded images: they
+// are stored and referenced by their internal URI, without a description.
+func TestCodexImageEnrichmentWithBlobStoreOnly(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	bleveIdx, err := bleveIndex.OpenOrCreate(ctx, filepath.Join(dir, "index.bleve"))
+	if err != nil {
+		t.Fatalf("could not open bleve index: %+v", errors.WithStack(err))
+	}
+	defer bleveIdx.Close()
+
+	store, err := gormStore.NewSQLiteStore(filepath.Join(dir, "data.sqlite"))
+	if err != nil {
+		t.Fatalf("could not open store: %+v", errors.WithStack(err))
+	}
+	defer store.Close()
+
+	blobs, err := blobfs.NewStore(filepath.Join(dir, "blobs"))
+	if err != nil {
+		t.Fatalf("could not open blob store: %+v", errors.WithStack(err))
+	}
+
+	codex, err := New(ctx,
+		WithStore(store),
+		WithIndexers(Indexer{ID: "bleve", Index: bleveIdx, Weight: 1}),
+		WithBlobStore(blobs),
+		WithImageEnrichment(),
+		WithDisableHyDE(),
+		WithDisableJudge(),
+	)
+	if err != nil {
+		t.Fatalf("could not create codex: %+v", errors.WithStack(err))
+	}
+	defer codex.Close()
+
+	collID, err := codex.CreateCollection(ctx, "test")
+	if err != nil {
+		t.Fatalf("could not create collection: %+v", errors.WithStack(err))
+	}
+
+	document := "# Architecture\n\n![Schéma](data:image/png;base64," +
+		base64.StdEncoding.EncodeToString(testPNG128) + ")\n"
+	source, _ := url.Parse("file:///corpus/note.md")
+
+	if err := codex.IndexFileSync(ctx, collID, "note.md", strings.NewReader(document), WithIndexFileSource(source)); err != nil {
+		t.Fatalf("could not index file: %+v", errors.WithStack(err))
+	}
+
+	documents, _, err := codex.ListDocuments(ctx, collID, ListDocumentsOptions{})
+	if err != nil || len(documents) != 1 {
+		t.Fatalf("expected one document, got %d: %+v", len(documents), err)
+	}
+
+	stored, err := codex.GetDocument(ctx, documents[0].ID())
+	if err != nil {
+		t.Fatalf("could not get document: %+v", errors.WithStack(err))
+	}
+	content, err := stored.Content()
+	if err != nil {
+		t.Fatalf("could not read document: %+v", errors.WithStack(err))
+	}
+	if !strings.Contains(string(content), "amoxtli://images/") {
+		t.Fatalf("expected the image to be referenced by its internal URI, got:\n%s", content)
+	}
+
+	hash := blob.Hash(strings.TrimSuffix(strings.SplitN(strings.SplitN(string(content), "amoxtli://images/", 2)[1], ")", 2)[0], " "))
+	referrers, err := codex.DocumentsReferencingBlob(ctx, hash)
+	if err != nil || len(referrers) != 1 {
+		t.Errorf("expected the document to reference the blob %q, got %v %+v", hash, referrers, err)
+	}
+}

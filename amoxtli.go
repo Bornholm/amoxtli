@@ -206,16 +206,19 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 		}
 
 		// Without an explicit describer, the codex LLM client serves as the
-		// vision model — it must then accept image attachments.
-		if imagetext.NewOptions(enrichOptions...).Describer == nil {
-			if opts.llmClient == nil {
-				return nil, errors.New("amoxtli: WithImageEnrichment requires either imagetext.WithDescriber or WithLLMClient")
+		// vision model — it must then accept image attachments. With neither,
+		// a blob store alone still stores and references the images, without
+		// describing them.
+		if enrich := imagetext.NewOptions(enrichOptions...); enrich.Describer == nil {
+			switch {
+			case opts.llmClient != nil:
+				enrichOptions = append(
+					[]imagetext.OptionFunc{imagetext.WithDescriber(vision.NewLLMDescriber(opts.llmClient))},
+					enrichOptions...,
+				)
+			case enrich.Blobs == nil:
+				return nil, errors.New("amoxtli: WithImageEnrichment requires imagetext.WithDescriber, WithLLMClient or a blob store")
 			}
-
-			enrichOptions = append(
-				[]imagetext.OptionFunc{imagetext.WithDescriber(vision.NewLLMDescriber(opts.llmClient))},
-				enrichOptions...,
-			)
 		}
 
 		managerOpts = append(managerOpts, ingest.WithManagerImageEnrichment(imagetext.New(enrichOptions...)))

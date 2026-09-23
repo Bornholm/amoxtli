@@ -211,7 +211,9 @@ func WithSourceCode(registry *sourcecode.Registry) Option {
 // are left alone.
 //
 // Without an explicit describer, one is built from the LLM client set by
-// WithLLMClient, which must then support image attachments. Pass a dedicated
+// WithLLMClient, which must then support image attachments. With neither, a
+// blob store (WithBlobStore) alone keeps the images displayable, stored and
+// referenced but not described. Pass a dedicated
 // vision model — and the description cache — with imagetext.WithDescriber:
 //
 //	amoxtli.WithImageEnrichment(
