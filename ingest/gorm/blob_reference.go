@@ -4,6 +4,9 @@ import (
 	"context"
 
 	"github.com/bornholm/amoxtli/blob"
+	"github.com/bornholm/amoxtli/ingest"
+	"github.com/bornholm/amoxtli/model"
+	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -138,3 +141,24 @@ func (s *Store) ListReferencedBlobs(ctx context.Context, fn func(blob.Hash) erro
 		lastHash = hashes[len(hashes)-1]
 	}
 }
+
+// DocumentsReferencingBlob implements ingest.BlobReferrerLister.
+func (s *Store) DocumentsReferencingBlob(ctx context.Context, hash string) ([]model.DocumentID, error) {
+	var ids []string
+
+	err := s.withRetry(ctx, false, func(ctx context.Context, db *gorm.DB) error {
+		return errors.WithStack(db.Model(&DocumentBlob{}).Where("hash = ?", hash).Pluck("document_id", &ids).Error)
+	}, sqlite3.LOCKED, sqlite3.BUSY)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	documents := make([]model.DocumentID, 0, len(ids))
+	for _, id := range ids {
+		documents = append(documents, model.DocumentID(id))
+	}
+
+	return documents, nil
+}
+
+var _ ingest.BlobReferrerLister = &Store{}

@@ -74,6 +74,21 @@ func testBlobReferences(t *testing.T, ctx context.Context, store *Store) {
 
 	assertReferenced(t, ctx, store, first, second)
 
+	referrers, err := store.DocumentsReferencingBlob(ctx, string(first))
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+	if len(referrers) != 2 {
+		t.Errorf("expected the two documents referencing the shared image, got %v", referrers)
+	}
+	referrers, err = store.DocumentsReferencingBlob(ctx, string(second))
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+	if len(referrers) != 1 || referrers[0] == docB {
+		t.Errorf("expected only document A to reference the second image, got %v", referrers)
+	}
+
 	// Re-indexing document A on a content that dropped the second image must
 	// drop the reference with it. Re-indexing yields a new document ID, so the
 	// references of the replaced row have to go by source, not by ID.

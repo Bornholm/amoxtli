@@ -3,6 +3,7 @@ package amoxtli
 import (
 	"context"
 
+	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/ingest"
 	"github.com/bornholm/amoxtli/model"
@@ -187,4 +188,20 @@ func (c *Codex) SetDocumentCollections(ctx context.Context, id model.DocumentID,
 	}
 
 	return nil
+}
+
+// DocumentsReferencingBlob returns the documents whose content references the
+// blob — to allow an image only to the users who may read one of them.
+func (c *Codex) DocumentsReferencingBlob(ctx context.Context, hash blob.Hash) ([]model.DocumentID, error) {
+	lister, ok := c.store.(ingest.BlobReferrerLister)
+	if !ok {
+		return nil, errors.WithStack(ErrUnsupported)
+	}
+
+	ids, err := lister.DocumentsReferencingBlob(ctx, string(hash))
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return ids, nil
 }

@@ -106,3 +106,12 @@ type DocumentUpdater interface {
 	// SetDocumentCollections replaces the collections a document belongs to.
 	SetDocumentCollections(ctx context.Context, id model.DocumentID, collections []model.CollectionID) error
 }
+
+// BlobReferrerLister is an optional capability of a Store able to tell which
+// documents reference a blob — to check that an image is reachable through a
+// document a user may read, typically.
+type BlobReferrerLister interface {
+	// DocumentsReferencingBlob returns the IDs of the documents whose content
+	// references the blob.
+	DocumentsReferencingBlob(ctx context.Context, hash string) ([]model.DocumentID, error)
+}
