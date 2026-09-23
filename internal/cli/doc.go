@@ -43,7 +43,7 @@ func toDocInfo(doc model.PersistedDocument) docInfo {
 		ID:        string(doc.ID()),
 		ETag:      doc.ETag(),
 		CreatedAt: doc.CreatedAt().Format("2006-01-02 15:04:05"),
-		Metadata:  model.Metadata(doc),
+		Metadata:  model.PublicMetadata(doc),
 	}
 	if doc.Source() != nil {
 		info.Source = doc.Source().String()

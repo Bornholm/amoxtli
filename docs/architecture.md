@@ -92,9 +92,16 @@ différentiel qui empêche deux implémentations de diverger silencieusement.
   jamais, sans jamais produire d'erreur (évaluation totale).
 - **Conteneurs** : une valeur tableau ou objet est présente mais jamais égale ni
   ordonnable — `Eq("tags", "go")` ne matche pas `tags: ["go", "db"]`.
-  L'appartenance à un tableau demanderait un opérateur `Contains` explicite,
-  volontairement hors périmètre pour l'instant.
-- **`In` vide** : `In(key)` sans valeur ne matche rien, comme `IN ()` en SQL.
+  L'appartenance à un tableau passe par `Any` : `Any("tags", "go", "rust")`
+  matche `tags: ["go", "db"]`. Les éléments suivent les règles scalaires
+  ci-dessus ; un élément conteneur ne matche jamais, une valeur scalaire non
+  plus (`Any("tags", "go")` ne matche pas `tags: "go"`).
+- **`In` et `Any` vides** : sans valeur, ils ne matchent rien, comme `IN ()` en
+  SQL.
+- **Clés réservées** : les clés préfixées par `_` (listes de contrôle d'accès,
+  typiquement) sont stockées, indexées et filtrables comme les autres, mais
+  jamais affichées : `model.PublicMetadata` les retire des sorties de la CLI et
+  du serveur MCP.
 - **Clés** : restreintes à `index.KeyPattern` (`^[A-Za-z0-9_-]{1,128}$`) et
   validées avant évaluation (`ErrInvalidFilterKey`). Les clés proviennent
   souvent d'une surface exposée (flags CLI, outil MCP `search`) ; la restriction

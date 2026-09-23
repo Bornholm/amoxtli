@@ -131,6 +131,25 @@ func buildCondition(condition index.Condition, a *args) string {
 
 		return "(" + strings.Join(clauses, " OR ") + ")"
 
+	case index.OpAny:
+		elements := index.InValues(condition.Value)
+		if len(elements) == 0 {
+			return alwaysFalse
+		}
+
+		clauses := make([]string, 0, len(elements))
+		for _, element := range elements {
+			clause, ok := containsElement(condition.Key, element, a)
+			if ok {
+				clauses = append(clauses, clause)
+			}
+		}
+		if len(clauses) == 0 {
+			return alwaysFalse
+		}
+
+		return "(" + strings.Join(clauses, " OR ") + ")"
+
 	case index.OpGt:
 		return ordered(condition.Key, condition.Value, ">", a)
 	case index.OpGte:
@@ -142,6 +161,30 @@ func buildCondition(condition index.Condition, a *args) string {
 	}
 
 	return alwaysFalse
+}
+
+// containsElement tests that the array stored under key holds operand, with
+// jsonb containment: {"k": ["a", "b"]} contains {"k": ["a"]} while a scalar
+// {"k": "a"} does not, which is exactly the Any semantics — and the form the
+// GIN jsonb_path_ops index on the metadata serves. jsonb compares numbers by
+// value (3 = 3.0) and never equates values of different types.
+func containsElement(key string, operand any, a *args) (string, bool) {
+	var element string
+
+	switch value := filternorm.Value(operand).(type) {
+	case bool:
+		element = "to_jsonb(" + a.bind(value) + "::boolean)"
+	case string:
+		element = "to_jsonb(" + a.bind(value) + "::text)"
+	default:
+		number, ok := filternorm.Float(value)
+		if !ok {
+			return "", false
+		}
+		element = "to_jsonb(" + a.bind(number) + "::numeric)"
+	}
+
+	return "COALESCE(dm.metadata @> jsonb_build_object(" + a.bind(key) + "::text, jsonb_build_array(" + element + ")), FALSE)", true
 }
 
 // exists tests key presence. jsonb_exists is true for a key explicitly set to

@@ -181,6 +181,26 @@ func buildCondition(condition index.Condition) (string, []any) {
 
 		return "(" + strings.Join(clauses, " OR ") + ")", args
 
+	case index.OpAny:
+		elements := index.InValues(condition.Value)
+		if len(elements) == 0 {
+			return alwaysFalse, nil
+		}
+
+		clauses := make([]string, 0, len(elements))
+		args := []any{key, key}
+		for _, element := range elements {
+			clause, elementArgs := elementEquals(element)
+			clauses = append(clauses, clause)
+			args = append(args, elementArgs...)
+		}
+
+		// json_each on a scalar path yields the scalar itself: the json_type
+		// guard keeps Any from matching a non-array value.
+		return "(json_type(" + metadataJSON + ", " + jsonPath + ") = 'array' AND EXISTS (" +
+			"SELECT 1 FROM json_each(" + metadataJSON + ", " + jsonPath + ") je WHERE " +
+			strings.Join(clauses, " OR ") + "))", args
+
 	case index.OpGt:
 		return ordered(key, condition.Value, ">")
 	case index.OpGte:
@@ -220,6 +240,28 @@ func equals(key string, operand any) (string, []any) {
 			return alwaysFalse, nil
 		}
 		return "(" + typeOf + " IN ('integer','real') AND " + extract + " = ?)", []any{key, key, number}
+	}
+}
+
+// elementEquals translates the equality of an array element (a json_each row
+// aliased je) with an operand, with the same type guards as equals.
+func elementEquals(operand any) (string, []any) {
+	switch value := filternorm.Value(operand).(type) {
+	case bool:
+		if value {
+			return "je.type = 'true'", nil
+		}
+		return "je.type = 'false'", nil
+
+	case string:
+		return "(je.type = 'text' AND je.value = ?)", []any{value}
+
+	default:
+		number, ok := filternorm.Float(value)
+		if !ok {
+			return alwaysFalse, nil
+		}
+		return "(je.type IN ('integer','real') AND je.value = ?)", []any{number}
 	}
 }
 

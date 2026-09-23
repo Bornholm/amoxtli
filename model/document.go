@@ -2,6 +2,7 @@ package model
 
 import (
 	"net/url"
+	"strings"
 
 	"github.com/rs/xid"
 )
@@ -43,4 +44,32 @@ func Metadata(d Document) map[string]any {
 		return m.Metadata()
 	}
 	return nil
+}
+
+// ReservedMetadataPrefix marks the metadata keys reserved to the application
+// embedding the library — access control lists, typically. They are stored,
+// indexed and filterable like any other key, but never shown: PublicMetadata
+// leaves them out.
+const ReservedMetadataPrefix = "_"
+
+// PublicMetadata returns the metadata of d without its reserved keys (see
+// ReservedMetadataPrefix), or nil when nothing remains.
+func PublicMetadata(d Document) map[string]any {
+	metadata := Metadata(d)
+	if len(metadata) == 0 {
+		return nil
+	}
+
+	public := make(map[string]any, len(metadata))
+	for k, v := range metadata {
+		if !strings.HasPrefix(k, ReservedMetadataPrefix) {
+			public[k] = v
+		}
+	}
+
+	if len(public) == 0 {
+		return nil
+	}
+
+	return public
 }

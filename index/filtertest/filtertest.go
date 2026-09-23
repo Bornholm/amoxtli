@@ -184,6 +184,22 @@ var Cases = []Case{
 	{"exists-array-metadata", index.Filter{index.Exists("tags")}, map[string]any{"tags": []any{"go"}}, true},
 	{"gt-array-metadata", index.Filter{index.Gt("tags", "go")}, map[string]any{"tags": []any{"go"}}, false},
 	{"in-array-metadata", index.Filter{index.In("tags", "go")}, map[string]any{"tags": []any{"go"}}, false},
+
+	// --- Any (array membership) ----------------------------------------------
+	{"any-string-match", index.Filter{index.Any("tags", "go", "rust")}, map[string]any{"tags": []any{"db", "go"}}, true},
+	{"any-string-no-match", index.Filter{index.Any("tags", "rust")}, map[string]any{"tags": []any{"db", "go"}}, false},
+	{"any-string-slice-metadata", index.Filter{index.Any("tags", "go")}, map[string]any{"tags": []string{"go"}}, true},
+	{"any-scalar-metadata", index.Filter{index.Any("tags", "go")}, map[string]any{"tags": "go"}, false},
+	{"any-empty-operand", index.Filter{index.Any("tags")}, map[string]any{"tags": []any{"go"}}, false},
+	{"any-empty-array", index.Filter{index.Any("tags", "go")}, map[string]any{"tags": []any{}}, false},
+	{"any-missing-key", index.Filter{index.Any("tags", "go")}, map[string]any{}, false},
+	{"any-numbers-int-vs-float", index.Filter{index.Any("ns", 3)}, map[string]any{"ns": []any{1.0, 3.0}}, true},
+	{"any-cross-type", index.Filter{index.Any("ns", "3")}, map[string]any{"ns": []any{3.0}}, false},
+	{"any-bool", index.Filter{index.Any("bs", true)}, map[string]any{"bs": []any{false, true}}, true},
+	{"any-bool-no-match", index.Filter{index.Any("bs", true)}, map[string]any{"bs": []any{false}}, false},
+	{"any-date-offset", index.Filter{index.Any("ds", refOffset)}, map[string]any{"ds": []any{refTime}}, true},
+	{"any-nested-array", index.Filter{index.Any("tags", "go")}, map[string]any{"tags": []any{[]any{"go"}}}, false},
+	{"any-case-sensitive", index.Filter{index.Any("tags", "Go")}, map[string]any{"tags": []any{"go"}}, false},
 	{"eq-object-metadata", index.Filter{index.Eq("o", "x")}, map[string]any{"o": map[string]any{"k": "x"}}, false},
 
 	// --- Conjunction --------------------------------------------------------

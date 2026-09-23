@@ -15,6 +15,7 @@ package filternorm
 
 import (
 	"cmp"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -58,8 +59,10 @@ func Value(v any) any {
 // applied on the write path so that what is persisted is directly comparable by
 // both the Go evaluator and the SQL translators.
 //
-// Nested values (slices, maps) are copied as-is: filters do not reach into
-// containers, so there is nothing to canonicalize there.
+// A top-level slice becomes a []any whose elements are canonicalized by Value
+// in turn, since the Any operator compares them one by one. Deeper values
+// (maps, slices nested in slices) are copied as-is: no filter reaches into
+// them.
 func Metadata(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
@@ -67,10 +70,47 @@ func Metadata(m map[string]any) map[string]any {
 
 	normalized := make(map[string]any, len(m))
 	for k, v := range m {
+		if elements, ok := Elements(v); ok {
+			canonical := make([]any, len(elements))
+			for i, e := range elements {
+				canonical[i] = Value(e)
+			}
+			normalized[k] = canonical
+			continue
+		}
 		normalized[k] = Value(v)
 	}
 
 	return normalized
+}
+
+// Elements returns the elements of v when it is a slice or an array (a []byte
+// excepted, which is a value rather than a list), and false otherwise.
+func Elements(v any) ([]any, bool) {
+	switch s := v.(type) {
+	case nil, []byte:
+		return nil, false
+	case []any:
+		return s, true
+	case []string:
+		out := make([]any, len(s))
+		for i, e := range s {
+			out[i] = e
+		}
+		return out, true
+	}
+
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		return nil, false
+	}
+
+	out := make([]any, rv.Len())
+	for i := range out {
+		out[i] = rv.Index(i).Interface()
+	}
+
+	return out, true
 }
 
 // Float reports the numeric value of v, unifying every Go numeric type into

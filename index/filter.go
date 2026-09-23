@@ -30,6 +30,9 @@ const (
 	OpLte FilterOp = "lte"
 	// OpIn matches when the metadata value equals any element of the value slice.
 	OpIn FilterOp = "in"
+	// OpAny matches when the metadata value is an array sharing at least one
+	// element with the value slice.
+	OpAny FilterOp = "any"
 	// OpExists matches on key presence only, whatever the value. The condition
 	// value is a bool: true requires the key, false requires its absence.
 	OpExists FilterOp = "exists"
@@ -80,8 +83,14 @@ type Condition struct {
 //
 //   - Containers. A metadata value that is a slice or a map is present but
 //     never equal nor ordered, so Eq("tags", "go") does not match
-//     tags: ["go", "db"]. Membership in an array is deliberately left out of
-//     this version; it would need an explicit Contains operator.
+//     tags: ["go", "db"]. Membership in an array is what OpAny is for:
+//     Any("tags", "go", "rust") matches tags: ["go", "db"]. Its elements are
+//     compared with the scalar rules above (numbers unified, dates
+//     canonicalized, mixed types never equal); an element that is itself a
+//     container never matches, and neither does a scalar metadata value —
+//     Any("tags", "go") does not match tags: "go".
+//
+//   - Empty Any. Any(key) without any value matches nothing.
 //
 //   - Empty In. In(key) without any value matches nothing, like SQL IN ().
 //
@@ -157,11 +166,11 @@ func (c Condition) canonical() string {
 }
 
 func canonicalOperand(op FilterOp, value any) string {
-	if op != OpIn {
+	if op != OpIn && op != OpAny {
 		return canonicalScalar(value)
 	}
 
-	// OpIn's operand is a set: the declaration order carries no meaning.
+	// The operand of OpIn and OpAny is a set: the declaration order carries no meaning.
 	elements := toSlice(value)
 
 	tokens := make([]string, 0, len(elements))
@@ -238,6 +247,20 @@ func (c Condition) matches(meta map[string]any) bool {
 		}
 		return false
 
+	case OpAny:
+		elements, ok := filternorm.Elements(value)
+		if !ok {
+			return false
+		}
+		for _, candidate := range toSlice(c.Value) {
+			for _, element := range elements {
+				if filternorm.Equal(element, candidate) {
+					return true
+				}
+			}
+		}
+		return false
+
 	case OpGt, OpGte, OpLt, OpLte:
 		cmp, ok := filternorm.Compare(value, c.Value)
 		if !ok {
@@ -259,7 +282,7 @@ func (c Condition) matches(meta map[string]any) bool {
 	return false
 }
 
-// InValues normalizes the operand of an OpIn condition into the candidate
+// InValues normalizes the operand of an OpIn or OpAny condition into the candidate
 // values it stands for. Backends translating a filter need it to expand the
 // membership test the same way the Go evaluator does.
 func InValues(v any) []any { return toSlice(v) }
@@ -306,6 +329,12 @@ func Lte(key string, value any) Condition { return Condition{Key: key, Op: OpLte
 // nothing.
 func In(key string, values ...any) Condition {
 	return Condition{Key: key, Op: OpIn, Value: values}
+}
+
+// Any builds an array membership condition: the metadata value is an array
+// holding at least one of values. Without values it matches nothing.
+func Any(key string, values ...any) Condition {
+	return Condition{Key: key, Op: OpAny, Value: values}
 }
 
 // Exists builds a presence condition: the document carries the key, whatever

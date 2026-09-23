@@ -472,7 +472,7 @@ func (s *Server) handleListDocuments(ctx context.Context, _ *mcp.CallToolRequest
 
 	out := listDocumentsOutput{Total: total, Documents: make([]documentHeader, 0, len(docs))}
 	for _, doc := range docs {
-		header := documentHeader{ID: string(doc.ID()), Metadata: model.Metadata(doc)}
+		header := documentHeader{ID: string(doc.ID()), Metadata: model.PublicMetadata(doc)}
 		if doc.Source() != nil {
 			header.Source = doc.Source().String()
 		}
@@ -616,7 +616,7 @@ func (s *Server) renderResults(ctx context.Context, results []*index.SearchResul
 				// first one that carries metadata settles it. Content() above
 				// already dereferences that same parent document.
 				if doc.Metadata == nil {
-					doc.Metadata = model.Metadata(s.Document())
+					doc.Metadata = model.PublicMetadata(s.Document())
 				}
 			}
 			doc.Sections = append(doc.Sections, section)
