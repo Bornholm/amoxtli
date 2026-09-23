@@ -2,7 +2,9 @@ package gorm
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/bornholm/amoxtli/task"
 	"github.com/bornholm/go-x/slogx"
 	"github.com/pkg/errors"
+	"github.com/rs/xid"
 	"gorm.io/gorm"
 )
 
@@ -19,31 +22,93 @@ import (
 // always persisted immediately.
 const progressPersistInterval = time.Second
 
-type queuedTask struct {
-	task   task.Task
-	ctx    context.Context
-	cancel context.CancelFunc
-}
+const (
+	defaultLeaseDuration = time.Minute
+	defaultPollInterval  = 2 * time.Second
+)
 
 // TaskRunner is a persistent [task.Runner] backed by a gorm database. Scheduled
-// tasks are serialized (through their json.Marshaler) and stored, so pending
-// tasks — and tasks that were still running when the process stopped — are
-// resumed on the next Run. Deserialization relies on factories registered with
-// RegisterFactory (task.PersistentRunner).
+// tasks are serialized (through their json.Marshaler) and stored; the database
+// is the only queue, so several runners — in one process or in several — can
+// share it and split the work between them.
+//
+// A worker claims a pending task by atomically moving it to running under a
+// lease it owns, and keeps extending the lease while the handler runs. A task
+// whose lease expires (its runner crashed or lost the database) goes back to
+// pending and is picked up again, from the start: handlers must be idempotent,
+// which the ingestion handlers are. Leases rely on the clocks of the machines
+// involved: a clock skew larger than the lease margin can make a task run
+// twice.
+//
+// Deserialization relies on factories registered with RegisterFactory
+// (task.PersistentRunner); a task scheduled by this runner is also kept in
+// memory, so it can run here without one.
 type TaskRunner struct {
 	getDatabase func(ctx context.Context) (*gorm.DB, error)
 
 	handlers  syncx.Map[task.Type, task.Handler]
 	factories syncx.Map[task.Type, task.Factory]
 
-	queue     chan queuedTask
+	// local keeps the tasks scheduled by this runner, so they can be executed
+	// here even when their type has no factory.
+	local syncx.Map[task.ID, localTask]
+
+	// wake nudges idle workers when this runner schedules a task, instead of
+	// waiting for the next poll.
+	wake chan struct{}
+
+	queueSize int
 	errOnFull bool
 
 	cancelFuncs syncx.Map[task.ID, context.CancelFunc]
 
-	parallelism     int
+	owner         string
+	parallelism   int
+	leaseDuration time.Duration
+	pollInterval  time.Duration
+
 	cleanupDelay    time.Duration
 	cleanupInterval time.Duration
+}
+
+type localTask struct {
+	task        task.Task
+	scheduledAt time.Time
+}
+
+// Option configures optional aspects of a TaskRunner.
+type Option func(r *TaskRunner)
+
+// WithLeaseDuration sets how long a claimed task stays reserved to its runner
+// without a heartbeat. A crashed runner's tasks are resumed elsewhere once it
+// elapses; the heartbeat extends it every third of its duration.
+func WithLeaseDuration(d time.Duration) Option {
+	return func(r *TaskRunner) {
+		if d > 0 {
+			r.leaseDuration = d
+		}
+	}
+}
+
+// WithPollInterval sets how often idle workers look for tasks scheduled by
+// other runners, and how often expired leases are reclaimed.
+func WithPollInterval(d time.Duration) Option {
+	return func(r *TaskRunner) {
+		if d > 0 {
+			r.pollInterval = d
+		}
+	}
+}
+
+// WithOwner sets the identifier this runner writes in the leases it takes.
+// It must be unique among the runners sharing the database; the default
+// combines the host name, the process id and a random suffix.
+func WithOwner(owner string) Option {
+	return func(r *TaskRunner) {
+		if owner != "" {
+			r.owner = owner
+		}
+	}
 }
 
 // RegisterTask implements [task.Runner].
@@ -57,72 +122,62 @@ func (r *TaskRunner) RegisterFactory(taskType task.Type, factory task.Factory) {
 	r.factories.Store(taskType, factory)
 }
 
-// ScheduleTask implements [task.Runner]. The task is persisted as pending
-// before being enqueued, so it survives a restart even if it is never picked up
-// by a worker in this process.
+// ScheduleTask implements [task.Runner]. The task is persisted as pending and
+// executed by whichever runner sharing the database claims it first.
 func (r *TaskRunner) ScheduleTask(ctx context.Context, tsk task.Task) error {
 	payload, err := tsk.MarshalJSON()
 	if err != nil {
 		return errors.Wrap(err, "could not marshal task payload")
 	}
 
+	now := time.Now()
+
 	row := &Task{
 		ID:          string(tsk.ID()),
 		Type:        string(tsk.Type()),
 		Payload:     payload,
 		Status:      task.StatusPending,
-		ScheduledAt: time.Now(),
+		ScheduledAt: now,
+	}
+
+	if r.errOnFull {
+		pending, err := r.countPending(ctx)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		if pending >= int64(r.queueSize) {
+			row.Status = task.StatusFailed
+			row.FinishedAt = &now
+			row.Error = task.ErrQueueFull.Error()
+			if err := r.save(ctx, row); err != nil {
+				slog.ErrorContext(ctx, "could not persist queue-full task state", slog.Any("error", errors.WithStack(err)))
+			}
+			return errors.WithStack(task.ErrQueueFull)
+		}
 	}
 
 	if err := r.save(ctx, row); err != nil {
 		return errors.WithStack(err)
 	}
 
-	return r.enqueue(ctx, tsk)
-}
+	r.local.Store(tsk.ID(), localTask{task: tsk, scheduledAt: now})
 
-// enqueue wires a cancelable context to the task and pushes it onto the work
-// queue. The context is derived from Background (not the scheduling context) so
-// an in-flight task is not aborted merely because the caller returned; it is
-// canceled through CancelTask or when the whole runner stops.
-func (r *TaskRunner) enqueue(ctx context.Context, tsk task.Task) error {
-	taskID := tsk.ID()
-
-	taskCtx, cancelFn := context.WithCancel(context.Background())
-	r.cancelFuncs.Store(taskID, cancelFn)
-
-	qt := queuedTask{task: tsk, ctx: taskCtx, cancel: cancelFn}
-
-	if r.errOnFull {
-		select {
-		case r.queue <- qt:
-		default:
-			cancelFn()
-			r.cancelFuncs.Delete(taskID)
-			if err := r.markFailed(ctx, taskID, errors.WithStack(task.ErrQueueFull)); err != nil {
-				slog.ErrorContext(ctx, "could not persist queue-full task state", slog.Any("error", errors.WithStack(err)))
-			}
-			return errors.WithStack(task.ErrQueueFull)
-		}
-	} else {
-		r.queue <- qt
+	select {
+	case r.wake <- struct{}{}:
+	default:
 	}
 
 	return nil
 }
 
-// Run implements [task.Runner]. It first resumes persisted work (pending tasks
-// and tasks left running by a previous, interrupted process), then serves the
-// queue with a fixed worker pool until the context is canceled. On shutdown it
-// lets in-flight tasks drain before returning.
+// Run implements [task.Runner]. It serves the shared queue with a fixed worker
+// pool until the context is canceled, reclaiming expired leases along the
+// way. On shutdown it stops claiming and lets in-flight tasks finish before
+// returning.
 func (r *TaskRunner) Run(ctx context.Context) error {
-	// Recover orphans BEFORE starting the workers: any task still marked running
-	// at this point was left behind by a previous, interrupted process (no worker
-	// of this process has claimed anything yet), so it is safe to reset it to
-	// pending. Doing this after workers start would risk clobbering a task this
-	// process is actively running.
-	if err := r.recoverOrphans(ctx); err != nil && ctx.Err() == nil {
-		slog.ErrorContext(ctx, "could not recover orphaned tasks", slog.Any("error", errors.WithStack(err)))
+	if err := r.reclaimExpired(ctx); err != nil && ctx.Err() == nil {
+		slog.ErrorContext(ctx, "could not reclaim expired tasks", slog.Any("error", errors.WithStack(err)))
 	}
 
 	var wg sync.WaitGroup
@@ -130,46 +185,13 @@ func (r *TaskRunner) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case qt, ok := <-r.queue:
-					if !ok {
-						return
-					}
-					r.executeTask(qt)
-				}
-			}
+			r.work(ctx)
 		}()
 	}
 
-	// Enqueue pending work now that workers are consuming the queue (so a large
-	// backlog cannot stall on the buffer). Duplicate enqueues — a task both
-	// scheduled by this process and picked up here — are made harmless by the
-	// claim guard in executeTask.
-	if err := r.enqueuePending(ctx); err != nil && ctx.Err() == nil {
-		slog.ErrorContext(ctx, "could not enqueue pending tasks", slog.Any("error", errors.WithStack(err)))
-	}
-
-	// Cleanup goroutine: purge tasks that finished long enough ago.
-	go func() {
-		ticker := time.NewTicker(r.cleanupInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if err := r.cleanupExpired(ctx); err != nil {
-					slog.WarnContext(ctx, "could not clean up expired tasks", slog.Any("error", errors.WithStack(err)))
-				}
-			}
-		}
-	}()
+	go r.maintain(ctx)
 
 	<-ctx.Done()
-	close(r.queue)
 	wg.Wait()
 
 	if err := ctx.Err(); err != nil {
@@ -178,87 +200,171 @@ func (r *TaskRunner) Run(ctx context.Context) error {
 	return nil
 }
 
-// recoverOrphans resets every task still marked running back to pending. It runs
-// once, before any worker starts, so the only running tasks it can see are those
-// left behind by a previous, interrupted process. They are re-run from the start
-// (the ingestion handlers are idempotent).
-func (r *TaskRunner) recoverOrphans(ctx context.Context) error {
+// work claims and executes tasks until the context is canceled, sleeping
+// between polls when the queue is empty.
+func (r *TaskRunner) work(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		claimed, err := r.claimNext(ctx)
+		if err != nil && ctx.Err() == nil {
+			slog.ErrorContext(ctx, "could not claim task", slog.Any("error", errors.WithStack(err)))
+		}
+
+		if claimed != nil {
+			r.executeTask(claimed)
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.wake:
+		case <-time.After(r.pollInterval):
+		}
+	}
+}
+
+// maintain periodically reclaims expired leases and purges old tasks.
+func (r *TaskRunner) maintain(ctx context.Context) {
+	reclaim := time.NewTicker(r.pollInterval)
+	defer reclaim.Stop()
+
+	cleanup := time.NewTicker(r.cleanupInterval)
+	defer cleanup.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-reclaim.C:
+			if err := r.reclaimExpired(ctx); err != nil && ctx.Err() == nil {
+				slog.WarnContext(ctx, "could not reclaim expired tasks", slog.Any("error", errors.WithStack(err)))
+			}
+		case <-cleanup.C:
+			if err := r.cleanupExpired(ctx); err != nil && ctx.Err() == nil {
+				slog.WarnContext(ctx, "could not clean up expired tasks", slog.Any("error", errors.WithStack(err)))
+			}
+		}
+	}
+}
+
+// reclaimExpired puts back to pending every running task whose lease has
+// expired. A running task without a lease was left by a runner predating
+// leases and is reclaimed as well.
+func (r *TaskRunner) reclaimExpired(ctx context.Context) error {
 	db, err := r.getDatabase(ctx)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
 	res := db.WithContext(ctx).Model(&Task{}).
-		Where("status = ?", task.StatusRunning).
-		Update("status", task.StatusPending)
+		Where("status = ? AND (lease_until IS NULL OR lease_until < ?)", task.StatusRunning, time.Now().UnixMilli()).
+		Updates(map[string]any{"status": task.StatusPending, "lease_owner": "", "lease_until": nil})
 	if res.Error != nil {
 		return errors.WithStack(res.Error)
 	}
 	if res.RowsAffected > 0 {
-		slog.InfoContext(ctx, "reset orphaned running tasks to pending", slog.Int64("count", res.RowsAffected))
+		slog.InfoContext(ctx, "reclaimed tasks with an expired lease", slog.Int64("count", res.RowsAffected))
 	}
 
 	return nil
 }
 
-// enqueuePending re-enqueues every task still marked pending so it is executed
-// by the worker pool. Deserialization uses the registered factories; a task
-// whose type has no factory cannot be rebuilt and is skipped.
-func (r *TaskRunner) enqueuePending(ctx context.Context) error {
+// claimNext claims the oldest pending task this runner can handle, or returns
+// nil when there is none. Candidates are claimed with a conditional update, so
+// runners racing on the same row never both win it.
+func (r *TaskRunner) claimNext(ctx context.Context) (task.Task, error) {
+	var types []string
+	r.handlers.Range(func(t task.Type, _ task.Handler) bool {
+		types = append(types, string(t))
+		return true
+	})
+	if len(types) == 0 {
+		return nil, nil
+	}
+
 	db, err := r.getDatabase(ctx)
 	if err != nil {
-		return errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 
-	var rows []Task
+	var candidates []Task
 	if err := db.WithContext(ctx).
-		Where("status = ?", task.StatusPending).
+		Select("id", "type", "payload").
+		Where("status = ? AND type IN ?", task.StatusPending, types).
 		Order("scheduled_at ASC").
-		Find(&rows).Error; err != nil {
-		return errors.WithStack(err)
+		Limit(max(8, r.parallelism*2)).
+		Find(&candidates).Error; err != nil {
+		return nil, errors.WithStack(err)
 	}
 
-	for i := range rows {
-		row := rows[i]
+	for i := range candidates {
+		row := candidates[i]
 
-		factory, exists := r.factories.Load(task.Type(row.Type))
-		if !exists {
-			slog.WarnContext(ctx, "no factory registered for persisted task type, skipping resume",
-				slog.String("taskID", row.ID), slog.String("taskType", row.Type))
-			continue
-		}
-
-		tsk, err := factory(task.ID(row.ID), row.Payload)
+		claimed, err := r.claim(ctx, task.ID(row.ID))
 		if err != nil {
-			slog.ErrorContext(ctx, "could not rebuild persisted task, skipping resume",
-				slog.String("taskID", row.ID), slog.Any("error", errors.WithStack(err)))
+			return nil, errors.WithStack(err)
+		}
+		if !claimed {
 			continue
 		}
 
-		slog.DebugContext(ctx, "resuming persisted task",
-			slog.String("taskID", row.ID), slog.String("taskType", row.Type))
-
-		if err := r.enqueue(ctx, tsk); err != nil {
-			slog.ErrorContext(ctx, "could not resume persisted task",
-				slog.String("taskID", row.ID), slog.Any("error", errors.WithStack(err)))
+		tsk, err := r.rebuild(task.ID(row.ID), task.Type(row.Type), row.Payload)
+		if err != nil {
+			if err := r.finishOwned(ctx, task.ID(row.ID), task.StatusFailed, err); err != nil {
+				slog.ErrorContext(ctx, "could not persist task state", slog.Any("error", errors.WithStack(err)))
+			}
+			continue
 		}
+
+		return tsk, nil
 	}
 
-	return nil
+	return nil, nil
 }
 
-func (r *TaskRunner) executeTask(qt queuedTask) {
-	tsk := qt.task
-	taskCtx := qt.ctx
+// rebuild returns the in-memory instance of a task this runner scheduled, or
+// rebuilds it from its payload with the registered factory.
+func (r *TaskRunner) rebuild(id task.ID, taskType task.Type, payload []byte) (task.Task, error) {
+	if local, exists := r.local.Load(id); exists {
+		return local.task, nil
+	}
+
+	factory, exists := r.factories.Load(taskType)
+	if !exists {
+		return nil, errors.Errorf("no factory registered for task type '%s'", taskType)
+	}
+
+	tsk, err := factory(id, payload)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not rebuild persisted task")
+	}
+
+	return tsk, nil
+}
+
+func (r *TaskRunner) executeTask(tsk task.Task) {
 	taskID := tsk.ID()
+
+	taskCtx, cancel := context.WithCancel(context.Background())
+	r.cancelFuncs.Store(taskID, cancel)
 
 	ctx := slogx.WithAttrs(taskCtx,
 		slog.String("taskID", string(taskID)),
 		slog.String("taskType", string(tsk.Type())),
 	)
 
+	heartbeatDone := make(chan struct{})
+	go r.heartbeat(ctx, taskID, cancel, heartbeatDone)
+
 	defer func() {
+		close(heartbeatDone)
+		cancel()
 		r.cancelFuncs.Delete(taskID)
+		r.local.Delete(taskID)
 
 		if recovered := recover(); recovered != nil {
 			err, ok := recovered.(error)
@@ -266,30 +372,15 @@ func (r *TaskRunner) executeTask(qt queuedTask) {
 				err = errors.Errorf("%+v", recovered)
 			}
 			slog.ErrorContext(ctx, "recovered panic while running task", slog.Any("error", errors.WithStack(err)))
-			if err := r.markFailed(ctx, taskID, errors.WithStack(err)); err != nil {
+			if err := r.finishOwned(context.Background(), taskID, task.StatusFailed, errors.WithStack(err)); err != nil {
 				slog.ErrorContext(ctx, "could not persist recovered task state", slog.Any("error", errors.WithStack(err)))
 			}
 		}
 	}()
 
-	// Atomically claim the task: transition pending -> running only if it is
-	// still pending. A task can legitimately be enqueued twice (scheduled in
-	// this process while also being resumed at startup, or resumed by several
-	// runners sharing the database); the claim guard ensures exactly one of
-	// those executions proceeds.
-	claimed, err := r.claim(ctx, taskID)
-	if err != nil {
-		slog.ErrorContext(ctx, "could not claim task", slog.Any("error", errors.WithStack(err)))
-		return
-	}
-	if !claimed {
-		slog.DebugContext(ctx, "task already claimed, skipping duplicate execution")
-		return
-	}
-
 	handler, exists := r.handlers.Load(tsk.Type())
 	if !exists {
-		if err := r.markFailed(ctx, taskID, errors.Errorf("no handler registered for task type '%s'", tsk.Type())); err != nil {
+		if err := r.finishOwned(ctx, taskID, task.StatusFailed, errors.Errorf("no handler registered for task type '%s'", tsk.Type())); err != nil {
 			slog.ErrorContext(ctx, "could not persist task state", slog.Any("error", errors.WithStack(err)))
 		}
 		return
@@ -313,7 +404,7 @@ func (r *TaskRunner) executeTask(qt queuedTask) {
 			if !dirty {
 				return
 			}
-			if err := r.updateState(ctx, taskID, map[string]any{"progress": progress, "message": message}); err != nil {
+			if err := r.updateOwned(context.Background(), taskID, map[string]any{"progress": progress, "message": message}); err != nil {
 				slog.WarnContext(ctx, "could not persist task progress", slog.Any("error", errors.WithStack(err)))
 			}
 			lastPersist = time.Now()
@@ -342,14 +433,17 @@ func (r *TaskRunner) executeTask(qt queuedTask) {
 
 	start := time.Now()
 
-	err = handler.Handle(taskCtx, tsk, events)
+	err := handler.Handle(taskCtx, tsk, events)
 
 	close(events)
 	eventsWg.Wait()
 
+	// The terminal writes below are guarded by the lease: when the task was
+	// canceled elsewhere, or its lease was lost and the task resumed by another
+	// runner, they are no-ops.
 	if errors.Is(err, task.ErrCanceled) {
 		slog.DebugContext(ctx, "task was canceled")
-		if err := r.markFailed(ctx, taskID, errors.WithStack(task.ErrCanceled)); err != nil {
+		if err := r.finishOwned(context.Background(), taskID, task.StatusFailed, errors.WithStack(task.ErrCanceled)); err != nil {
 			slog.ErrorContext(ctx, "could not persist canceled task state", slog.Any("error", errors.WithStack(err)))
 		}
 		return
@@ -358,24 +452,57 @@ func (r *TaskRunner) executeTask(qt queuedTask) {
 	if err != nil {
 		err = errors.WithStack(err)
 		slog.ErrorContext(ctx, "task failed", slog.Any("error", err))
-		if err := r.markFailed(ctx, taskID, err); err != nil {
+		if err := r.finishOwned(context.Background(), taskID, task.StatusFailed, err); err != nil {
 			slog.ErrorContext(ctx, "could not persist failed task state", slog.Any("error", errors.WithStack(err)))
 		}
 		return
 	}
 
 	slog.DebugContext(ctx, "task finished", slog.Duration("duration", time.Since(start)))
-	now := time.Now()
-	if err := r.updateState(ctx, taskID, map[string]any{
-		"status":      task.StatusSucceeded,
-		"finished_at": &now,
-		"progress":    float32(1),
-	}); err != nil {
+	if err := r.finishOwned(context.Background(), taskID, task.StatusSucceeded, nil); err != nil {
 		slog.ErrorContext(ctx, "could not persist succeeded task state", slog.Any("error", errors.WithStack(err)))
 	}
 }
 
-// CancelTask implements [task.Runner].
+// heartbeat extends the lease of a running task until done is closed. When
+// the lease can no longer be extended — the task was canceled by another
+// runner, or its lease expired and another runner took it — the task's
+// context is canceled.
+func (r *TaskRunner) heartbeat(ctx context.Context, id task.ID, cancel context.CancelFunc, done <-chan struct{}) {
+	ticker := time.NewTicker(r.leaseDuration / 3)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			db, err := r.getDatabase(ctx)
+			if err != nil {
+				slog.WarnContext(ctx, "could not extend task lease", slog.Any("error", errors.WithStack(err)))
+				continue
+			}
+
+			res := db.WithContext(context.Background()).Model(&Task{}).
+				Where("id = ? AND status = ? AND lease_owner = ?", string(id), task.StatusRunning, r.owner).
+				Update("lease_until", r.leaseDeadline())
+			if res.Error != nil {
+				slog.WarnContext(ctx, "could not extend task lease", slog.Any("error", errors.WithStack(res.Error)))
+				continue
+			}
+
+			if res.RowsAffected == 0 {
+				slog.InfoContext(ctx, "task lease lost or task canceled, stopping it")
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+// CancelTask implements [task.Runner]. The task is marked failed with
+// ErrCanceled; a task running in another runner is stopped by that runner's
+// next heartbeat.
 func (r *TaskRunner) CancelTask(ctx context.Context, id task.ID) error {
 	state, err := r.GetTaskState(ctx, id)
 	if err != nil {
@@ -386,14 +513,28 @@ func (r *TaskRunner) CancelTask(ctx context.Context, id task.ID) error {
 		return errors.WithStack(task.ErrCanceled)
 	}
 
-	if cancelFn, exists := r.cancelFuncs.Load(id); exists {
-		cancelFn()
-		r.cancelFuncs.Delete(id)
-	}
-
-	if err := r.markFailed(ctx, id, errors.WithStack(task.ErrCanceled)); err != nil {
+	db, err := r.getDatabase(ctx)
+	if err != nil {
 		return errors.WithStack(err)
 	}
+
+	now := time.Now()
+	if err := db.WithContext(ctx).Model(&Task{}).
+		Where("id = ? AND status IN ?", string(id), []string{task.StatusPending, task.StatusRunning}).
+		Updates(map[string]any{
+			"status":      task.StatusFailed,
+			"finished_at": &now,
+			"error":       task.ErrCanceled.Error(),
+			"lease_owner": "",
+			"lease_until": nil,
+		}).Error; err != nil {
+		return errors.WithStack(err)
+	}
+
+	if cancelFn, exists := r.cancelFuncs.Load(id); exists {
+		cancelFn()
+	}
+	r.local.Delete(id)
 
 	return nil
 }
@@ -450,6 +591,10 @@ func (r *TaskRunner) ListTasks(ctx context.Context) ([]task.StateHeader, error) 
 
 // --- persistence helpers ---
 
+func (r *TaskRunner) leaseDeadline() int64 {
+	return time.Now().Add(r.leaseDuration).UnixMilli()
+}
+
 func (r *TaskRunner) save(ctx context.Context, row *Task) error {
 	db, err := r.getDatabase(ctx)
 	if err != nil {
@@ -461,9 +606,23 @@ func (r *TaskRunner) save(ctx context.Context, row *Task) error {
 	return nil
 }
 
-// claim atomically transitions a task from pending to running, returning true
-// only if this call performed the transition. It is the guard that makes a
-// task safe to enqueue more than once.
+func (r *TaskRunner) countPending(ctx context.Context) (int64, error) {
+	db, err := r.getDatabase(ctx)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	var count int64
+	if err := db.WithContext(ctx).Model(&Task{}).Where("status = ?", task.StatusPending).Count(&count).Error; err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	return count, nil
+}
+
+// claim atomically transitions a task from pending to running under a lease
+// owned by this runner, returning true only if this call performed the
+// transition.
 func (r *TaskRunner) claim(ctx context.Context, id task.ID) (bool, error) {
 	db, err := r.getDatabase(ctx)
 	if err != nil {
@@ -471,13 +630,52 @@ func (r *TaskRunner) claim(ctx context.Context, id task.ID) (bool, error) {
 	}
 	res := db.WithContext(ctx).Model(&Task{}).
 		Where("id = ? AND status = ?", string(id), task.StatusPending).
-		Updates(map[string]any{"status": task.StatusRunning})
+		Updates(map[string]any{
+			"status":      task.StatusRunning,
+			"lease_owner": r.owner,
+			"lease_until": r.leaseDeadline(),
+		})
 	if res.Error != nil {
 		return false, errors.WithStack(res.Error)
 	}
 	return res.RowsAffected == 1, nil
 }
 
+// updateOwned updates a task only while it is running under this runner's
+// lease.
+func (r *TaskRunner) updateOwned(ctx context.Context, id task.ID, fields map[string]any) error {
+	db, err := r.getDatabase(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := db.WithContext(ctx).Model(&Task{}).
+		Where("id = ? AND status = ? AND lease_owner = ?", string(id), task.StatusRunning, r.owner).
+		Updates(fields).Error; err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+// finishOwned writes the terminal state of a task this runner holds the
+// lease of, and releases the lease.
+func (r *TaskRunner) finishOwned(ctx context.Context, id task.ID, status task.Status, cause error) error {
+	now := time.Now()
+	fields := map[string]any{
+		"status":      status,
+		"finished_at": &now,
+		"lease_owner": "",
+		"lease_until": nil,
+	}
+	if status == task.StatusSucceeded {
+		fields["progress"] = float32(1)
+	}
+	if cause != nil {
+		fields["error"] = cause.Error()
+	}
+	return r.updateOwned(ctx, id, fields)
+}
+
+// updateState updates a task unconditionally.
 func (r *TaskRunner) updateState(ctx context.Context, id task.ID, fields map[string]any) error {
 	db, err := r.getDatabase(ctx)
 	if err != nil {
@@ -487,15 +685,6 @@ func (r *TaskRunner) updateState(ctx context.Context, id task.ID, fields map[str
 		return errors.WithStack(err)
 	}
 	return nil
-}
-
-func (r *TaskRunner) markFailed(ctx context.Context, id task.ID, cause error) error {
-	now := time.Now()
-	return r.updateState(ctx, id, map[string]any{
-		"status":      task.StatusFailed,
-		"finished_at": &now,
-		"error":       cause.Error(),
-	})
 }
 
 func (r *TaskRunner) getRow(ctx context.Context, id task.ID) (*Task, error) {
@@ -528,6 +717,15 @@ func (r *TaskRunner) cleanupExpired(ctx context.Context) error {
 		return errors.WithStack(err)
 	}
 
+	// Tasks scheduled here but run (or purged) elsewhere are never deleted by
+	// executeTask: drop them once they are old enough to be gone.
+	r.local.Range(func(id task.ID, local localTask) bool {
+		if local.scheduledAt.Before(cutoff) {
+			r.local.Delete(id)
+		}
+		return true
+	})
+
 	return nil
 }
 
@@ -551,28 +749,44 @@ func rowToState(row *Task) *task.State {
 	return state
 }
 
+func defaultOwner() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s/%d/%s", host, os.Getpid(), xid.New().String())
+}
+
 // NewTaskRunner creates a persistent runner backed by db. The schema is migrated
 // lazily on the first database access. Register the task handlers with
 // RegisterTask and the deserialization factories with RegisterFactory before
 // calling Run so pending tasks can be resumed.
-func NewTaskRunner(db *gorm.DB, parallelism int, cleanupDelay time.Duration, cleanupInterval time.Duration) *TaskRunner {
-	return NewTaskRunnerWithQueue(db, parallelism, 10_000, false, cleanupDelay, cleanupInterval)
+func NewTaskRunner(db *gorm.DB, parallelism int, cleanupDelay time.Duration, cleanupInterval time.Duration, funcs ...Option) *TaskRunner {
+	return NewTaskRunnerWithQueue(db, parallelism, 10_000, false, cleanupDelay, cleanupInterval, funcs...)
 }
 
-// NewTaskRunnerWithQueue is NewTaskRunner with control over the in-memory queue
-// size and whether ScheduleTask fails (ErrQueueFull) when the queue is full.
-func NewTaskRunnerWithQueue(db *gorm.DB, parallelism int, queueSize int, errOnFull bool, cleanupDelay time.Duration, cleanupInterval time.Duration) *TaskRunner {
-	return &TaskRunner{
+// NewTaskRunnerWithQueue is NewTaskRunner with control over the queue size and
+// whether ScheduleTask fails (ErrQueueFull) when that many tasks are already
+// pending.
+func NewTaskRunnerWithQueue(db *gorm.DB, parallelism int, queueSize int, errOnFull bool, cleanupDelay time.Duration, cleanupInterval time.Duration, funcs ...Option) *TaskRunner {
+	r := &TaskRunner{
 		getDatabase:     createGetDatabase(db, &Task{}),
-		parallelism:     parallelism,
-		queue:           make(chan queuedTask, queueSize),
+		parallelism:     max(parallelism, 1),
+		queueSize:       queueSize,
 		errOnFull:       errOnFull,
-		handlers:        syncx.Map[task.Type, task.Handler]{},
-		factories:       syncx.Map[task.Type, task.Factory]{},
-		cancelFuncs:     syncx.Map[task.ID, context.CancelFunc]{},
+		wake:            make(chan struct{}, 1),
+		owner:           defaultOwner(),
+		leaseDuration:   defaultLeaseDuration,
+		pollInterval:    defaultPollInterval,
 		cleanupDelay:    cleanupDelay,
 		cleanupInterval: cleanupInterval,
 	}
+
+	for _, fn := range funcs {
+		fn(r)
+	}
+
+	return r
 }
 
 var (

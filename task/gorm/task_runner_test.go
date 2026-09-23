@@ -320,3 +320,269 @@ func waitForStatus(t *testing.T, runner *TaskRunner, id task.ID, want task.Statu
 	}
 	t.Fatalf("task %s did not reach status %s in time", id, want)
 }
+
+// openSharedDB opens a connection to a SQLite file meant to be shared by
+// several runners at once: WAL and a busy timeout keep concurrent writers
+// from failing with SQLITE_BUSY.
+func openSharedDB(t *testing.T, path string) *gorm.DB {
+	t.Helper()
+	return openTestDB(t, "file:"+path+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(wal)")
+}
+
+// TestTaskRunnersShareQueue runs two runners on the same database: every task
+// must run exactly once, and both runners must take part.
+func TestTaskRunnersShareQueue(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := filepath.Join(t.TempDir(), "tasks.sqlite")
+
+	const total = 200
+
+	var (
+		mu    sync.Mutex
+		runs  = map[task.ID]int{}
+		byRun = map[string]int{}
+		done  = make(chan struct{}, total*2)
+	)
+
+	newRunner := func(name string) *TaskRunner {
+		r := NewTaskRunner(openSharedDB(t, path), 4, 24*time.Hour, time.Minute,
+			WithOwner(name), WithPollInterval(20*time.Millisecond))
+		r.RegisterTask(dummyTaskType, task.HandlerFunc(func(ctx context.Context, tsk task.Task, events chan task.Event) error {
+			time.Sleep(time.Millisecond)
+			mu.Lock()
+			runs[tsk.ID()]++
+			byRun[name]++
+			mu.Unlock()
+			done <- struct{}{}
+			return nil
+		}))
+		r.RegisterFactory(dummyTaskType, dummyFactory)
+		return r
+	}
+
+	runnerA, runnerB := newRunner("a"), newRunner("b")
+
+	var wg sync.WaitGroup
+	for _, r := range []*TaskRunner{runnerA, runnerB} {
+		wg.Go(func() { _ = r.Run(ctx) })
+	}
+
+	ids := make([]task.ID, 0, total)
+	for i := range total {
+		scheduler := runnerA
+		if i%2 == 1 {
+			scheduler = runnerB
+		}
+		tsk := &dummyTask{id: task.NewID(), Name: "shared"}
+		if err := scheduler.ScheduleTask(ctx, tsk); err != nil {
+			t.Fatalf("ScheduleTask: %+v", errors.WithStack(err))
+		}
+		ids = append(ids, tsk.ID())
+	}
+
+	for range total {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for tasks")
+		}
+	}
+
+	for _, id := range ids {
+		waitForStatus(t, runnerA, id, task.StatusSucceeded)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, id := range ids {
+		if runs[id] != 1 {
+			t.Errorf("task %s ran %d times, expected exactly once", id, runs[id])
+		}
+	}
+	if byRun["a"] == 0 || byRun["b"] == 0 {
+		t.Errorf("expected both runners to take part, got %v", byRun)
+	}
+
+	cancel()
+	wg.Wait()
+}
+
+// TestTaskRunnerReclaimsExpiredLease simulates a runner that died holding a
+// task: once its lease expires, another runner resumes the task.
+func TestTaskRunnerReclaimsExpiredLease(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	path := filepath.Join(t.TempDir(), "tasks.sqlite")
+
+	dead := NewTaskRunner(openSharedDB(t, path), 1, 24*time.Hour, time.Minute,
+		WithOwner("dead"), WithLeaseDuration(300*time.Millisecond))
+	dead.RegisterFactory(dummyTaskType, dummyFactory)
+
+	tsk := &dummyTask{id: task.NewID(), Name: "orphan"}
+	if err := dead.ScheduleTask(ctx, tsk); err != nil {
+		t.Fatalf("ScheduleTask: %+v", errors.WithStack(err))
+	}
+
+	// The dead runner claims the task, then never heartbeats nor finishes it.
+	if claimed, err := dead.claim(ctx, tsk.ID()); err != nil || !claimed {
+		t.Fatalf("claim: claimed=%v err=%+v", claimed, err)
+	}
+
+	resumed := make(chan task.ID, 1)
+	alive := NewTaskRunner(openSharedDB(t, path), 1, 24*time.Hour, time.Minute,
+		WithOwner("alive"), WithPollInterval(50*time.Millisecond))
+	alive.RegisterTask(dummyTaskType, task.HandlerFunc(func(ctx context.Context, tsk task.Task, events chan task.Event) error {
+		resumed <- tsk.ID()
+		return nil
+	}))
+	alive.RegisterFactory(dummyTaskType, dummyFactory)
+
+	started := time.Now()
+
+	runnerDone := make(chan struct{})
+	go func() {
+		defer close(runnerDone)
+		_ = alive.Run(ctx)
+	}()
+
+	select {
+	case got := <-resumed:
+		if got != tsk.ID() {
+			t.Errorf("resumed unexpected task: %s != %s", got, tsk.ID())
+		}
+		if elapsed := time.Since(started); elapsed < 200*time.Millisecond {
+			t.Errorf("task resumed after %s, before its lease expired", elapsed)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the orphaned task to be resumed")
+	}
+
+	waitForStatus(t, alive, tsk.ID(), task.StatusSucceeded)
+
+	cancel()
+	<-runnerDone
+}
+
+// TestTaskRunnerRemoteCancel cancels, from one runner, a task running in
+// another: the running handler must see its context canceled.
+func TestTaskRunnerRemoteCancel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	path := filepath.Join(t.TempDir(), "tasks.sqlite")
+
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+
+	worker := NewTaskRunner(openSharedDB(t, path), 1, 24*time.Hour, time.Minute,
+		WithOwner("worker"), WithLeaseDuration(150*time.Millisecond), WithPollInterval(20*time.Millisecond))
+	worker.RegisterTask(dummyTaskType, task.HandlerFunc(func(ctx context.Context, tsk task.Task, events chan task.Event) error {
+		close(started)
+		<-ctx.Done()
+		close(stopped)
+		return errors.WithStack(task.ErrCanceled)
+	}))
+	worker.RegisterFactory(dummyTaskType, dummyFactory)
+
+	remote := NewTaskRunner(openSharedDB(t, path), 1, 24*time.Hour, time.Minute, WithOwner("remote"))
+	remote.RegisterFactory(dummyTaskType, dummyFactory)
+
+	runnerDone := make(chan struct{})
+	go func() {
+		defer close(runnerDone)
+		_ = worker.Run(ctx)
+	}()
+
+	tsk := &dummyTask{id: task.NewID(), Name: "long"}
+	if err := remote.ScheduleTask(ctx, tsk); err != nil {
+		t.Fatalf("ScheduleTask: %+v", errors.WithStack(err))
+	}
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the task to start")
+	}
+
+	if err := remote.CancelTask(ctx, tsk.ID()); err != nil {
+		t.Fatalf("CancelTask: %+v", errors.WithStack(err))
+	}
+
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Fatal("the running task was not stopped by the remote cancellation")
+	}
+
+	state, err := remote.GetTaskState(ctx, tsk.ID())
+	if err != nil {
+		t.Fatalf("GetTaskState: %+v", errors.WithStack(err))
+	}
+	if state.Status != task.StatusFailed || state.Error == nil || state.Error.Error() != task.ErrCanceled.Error() {
+		t.Errorf("expected a canceled task, got status %s error %v", state.Status, state.Error)
+	}
+
+	cancel()
+	<-runnerDone
+}
+
+// TestTaskRunnerStaleWorkerCannotOverwrite checks that a runner which lost
+// its lease cannot write the terminal state of a task another runner holds.
+func TestTaskRunnerStaleWorkerCannotOverwrite(t *testing.T) {
+	ctx := context.Background()
+
+	path := filepath.Join(t.TempDir(), "tasks.sqlite")
+
+	stale := NewTaskRunner(openSharedDB(t, path), 1, 24*time.Hour, time.Minute, WithOwner("stale"))
+	current := NewTaskRunner(openSharedDB(t, path), 1, 24*time.Hour, time.Minute, WithOwner("current"))
+
+	tsk := &dummyTask{id: task.NewID(), Name: "contended"}
+	if err := stale.ScheduleTask(ctx, tsk); err != nil {
+		t.Fatalf("ScheduleTask: %+v", errors.WithStack(err))
+	}
+
+	if claimed, err := stale.claim(ctx, tsk.ID()); err != nil || !claimed {
+		t.Fatalf("claim: claimed=%v err=%+v", claimed, err)
+	}
+
+	// The stale lease expires and the task goes to the current runner.
+	if err := stale.updateState(ctx, tsk.ID(), map[string]any{"lease_until": time.Now().Add(-time.Second).UnixMilli()}); err != nil {
+		t.Fatalf("updateState: %+v", errors.WithStack(err))
+	}
+	if err := current.reclaimExpired(ctx); err != nil {
+		t.Fatalf("reclaimExpired: %+v", errors.WithStack(err))
+	}
+	if claimed, err := current.claim(ctx, tsk.ID()); err != nil || !claimed {
+		t.Fatalf("claim by current: claimed=%v err=%+v", claimed, err)
+	}
+
+	if err := stale.finishOwned(ctx, tsk.ID(), task.StatusFailed, errors.New("stale failure")); err != nil {
+		t.Fatalf("finishOwned: %+v", errors.WithStack(err))
+	}
+
+	state, err := current.GetTaskState(ctx, tsk.ID())
+	if err != nil {
+		t.Fatalf("GetTaskState: %+v", errors.WithStack(err))
+	}
+	if state.Status != task.StatusRunning {
+		t.Fatalf("stale runner overwrote the task: status %s", state.Status)
+	}
+
+	if err := current.finishOwned(ctx, tsk.ID(), task.StatusSucceeded, nil); err != nil {
+		t.Fatalf("finishOwned: %+v", errors.WithStack(err))
+	}
+
+	state, err = current.GetTaskState(ctx, tsk.ID())
+	if err != nil {
+		t.Fatalf("GetTaskState: %+v", errors.WithStack(err))
+	}
+	if state.Status != task.StatusSucceeded {
+		t.Errorf("expected succeeded, got %s", state.Status)
+	}
+}
