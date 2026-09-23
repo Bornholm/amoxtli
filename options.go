@@ -48,10 +48,13 @@ const (
 	// StageTranslate translates the query into the corpus languages (lexical
 	// indexes).
 	StageTranslate Stage = "translate"
+	// StageAnswer writes an answer citing the retrieved sections (see
+	// Codex.Answer).
+	StageAnswer Stage = "answer"
 )
 
 // Stages lists every stage accepted by WithStageLLMClient.
-var Stages = []Stage{StageHyDE, StageJudge, StageGrounding, StageRerank, StageDecompose, StageReformulate, StageTranslate}
+var Stages = []Stage{StageHyDE, StageJudge, StageGrounding, StageRerank, StageDecompose, StageReformulate, StageTranslate, StageAnswer}
 
 type options struct {
 	llmClient          llm.Client

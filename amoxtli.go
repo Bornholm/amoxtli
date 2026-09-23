@@ -52,6 +52,7 @@ type Codex struct {
 	groundingFailOpen bool
 	groundingMode     retrieval.GroundingMode
 	orchestrator      *retrieval.Orchestrator
+	answerer          *retrieval.Answerer
 	snapshotBoundary  string
 	cancel            context.CancelFunc
 	runnerDone        chan struct{}
@@ -274,6 +275,9 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	codex.groundingFailOpen = opts.groundingFailOpen
 	codex.groundingMode = opts.groundingMode
 	codex.orchestrator = newOrchestrator(opts, manager, codex.evaluator)
+	if answerClient := opts.clientFor(StageAnswer); answerClient != nil {
+		codex.answerer = retrieval.NewAnswerer(answerClient, store)
+	}
 
 	codex.cancel = cancel
 	codex.runnerDone = runnerDone
