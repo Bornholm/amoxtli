@@ -225,3 +225,23 @@ func TestCodexGetDocumentBySource(t *testing.T) {
 		t.Errorf("expected ErrNotFound, got %+v", err)
 	}
 }
+
+func TestCodexCountDocuments(t *testing.T) {
+	ctx := context.Background()
+	codex, collID := newBleveCodex(t)
+
+	otherID, err := codex.CreateCollection(ctx, "other")
+	if err != nil {
+		t.Fatalf("CreateCollection: %+v", errors.WithStack(err))
+	}
+	indexSync(t, codex, collID, "https://example.net/a.md", nil)
+	indexSync(t, codex, otherID, "https://example.net/b.md", nil)
+	if err := codex.SetDocumentCollections(ctx, documentIDBySource(t, codex, collID, "https://example.net/a.md"), collID, otherID); err != nil {
+		t.Fatalf("SetDocumentCollections: %+v", errors.WithStack(err))
+	}
+
+	count, err := codex.CountDocuments(ctx)
+	if err != nil || count != 2 {
+		t.Errorf("expected 2 documents, each counted once, got %d %+v", count, err)
+	}
+}

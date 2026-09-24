@@ -154,6 +154,17 @@ func (c *Codex) listFilteredDocuments(ctx context.Context, collectionID model.Co
 	}
 }
 
+// CountDocuments returns the number of documents of the codex, each counted
+// once whatever the number of collections holding it.
+func (c *Codex) CountDocuments(ctx context.Context) (int64, error) {
+	page, limit := 0, 1
+	_, total, err := c.store.QueryDocuments(ctx, ingest.QueryDocumentsOptions{Page: &page, Limit: &limit, HeaderOnly: true})
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return total, nil
+}
+
 // GetDocument returns a document with its sections and collections.
 func (c *Codex) GetDocument(ctx context.Context, id model.DocumentID) (model.PersistedDocument, error) {
 	document, err := c.store.GetDocumentByID(ctx, id)
