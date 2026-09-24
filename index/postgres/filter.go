@@ -97,6 +97,19 @@ const alwaysFalse = "FALSE"
 
 func buildCondition(condition index.Condition, a *args) string {
 	switch condition.Op {
+	case index.OpOr:
+		alternatives := condition.Conditions()
+		if len(alternatives) == 0 {
+			return alwaysFalse
+		}
+		clauses := make([]string, 0, len(alternatives))
+		for _, alternative := range alternatives {
+			// COALESCE: an alternative evaluating to NULL (a document
+			// without metadata row) must not hide a true one.
+			clauses = append(clauses, "COALESCE(("+buildCondition(alternative, a)+"), FALSE)")
+		}
+		return "(" + strings.Join(clauses, " OR ") + ")"
+
 	case index.OpExists:
 		want, ok := condition.Value.(bool)
 		if !ok {

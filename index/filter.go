@@ -36,6 +36,9 @@ const (
 	// OpExists matches on key presence only, whatever the value. The condition
 	// value is a bool: true requires the key, false requires its absence.
 	OpExists FilterOp = "exists"
+	// OpOr matches when at least one of its conditions does. Its Key is
+	// empty and its Value is a []Condition; built with Or.
+	OpOr FilterOp = "or"
 )
 
 // Condition is a single predicate over one metadata key.
@@ -94,6 +97,11 @@ type Condition struct {
 //
 //   - Empty In. In(key) without any value matches nothing, like SQL IN ().
 //
+//   - Disjunction. Or(a, b) matches when a or b does; the conditions nest,
+//     an Or inside an Or included. Or() without any condition matches
+//     nothing. It is how "no restriction, or a matching one" reads:
+//     Or(NotExists("_acl"), Any("_acl", principals...)).
+//
 // # Keys
 //
 // Filter keys are restricted to KeyPattern. Metadata keys usually come from a
@@ -124,12 +132,29 @@ func ValidateKey(key string) error {
 // its source.
 func (f Filter) Validate() error {
 	for _, c := range f {
-		if err := ValidateKey(c.Key); err != nil {
-			return errors.WithStack(err)
+		if err := c.validate(); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+func (c Condition) validate() error {
+	if c.Op != OpOr {
+		return errors.WithStack(ValidateKey(c.Key))
+	}
+	conditions, ok := c.Value.([]Condition)
+	if !ok {
+		return errors.Wrapf(ErrInvalidFilterKey, "or: expected []Condition, got %T", c.Value)
+	}
+	return Filter(conditions).Validate()
+}
+
+// Conditions returns the conditions of an OpOr condition.
+func (c Condition) Conditions() []Condition {
+	conditions, _ := c.Value.([]Condition)
+	return conditions
 }
 
 // CanonicalBytes returns a stable encoding of the filter, independent of the
@@ -160,6 +185,16 @@ func (f Filter) CanonicalBytes() []byte {
 }
 
 func (c Condition) canonical() string {
+	if c.Op == OpOr {
+		// The alternatives are a set, like the conditions of a filter.
+		alternatives := make([]string, 0, len(c.Conditions()))
+		for _, sub := range c.Conditions() {
+			alternatives = append(alternatives, strconv.Quote(sub.canonical()))
+		}
+		slices.Sort(alternatives)
+		return "\x00or\x00[" + strings.Join(alternatives, ",") + "]"
+	}
+
 	// Keys and string operands are quoted so that a value containing the
 	// separators cannot forge the encoding of a different condition.
 	return strconv.Quote(c.Key) + "\x00" + string(c.Op) + "\x00" + canonicalOperand(c.Op, c.Value)
@@ -221,6 +256,15 @@ func (f Filter) Matches(meta map[string]any) bool {
 }
 
 func (c Condition) matches(meta map[string]any) bool {
+	if c.Op == OpOr {
+		for _, sub := range c.Conditions() {
+			if sub.matches(meta) {
+				return true
+			}
+		}
+		return false
+	}
+
 	value, present := meta[c.Key]
 
 	if c.Op == OpExists {
@@ -335,6 +379,12 @@ func In(key string, values ...any) Condition {
 // holding at least one of values. Without values it matches nothing.
 func Any(key string, values ...any) Condition {
 	return Condition{Key: key, Op: OpAny, Value: values}
+}
+
+// Or builds a disjunction: at least one of the conditions holds. Without
+// conditions it matches nothing.
+func Or(conditions ...Condition) Condition {
+	return Condition{Op: OpOr, Value: conditions}
 }
 
 // Exists builds a presence condition: the document carries the key, whatever

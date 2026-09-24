@@ -139,6 +139,21 @@ func buildFilterSQL(filter index.Filter) (string, []any, error) {
 const alwaysFalse = "0"
 
 func buildCondition(condition index.Condition) (string, []any) {
+	if condition.Op == index.OpOr {
+		alternatives := condition.Conditions()
+		if len(alternatives) == 0 {
+			return alwaysFalse, nil
+		}
+		clauses := make([]string, 0, len(alternatives))
+		var args []any
+		for _, alternative := range alternatives {
+			clause, alternativeArgs := buildCondition(alternative)
+			clauses = append(clauses, "("+clause+")")
+			args = append(args, alternativeArgs...)
+		}
+		return "(" + strings.Join(clauses, " OR ") + ")", args
+	}
+
 	key := condition.Key
 
 	// json_type(...) IS NOT NULL is the presence test: it returns 'null' — not

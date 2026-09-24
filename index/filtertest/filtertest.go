@@ -208,6 +208,19 @@ var Cases = []Case{
 	{"and-one-missing-key", index.Filter{index.Eq("a", "x"), index.Eq("b", "y")}, map[string]any{"a": "x"}, false},
 	{"and-exists-and-ne", index.Filter{index.Exists("a"), index.Ne("a", "x")}, map[string]any{"a": "y"}, true},
 
+	// --- Disjunction ---------------------------------------------------------
+	{"or-first-true", index.Filter{index.Or(index.Eq("a", "x"), index.Eq("b", "y"))}, map[string]any{"a": "x"}, true},
+	{"or-second-true", index.Filter{index.Or(index.Eq("a", "x"), index.Eq("b", "y"))}, map[string]any{"b": "y"}, true},
+	{"or-none-true", index.Filter{index.Or(index.Eq("a", "x"), index.Eq("b", "y"))}, map[string]any{"a": "z"}, false},
+	{"or-empty", index.Filter{index.Or()}, map[string]any{"a": "x"}, false},
+	{"or-acl-absent", index.Filter{index.Or(index.NotExists("_acl"), index.Any("_acl", "u1", "g1"))}, map[string]any{"a": "x"}, true},
+	{"or-acl-absent-nil-metadata", index.Filter{index.Or(index.NotExists("_acl"), index.Any("_acl", "u1", "g1"))}, nil, true},
+	{"or-acl-granted", index.Filter{index.Or(index.NotExists("_acl"), index.Any("_acl", "u1", "g1"))}, map[string]any{"_acl": []any{"g1", "g2"}}, true},
+	{"or-acl-denied", index.Filter{index.Or(index.NotExists("_acl"), index.Any("_acl", "u1", "g1"))}, map[string]any{"_acl": []any{"g2"}}, false},
+	{"or-acl-empty", index.Filter{index.Or(index.NotExists("_acl"), index.Any("_acl", "u1", "g1"))}, map[string]any{"_acl": []any{}}, false},
+	{"or-and-other-condition", index.Filter{index.Or(index.NotExists("_acl"), index.Any("_acl", "u1", "g1")), index.Eq("a", "x")}, map[string]any{"a": "y"}, false},
+	{"or-nested", index.Filter{index.Or(index.Eq("a", "x"), index.Or(index.Eq("b", "y"), index.Gt("n", 2)))}, map[string]any{"n": 3.0}, true},
+
 	// --- Hostile values (no interpolation, no error) ------------------------
 	//
 	// Keys are not exercised here: index.Filter restricts them to KeyPattern
