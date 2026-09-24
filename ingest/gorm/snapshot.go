@@ -3,6 +3,7 @@ package gorm
 import (
 	"context"
 	"encoding/gob"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/url"
@@ -59,6 +60,14 @@ func (s *Store) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
 					return
 				}
 
+				var metadata []byte
+				if m := model.Metadata(d); len(m) > 0 {
+					if metadata, err = json.Marshal(m); err != nil {
+						w.CloseWithError(errors.WithStack(err))
+						return
+					}
+				}
+
 				err = encoder.Encode(SnapshottedDocument{
 					ID:          string(d.ID()),
 					Source:      d.Source().String(),
@@ -66,6 +75,7 @@ func (s *Store) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
 					Content:     content,
 					Collections: toSnapshottedCollections(d.Collections()),
 					Sections:    toSnapshottedSections(d.Sections()),
+					Metadata:    metadata,
 				})
 				if err != nil {
 					w.CloseWithError(errors.WithStack(err))
@@ -127,6 +137,10 @@ type SnapshottedDocument struct {
 	Content     []byte
 	Collections []SnapshottedCollection
 	Sections    []SnapshottedSection
+	// Metadata is the JSON of the document metadata: gob cannot carry the
+	// dynamic values of a map[string]any. Absent from the snapshots of
+	// earlier versions.
+	Metadata []byte
 }
 
 type snapshottedDocumentWrapper struct {
@@ -158,6 +172,18 @@ func (w *snapshottedDocumentWrapper) Collections() []model.Collection {
 		collections = append(collections, &snapshottedCollectionWrapper{c})
 	}
 	return collections
+}
+
+// Metadata implements model.WithMetadata.
+func (w *snapshottedDocumentWrapper) Metadata() map[string]any {
+	if len(w.snapshot.Metadata) == 0 {
+		return nil
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(w.snapshot.Metadata, &metadata); err != nil {
+		return nil
+	}
+	return metadata
 }
 
 // Content implements model.Document.
