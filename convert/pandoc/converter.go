@@ -5,11 +5,12 @@ import (
 	"context"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/bornholm/amoxtli/blob"
 	"github.com/bornholm/amoxtli/convert"
+	"github.com/bornholm/amoxtli/internal/proc"
 	"github.com/bornholm/amoxtli/markdown/imagetext"
 	"github.com/pkg/errors"
 )
@@ -28,6 +29,8 @@ type Options struct {
 	// MaxImageBytes bounds the size of an inlined image; larger media stay
 	// links (which are ignored downstream). 0 defers to the default.
 	MaxImageBytes int64
+	// Timeout bounds a conversion; <= 0 selects proc.DefaultTimeout.
+	Timeout time.Duration
 	// Blobs, when set, receives the extracted media, which are then referenced
 	// by their internal URI instead of being inlined as data URIs.
 	Blobs blob.Store
@@ -66,6 +69,18 @@ func WithInlineMedia(maxImageBytes int64) OptionFunc {
 	}
 }
 
+// WithTimeout bounds each conversion: pandoc is killed past it.
+func WithTimeout(timeout time.Duration) OptionFunc {
+	return func(opts *Options) {
+		opts.Timeout = timeout
+	}
+}
+
+// Timeout returns the conversion deadline of the converter.
+func (f *Converter) Timeout() time.Duration {
+	return f.opts.Timeout
+}
+
 // WithBlobStore stores the extracted media and references them by their
 // internal URI (`amoxtli://images/<hash>`) instead of inlining them as data
 // URIs: a much lighter markdown, and the bytes are stored once instead of
@@ -101,6 +116,10 @@ func (f *Converter) Convert(ctx context.Context, filename string, r io.Reader) (
 	}
 
 	if _, err := io.Copy(copy, r); err != nil {
+		copy.Close()
+		return nil, errors.WithStack(err)
+	}
+	if err := copy.Close(); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -112,16 +131,10 @@ func (f *Converter) Convert(ctx context.Context, filename string, r io.Reader) (
 
 	args = append(args, source)
 
-	cmd := exec.Command("pandoc", args...)
-
 	// Running from the temporary directory keeps the destinations pandoc writes
 	// relative to it, so the extracted media resolve — and stay confined —
 	// under a directory we own.
-	cmd.Dir = tempDir
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
-
-	if err := cmd.Run(); err != nil {
+	if err := proc.Run(ctx, f.opts.Timeout, tempDir, "pandoc", args...); err != nil {
 		return nil, errors.WithStack(err)
 	}
 

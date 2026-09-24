@@ -4,12 +4,12 @@ import (
 	"context"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/bornholm/amoxtli/convert"
 	"github.com/bornholm/amoxtli/convert/pandoc"
+	"github.com/bornholm/amoxtli/internal/proc"
 	"github.com/pkg/errors"
 )
 
@@ -39,15 +39,15 @@ func (f *Converter) Convert(ctx context.Context, filename string, r io.Reader) (
 	}
 
 	if _, err := io.Copy(copy, r); err != nil {
+		copy.Close()
+		return nil, errors.WithStack(err)
+	}
+	if err := copy.Close(); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	cmd := exec.Command("libreoffice", "--headless", "--convert-to", "docx", source, "--outdir", tempDir)
-
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
-
-	if err := cmd.Run(); err != nil {
+	// LibreOffice shares the deadline of the pandoc conversion that follows.
+	if err := proc.Run(ctx, f.pandoc.Timeout(), tempDir, "libreoffice", "--headless", "--convert-to", "docx", source, "--outdir", tempDir); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
