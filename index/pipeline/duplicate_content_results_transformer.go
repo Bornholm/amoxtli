@@ -18,18 +18,23 @@ type DuplicateContentResultsTransformer struct {
 func (t *DuplicateContentResultsTransformer) TransformResults(ctx context.Context, query string, results []*index.SearchResult, opts index.SearchOptions) ([]*index.SearchResult, error) {
 	merged := make([]*index.SearchResult, 0, len(results))
 
+	// One query for the sections of every result: the candidate pool of a
+	// paged search holds a hundred results.
+	var ids []model.SectionID
+	for _, r := range results {
+		ids = append(ids, r.Sections...)
+	}
+	sectionsMap, err := t.store.GetSectionsByIDs(ctx, ids)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
 	for _, r := range results {
 		updated := &index.SearchResult{
 			Source:        r.Source,
 			Sections:      make([]model.SectionID, 0),
 			Score:         r.Score,
 			SectionScores: r.SectionScores,
-		}
-
-		// Batch load all sections for this result
-		sectionsMap, err := t.store.GetSectionsByIDs(ctx, r.Sections)
-		if err != nil {
-			return nil, errors.WithStack(err)
 		}
 
 		sections := make([]model.Section, 0, len(r.Sections))
