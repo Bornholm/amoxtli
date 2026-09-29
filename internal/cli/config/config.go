@@ -7,6 +7,7 @@ package config
 import (
 	"slices"
 	"strings"
+	"time"
 
 	visionconv "github.com/bornholm/amoxtli/convert/vision"
 	"github.com/bornholm/amoxtli/sourcecode"
@@ -287,11 +288,22 @@ type LLMCacheConfig struct {
 	// (default "cache"). Entries are keyed by model, so switching model never
 	// serves results from the wrong space.
 	Path string `yaml:"path"`
+	// MaxAge removes the entries unused for longer than it, as a Go duration
+	// ("2160h"). Reading an entry counts as a use, so only the entries of
+	// content no longer indexed nor searched expire. Left empty it defaults
+	// to DefaultLLMCacheMaxAge; "0s" sets no age limit.
+	MaxAge *time.Duration `yaml:"max_age"`
+	// MaxSize bounds the cache size in bytes, removing the least recently
+	// used entries first; 0 (the default) sets no size limit.
+	MaxSize int64 `yaml:"max_size"`
 }
 
 // DefaultLLMCachePath is the LLM cache root used when llm.cache.path is left
 // empty, relative to the .amoxtli directory.
 const DefaultLLMCachePath = "cache"
+
+// DefaultLLMCacheMaxAge is the llm.cache.max_age used when it is left empty.
+const DefaultLLMCacheMaxAge = 90 * 24 * time.Hour
 
 // SupportedProviders lists the llm.chat / llm.embeddings providers the CLI
 // can wire. All share provider.CommonOptions (model, base_url, api_key).
@@ -620,6 +632,15 @@ func (c *Config) LLMCachePath() string {
 	return DefaultLLMCachePath
 }
 
+// LLMCacheMaxAge returns the configured llm.cache.max_age, falling back to
+// DefaultLLMCacheMaxAge; 0 sets no age limit.
+func (c *Config) LLMCacheMaxAge() time.Duration {
+	if c.LLM.Cache.MaxAge != nil {
+		return *c.LLM.Cache.MaxAge
+	}
+	return DefaultLLMCacheMaxAge
+}
+
 // VectorEnabled resolves the vector index toggle against the presence of an
 // embeddings client. It only governs the local sqlite-vec index; the postgres
 // index manages its vector leg internally.
@@ -705,6 +726,14 @@ func (c *Config) VisionExtensions() []string {
 func (c *Config) Validate() error {
 	if c.Version != 1 {
 		return errors.Errorf("unsupported config version %d (expected 1)", c.Version)
+	}
+
+	if c.LLM.Cache.MaxAge != nil && *c.LLM.Cache.MaxAge < 0 {
+		return errors.New("llm.cache.max_age must not be negative")
+	}
+
+	if c.LLM.Cache.MaxSize < 0 {
+		return errors.New("llm.cache.max_size must not be negative")
 	}
 
 	switch c.Store.Driver {

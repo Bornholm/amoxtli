@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/bornholm/amoxtli"
 	bleveIndex "github.com/bornholm/amoxtli/index/bleve"
@@ -38,7 +39,14 @@ type Runtime struct {
 	// llmCache is the caching decorator around the default LLM client when the
 	// LLM cache is enabled; kept to report hit/miss stats on Close.
 	llmCache *llmx.CachingClient
+	// cacheDir is the on-disk LLM cache root, pruned on Close within
+	// cachePrune; empty when the cache is disabled.
+	cacheDir   string
+	cachePrune llmx.PruneOptions
 }
+
+// CachePruneInterval is how often Close prunes the LLM cache at most.
+const CachePruneInterval = 24 * time.Hour
 
 // Open acquires the workspace lock and wires the configuration into a Codex.
 // command names the caller in the lock file for diagnostics.
@@ -76,6 +84,14 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 
 	if cached, ok := client.(*llmx.CachingClient); ok {
 		rt.llmCache = cached
+	}
+
+	// The toggle alone, not LLMCacheEnabled: the vision description cache
+	// shares the directory and may be in use without llm.chat nor
+	// llm.embeddings.
+	if cfg.LLM.Cache.Enabled.Resolve(true) {
+		rt.cacheDir = ws.Resolve(cfg.LLMCachePath())
+		rt.cachePrune = llmx.PruneOptions{MaxAge: cfg.LLMCacheMaxAge(), MaxSize: cfg.LLM.Cache.MaxSize}
 	}
 
 	// Both the gorm SQLite store and the sqlite-vec index hand a WASM build to
@@ -415,6 +431,17 @@ func (r *Runtime) Close() error {
 		}
 		if hits, misses := r.llmCache.ChatStats(); hits+misses > 0 {
 			slog.Debug("chat cache", slog.Int64("hits", hits), slog.Int64("misses", misses))
+		}
+	}
+
+	if r.cacheDir != "" {
+		// A failed prune must not fail the command: the cache only grows.
+		stats, ran, err := llmx.PruneCacheEvery(r.cacheDir, r.cachePrune, CachePruneInterval)
+		switch {
+		case err != nil:
+			slog.Warn("could not prune the llm cache", slog.Any("error", err))
+		case ran:
+			slog.Debug("llm cache pruned", slog.Int("removed", stats.Removed), slog.Int64("freed", stats.Freed), slog.Int("kept", stats.Kept), slog.Int64("size", stats.Size))
 		}
 	}
 
