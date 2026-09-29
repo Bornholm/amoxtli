@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/internal/cdc"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/genai/llm"
 	"github.com/ncruces/go-sqlite3"
@@ -334,6 +335,8 @@ const (
 
 	targetBatchTokens = 6000
 
+	// overlapChars is the overlap of the windows cutting a single line
+	// longer than a chunk.
 	overlapChars = 200
 )
 
@@ -522,8 +525,8 @@ func bindVecInsert(stmt *sqlite3.Stmt, rowID int64, vecBlob []byte, partition st
 }
 
 // collectChunks walks the document sections and splits their content into the
-// chunks to embed (character-window with overlap for oversized sections). It
-// performs no I/O beyond reading section content and takes no lock.
+// chunks to embed (see cdc.Split for oversized sections). It performs no I/O
+// beyond reading section content and takes no lock.
 func (i *Index) collectChunks(document model.Document) ([]*indexableChunk, error) {
 	var chunksToProcess []*indexableChunk
 
@@ -540,45 +543,16 @@ func (i *Index) collectChunks(document model.Document) ([]*indexableChunk, error
 		// stable between a fresh parse and the store round-trip (the persisted
 		// content is trimmed, the parsed one may keep a trailing newline).
 		textStr := strings.TrimSpace(string(content))
-		textLen := len(textStr)
 
-		if textLen <= limitChars {
-			if textLen > 0 { // On ignore les sections vides
-				chunksToProcess = append(chunksToProcess, &indexableChunk{
-					Section:  s,
-					Text:     textStr,
-					ChunkIdx: 0,
-				})
-			}
-		} else {
-			runes := []rune(textStr)
-			runesLen := len(runes)
-
-			limitRunes := limitChars
-			overlapRunes := overlapChars
-
-			currentChunkIdx := 0
-			for start := 0; start < runesLen; {
-				end := start + limitRunes
-				if end > runesLen {
-					end = runesLen
-				}
-
-				chunkText := string(runes[start:end])
-
-				chunksToProcess = append(chunksToProcess, &indexableChunk{
-					Section:  s,
-					Text:     chunkText,
-					ChunkIdx: currentChunkIdx,
-				})
-				currentChunkIdx++
-
-				if end == runesLen {
-					break
-				}
-
-				start += (limitRunes - overlapRunes)
-			}
+		// Oversized sections are cut at content-defined paragraph boundaries,
+		// not fixed windows: an edit then only changes the chunks around it,
+		// and the others keep their embeddings cache key.
+		for idx, chunkText := range cdc.Split(textStr, limitChars, overlapChars) {
+			chunksToProcess = append(chunksToProcess, &indexableChunk{
+				Section:  s,
+				Text:     chunkText,
+				ChunkIdx: idx,
+			})
 		}
 
 		for _, child := range s.Sections() {
@@ -602,11 +576,47 @@ func (i *Index) collectChunks(document model.Document) ([]*indexableChunk, error
 // as before) and returns the serialized vectors aligned by index with chunks.
 // It performs no database access and holds no lock, so it runs concurrently
 // with searches.
+//
+// Identical chunks are embedded once. They are common: a section's content
+// holds its sub-sections', so a parent whose text is mostly one child's yields
+// the same chunks as that child — and the concurrent batches would all miss an
+// embeddings cache for them at the same time.
 func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk) ([][]byte, error) {
-	vectors := make([][]byte, len(chunks))
+	// texts are the distinct chunk texts, slots map each chunk to its text.
+	var texts []string
+	slots := make([]int, len(chunks))
+	seen := make(map[string]int, len(chunks))
+	for idx, chunk := range chunks {
+		slot, ok := seen[chunk.Text]
+		if !ok {
+			slot = len(texts)
+			seen[chunk.Text] = slot
+			texts = append(texts, chunk.Text)
+		}
+		slots[idx] = slot
+	}
 
-	// First, partition the chunks into batches bounded by item count and token
-	// budget (same policy as before, just materialized up front).
+	unique, err := i.embedTexts(ctx, texts)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	vectors := make([][]byte, len(chunks))
+	for idx, slot := range slots {
+		vectors[idx] = unique[slot]
+	}
+
+	return vectors, nil
+}
+
+// embedTexts runs the embeddings model over texts, in batches computed
+// concurrently, and returns the serialized vectors aligned by index with
+// texts.
+func (i *Index) embedTexts(ctx context.Context, texts []string) ([][]byte, error) {
+	vectors := make([][]byte, len(texts))
+
+	// First, partition the texts into batches bounded by item count and token
+	// budget.
 	type embeddingsBatch struct {
 		idx   []int
 		texts []string
@@ -627,8 +637,8 @@ func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk)
 		batchIdx, batchTexts, batchTokens = nil, nil, 0
 	}
 
-	for idx, chunk := range chunks {
-		tokenEst := estimateTokens(chunk.Text)
+	for idx, text := range texts {
+		tokenEst := estimateTokens(text)
 
 		isBatchFull := (len(batchTexts) >= maxBatchItemCount) ||
 			(batchTokens+tokenEst >= targetBatchTokens)
@@ -638,7 +648,7 @@ func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk)
 		}
 
 		batchIdx = append(batchIdx, idx)
-		batchTexts = append(batchTexts, chunk.Text)
+		batchTexts = append(batchTexts, text)
 		batchTokens += tokenEst
 	}
 	seal()
@@ -673,12 +683,12 @@ func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk)
 				return errors.New("vector count mismatch")
 			}
 
-			for j, chunkIdx := range b.idx {
+			for j, textIdx := range b.idx {
 				blob, err := sqlite_vec.SerializeFloat32(toFloat32(embeddings[j]))
 				if err != nil {
 					return errors.WithStack(err)
 				}
-				vectors[chunkIdx] = blob
+				vectors[textIdx] = blob
 			}
 
 			return nil

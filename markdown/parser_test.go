@@ -19,6 +19,8 @@ func TestParser(t *testing.T) {
 		MaxWordPerSection int
 	}
 
+	// Content-defined cuts (see cdc.Policy) may close a section from half the
+	// word bound, hence more sections than a greedy packing up to the bound.
 	testCases := []testCase{
 		{
 			File:              "testdata/test.md",
@@ -27,7 +29,7 @@ func TestParser(t *testing.T) {
 		},
 		{
 			File:              "testdata/le_horla.md",
-			ExpectedSections:  205,
+			ExpectedSections:  280,
 			MaxWordPerSection: 200,
 		},
 		{

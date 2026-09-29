@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/internal/cdc"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/genai/llm"
 	"github.com/jackc/pgx/v5"
@@ -228,6 +229,8 @@ const (
 
 	targetBatchTokens = 6000
 
+	// overlapChars is the overlap of the windows cutting a single line
+	// longer than a chunk.
 	overlapChars = 200
 )
 
@@ -405,46 +408,18 @@ func collectChunks(document model.Document, limitChars int) ([]*indexableChunk, 
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		textStr := string(content)
-		textLen := len(textStr)
+		// Trimmed like the sqlite-vec index, so that a fresh parse and the store
+		// round-trip give the same chunks. Oversized sections are cut at
+		// content-defined paragraph boundaries: an edit then only changes the
+		// chunks around it, and the others keep their embeddings cache key.
+		textStr := strings.TrimSpace(string(content))
 
-		if textLen <= limitChars {
-			if textLen > 0 { // On ignore les sections vides
-				chunksToProcess = append(chunksToProcess, &indexableChunk{
-					Section:  s,
-					Text:     textStr,
-					ChunkIdx: 0,
-				})
-			}
-		} else {
-			runes := []rune(textStr)
-			runesLen := len(runes)
-
-			limitRunes := limitChars
-			overlapRunes := overlapChars
-
-			currentChunkIdx := 0
-			for start := 0; start < runesLen; {
-				end := start + limitRunes
-				if end > runesLen {
-					end = runesLen
-				}
-
-				chunkText := string(runes[start:end])
-
-				chunksToProcess = append(chunksToProcess, &indexableChunk{
-					Section:  s,
-					Text:     chunkText,
-					ChunkIdx: currentChunkIdx,
-				})
-				currentChunkIdx++
-
-				if end == runesLen {
-					break
-				}
-
-				start += (limitRunes - overlapRunes)
-			}
+		for idx, chunkText := range cdc.Split(textStr, limitChars, overlapChars) {
+			chunksToProcess = append(chunksToProcess, &indexableChunk{
+				Section:  s,
+				Text:     chunkText,
+				ChunkIdx: idx,
+			})
 		}
 
 		for _, child := range s.Sections() {
