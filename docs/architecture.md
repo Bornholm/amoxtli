@@ -392,6 +392,11 @@ Un titre n'est jamais coupé en deux. S'il fait à lui seul plus de
 puis converti par pandoc, le découpage tombe à la fin de sa ligne et le bloc
 suivant ouvre sa propre section.
 
+La plage d'une section couvre celles de ses sous-sections, et son contenu
+inclut donc le leur. La section racine couvre tout le document. Après le
+découpage d'un titre long, la section du titre contient aussi le bloc suivant,
+alors que ce bloc a sa propre sous-section.
+
 Chaque section porte sa branche, la liste des identifiants de ses ancêtres
 suivie du sien. `ingest/gorm` l'enregistre telle quelle.
 
