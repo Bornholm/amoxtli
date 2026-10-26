@@ -23,17 +23,17 @@ func TestParser(t *testing.T) {
 	testCases := []testCase{
 		{
 			File:              "testdata/test.md",
-			ExpectedSections:  11,
+			ExpectedSections:  9,
 			MaxWordPerSection: 5,
 		},
 		{
 			File:              "testdata/le_horla.md",
-			ExpectedSections:  205,
+			ExpectedSections:  203,
 			MaxWordPerSection: 200,
 		},
 		{
 			File:              "../index/testsuite/testdata/documents/programming_go.md",
-			ExpectedSections:  4,
+			ExpectedSections:  3,
 			MaxWordPerSection: 200,
 		},
 		{
@@ -43,7 +43,7 @@ func TestParser(t *testing.T) {
 		},
 		{
 			File:              "../index/testsuite/testdata/documents/cooking_boeuf_bourguignon.md",
-			ExpectedSections:  4,
+			ExpectedSections:  3,
 			MaxWordPerSection: 200,
 		},
 	}
@@ -262,6 +262,64 @@ func TestParseSplitBranches(t *testing.T) {
 	}
 
 	assertBranches(t, doc)
+}
+
+// TestParseDropsEmptySections: a word-count split opens a section after the
+// node that filled the previous one. When nothing came after that node, the
+// section stayed empty, and bleve indexed it with "\n" as its content.
+func TestParseDropsEmptySections(t *testing.T) {
+	type testCase struct {
+		Name   string
+		Source string
+	}
+
+	long := strings.Repeat("word ", 300)
+
+	testCases := []testCase{
+		{Name: "long paragraph last", Source: "# Title\n\n" + long + "\n"},
+		{Name: "long heading last", Source: "intro\n\n# " + long + "\n"},
+		{Name: "long heading before a heading", Source: "intro\n\n# " + long + "\n\n# Next\n\nBody.\n"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			doc, err := Parse([]byte(tc.Source), WithMaxWordPerSection(250))
+			if err != nil {
+				t.Fatalf("%+v", errors.WithStack(err))
+			}
+
+			if err := model.WalkSections(doc, func(s model.Section) error {
+				content, err := s.Content()
+				if err != nil {
+					return errors.WithStack(err)
+				}
+
+				if strings.TrimSpace(string(content)) == "" {
+					return errors.Errorf("section %s [%d:%d] is empty", s.ID(), s.Start(), s.End())
+				}
+
+				return nil
+			}); err != nil {
+				dumpDocument(t, doc)
+				t.Fatalf("%+v", errors.WithStack(err))
+			}
+
+			assertBranches(t, doc)
+		})
+	}
+}
+
+// TestParseKeepsEmptyRoot: pruning the empty sections must leave the root one
+// alone, so that a document without text still has a section.
+func TestParseKeepsEmptyRoot(t *testing.T) {
+	doc, err := Parse([]byte(""))
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	if e, g := 1, model.CountSections(doc); e != g {
+		t.Errorf("model.CountSections(doc): expected %d, got %d", e, g)
+	}
 }
 
 // TestParseSiblingBranches: Parse used to append a section's ID to its

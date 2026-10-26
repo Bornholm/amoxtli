@@ -409,7 +409,7 @@ func collectChunks(document model.Document, limitChars int) ([]*indexableChunk, 
 		textLen := len(textStr)
 
 		if textLen <= limitChars {
-			if textLen > 0 { // On ignore les sections vides
+			if strings.TrimSpace(textStr) != "" { // On ignore les sections vides
 				chunksToProcess = append(chunksToProcess, &indexableChunk{
 					Section:  s,
 					Text:     textStr,

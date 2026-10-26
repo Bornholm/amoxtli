@@ -1,6 +1,7 @@
 package bleve
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/url"
@@ -95,6 +96,14 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 		return errors.WithStack(err)
 	}
 
+	// The sections skipped as blank never report their progress, so the count
+	// below can stop short of 1.
+	defer func() {
+		if opts.OnProgress != nil {
+			opts.OnProgress(1.0)
+		}
+	}()
+
 	totalSections := model.CountSections(document)
 
 	totalIndexed := 0
@@ -184,7 +193,7 @@ func (i *Index) getIndexableResource(ctx context.Context, section model.Section)
 		return "", nil, errors.WithStack(err)
 	}
 
-	if len(content) == 0 {
+	if len(bytes.TrimSpace(content)) == 0 {
 		return "", nil, nil
 	}
 
