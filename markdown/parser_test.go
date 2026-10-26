@@ -3,6 +3,7 @@ package markdown
 import (
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -136,24 +137,114 @@ func TestParseLongHeadingWithInlines(t *testing.T) {
 	words := strings.Repeat("word ", 300)
 	source := "# " + words + "*bold* " + words + "\n\nBody.\n"
 
+	headingEnd := strings.Index(source, "\n\nBody.")
+
 	doc, err := Parse([]byte(source), WithMaxWordPerSection(250))
 	if err != nil {
 		t.Fatalf("%+v", errors.WithStack(err))
 	}
 
+	foundBody := false
+
 	if err := model.WalkSections(doc, func(s model.Section) error {
 		if s.Start() > s.End() {
 			return errors.Errorf("section %s starts at %d, past its end %d", s.ID(), s.Start(), s.End())
 		}
-		if _, err := s.Content(); err != nil {
+
+		// The heading is one node: no section may begin or end within it.
+		if s.Start() > 0 && s.Start() < headingEnd {
+			return errors.Errorf("section %s starts at %d, within the heading [0:%d]", s.ID(), s.Start(), headingEnd)
+		}
+		if s.End() > 0 && s.End() < headingEnd {
+			return errors.Errorf("section %s ends at %d, within the heading [0:%d]", s.ID(), s.End(), headingEnd)
+		}
+
+		content, err := s.Content()
+		if err != nil {
 			return errors.WithStack(err)
+		}
+
+		if strings.Contains(string(content), "Body.") {
+			foundBody = true
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	if !foundBody {
+		t.Error("the paragraph following the heading is in no section")
+	}
+
+	dumpDocument(t, doc)
+}
+
+// TestParseSplitsLongBody: not splitting on the nodes a section already covers
+// must leave the split on the blocks that extend it alone — a body longer than
+// MaxWordPerSection still ends up in several sections.
+func TestParseSplitsLongBody(t *testing.T) {
+	first := strings.Repeat("first ", 300)
+	second := strings.Repeat("second ", 10)
+	source := "# Title\n\n" + first + "\n\n" + second + "\n"
+
+	doc, err := Parse([]byte(source), WithMaxWordPerSection(250))
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	var found model.Section
+	if err := model.WalkSections(doc, func(s model.Section) error {
+		content, err := s.Content()
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if strings.HasPrefix(string(content), "second") {
+			found = s
 		}
 		return nil
 	}); err != nil {
 		t.Fatalf("%+v", errors.WithStack(err))
 	}
 
-	dumpDocument(t, doc)
+	if found == nil {
+		dumpDocument(t, doc)
+		t.Fatal("expected the paragraph following the overflowing one to open a section of its own")
+	}
+}
+
+// TestParseSiblingBranches: the branch of a section used to be appended to its
+// parent's without a copy, so that once that slice had spare capacity the next
+// sibling overwrote the last ID of the previous one. A document whose first
+// heading is not pruned — some text before it — kept the corrupted branches.
+func TestParseSiblingBranches(t *testing.T) {
+	const source = "intro\n\n# A\n\n## B\n\n### B1\n\nfirst\n\n### B2\n\nsecond\n\n### B3\n\nthird\n"
+
+	doc, err := Parse([]byte(source))
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	if err := model.WalkSections(doc, func(s model.Section) error {
+		branch := s.Branch()
+
+		if last := branch[len(branch)-1]; last != s.ID() {
+			return errors.Errorf("branch of section %s ends with %s", s.ID(), last)
+		}
+
+		parent, ok := s.Parent().(*Section)
+		if !ok || parent == nil {
+			return nil
+		}
+
+		if !slices.Equal(branch[:len(branch)-1], parent.Branch()) {
+			return errors.Errorf("branch of section %s is %v, want its parent's %v followed by its own ID", s.ID(), branch, parent.Branch())
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
 }
 
 // findSection looks a section up by ID in the document tree.
