@@ -79,9 +79,9 @@ Ne font **pas** partie de la surface stable et peuvent changer à tout moment :
 - **Sections markdown vides.** `markdown.Parse` ne produit plus de section
   vide après un découpage par nombre de mots. Un document réindexé peut donc
   compter moins de sections qu'avant. Sur les documents de test, il en perd une
-  ou deux (203 sections au lieu de 205 pour `le_horla.md`). `index/bleve`
-  ignore aussi une section dont le contenu n'est fait que de blancs, comme le
-  faisait déjà `index/sqlitevec`.
+  ou deux (203 sections au lieu de 205 pour `le_horla.md`). `index/bleve` et
+  `index/postgres` ignorent aussi une section dont le contenu n'est fait que de
+  blancs, comme le faisait déjà `index/sqlitevec`.
 
 ## Contraintes de dépendances
 

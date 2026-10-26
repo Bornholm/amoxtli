@@ -396,7 +396,8 @@ Une section ouverte par le découpage peut rester vide. C'est le cas quand le
 bloc qui a rempli la précédente termine le document, ou quand un titre de même
 niveau ou de niveau plus haut le suit. `markdown.Parse` retire ces sections une
 fois le document parcouru, comme celles qui couvrent exactement la plage de
-leur parent.
+leur parent. La section racine reste toujours, même vide : un document sans
+texte garde ainsi une section.
 
 La plage d'une section couvre celles de ses sous-sections, et son contenu
 inclut donc le leur. La section racine couvre tout le document. Après le

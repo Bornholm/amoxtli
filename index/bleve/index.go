@@ -96,6 +96,14 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 		return errors.WithStack(err)
 	}
 
+	// The sections skipped as blank never report their progress, so the count
+	// below can stop short of 1.
+	defer func() {
+		if opts.OnProgress != nil {
+			opts.OnProgress(1.0)
+		}
+	}()
+
 	totalSections := model.CountSections(document)
 
 	totalIndexed := 0
