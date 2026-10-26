@@ -309,6 +309,19 @@ func TestParseDropsEmptySections(t *testing.T) {
 	}
 }
 
+// TestParseKeepsEmptyRoot: pruning the empty sections must leave the root one
+// alone, so that a document without text still has a section.
+func TestParseKeepsEmptyRoot(t *testing.T) {
+	doc, err := Parse([]byte(""))
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	if e, g := 1, model.CountSections(doc); e != g {
+		t.Errorf("model.CountSections(doc): expected %d, got %d", e, g)
+	}
+}
+
 // TestParseSiblingBranches: Parse used to append a section's ID to its
 // parent's branch without a copy. Once that slice had spare capacity, the next
 // sibling overwrote the last ID of the previous one. Documents with text before

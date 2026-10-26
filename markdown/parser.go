@@ -275,6 +275,8 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 // section right after the node that filled the previous one, and nothing fills
 // it when that node is the last one, or when a heading of the same or a higher
 // level comes next. Such a section holds no text, yet the indexes would store it.
+// The root section stays, even empty: a document always has one. An inverted
+// range is a parser bug, so it stays too, where the tests can see it.
 //
 // It runs on the finished tree instead of during the walk: a heading looks
 // redundant the moment it is entered, before the sub-sections that make it a
@@ -288,7 +290,7 @@ func pruneRedundant(sections []*Section, parent *Section) []*Section {
 	for _, s := range sections {
 		s.sections = pruneRedundant(s.sections, s)
 
-		if parent != nil && (s.start >= s.end || (s.start == parent.start && s.end == parent.end)) {
+		if parent != nil && (s.start == s.end || (s.start == parent.start && s.end == parent.end)) {
 			for _, child := range s.sections {
 				child.parent = parent
 				rebranch(child, parent.branch)
