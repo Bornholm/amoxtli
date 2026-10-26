@@ -392,6 +392,12 @@ Un titre n'est jamais coupé en deux. S'il fait à lui seul plus de
 puis converti par pandoc, le découpage tombe à la fin de sa ligne et le bloc
 suivant ouvre sa propre section.
 
+Une section ouverte par le découpage peut rester vide. C'est le cas quand le
+bloc qui a rempli la précédente termine le document, ou quand un titre de même
+niveau ou de niveau plus haut le suit. `markdown.Parse` retire ces sections une
+fois le document parcouru, comme celles qui couvrent exactement la plage de
+leur parent.
+
 La plage d'une section couvre celles de ses sous-sections, et son contenu
 inclut donc le leur. La section racine couvre tout le document. Après le
 découpage d'un titre long, la section du titre contient aussi le bloc suivant,
