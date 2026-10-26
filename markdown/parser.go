@@ -133,7 +133,7 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 
 				if current.parent != nil {
 					current.parent.sections = append(current.parent.sections, current)
-					current.branch = append(current.parent.branch, current.id)
+					current.branch = append(slices.Clone(current.parent.branch), current.id)
 				} else {
 					document.sections = append(document.sections, current)
 					current.branch = []model.SectionID{current.id}
@@ -150,7 +150,7 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 
 				if current.parent != nil {
 					current.parent.sections = append(current.parent.sections, current)
-					current.branch = append(current.parent.branch, current.id)
+					current.branch = append(slices.Clone(current.parent.branch), current.id)
 				} else {
 					document.sections = append(document.sections, current)
 					current.branch = []model.SectionID{current.id}
@@ -218,12 +218,12 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 				end:      end,
 			}
 
-			current.branch = append(previous.branch, current.id)
+			current.branch = append(slices.Clone(previous.branch), current.id)
 
 			if split {
 				current.level = previous.level
 				current.parent = previous.parent
-				current.branch = append(previous.parent.branch, current.id)
+				current.branch = append(slices.Clone(previous.parent.branch), current.id)
 				previous.parent.sections = append(previous.parent.sections, current)
 			} else {
 				current.start = previous.end
