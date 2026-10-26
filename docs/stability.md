@@ -66,6 +66,16 @@ Ne font **pas** partie de la surface stable et peuvent changer à tout moment :
   à l'ingestion continuent d'écraser celles du parseur. C'est le mécanisme par
   lequel le convertisseur d'images injecte `type=image` (voir
   [images.md](images.md)).
+- **Branches des sections markdown.** Jusqu'ici, `markdown.Parse` pouvait
+  remplacer le dernier identifiant de la branche d'une section par celui d'une
+  section sœur. Seuls les documents dont le premier titre n'ouvre pas le
+  fichier étaient touchés, par exemple quand du texte le précède. Les sections
+  déjà enregistrées gardent leur branche fausse jusqu'à la réindexation du
+  document.
+- **Plage inversée dans `Chunk`.** `model.Document.Chunk` renvoie maintenant
+  une erreur quand `start` dépasse `end`, au lieu de paniquer. Les quatre
+  implémentations fournies le font, et `model/testsuite.TestChunk` vérifie ce
+  contrat pour une implémentation tierce.
 
 ## Contraintes de dépendances
 

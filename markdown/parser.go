@@ -108,6 +108,45 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 
 	split := false
 
+	// splitAfter opens a new section once s holds MaxWordPerSection words and
+	// returns it, or returns s while it has room left. The new section starts
+	// where s ends, so the node that filled s stays in s.
+	splitAfter := func(s *Section, end int) (*Section, error) {
+		chunk, err := s.Content()
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		if totalWords := len(corpusText.SplitByWords(string(chunk))); totalWords < opts.MaxWordPerSection {
+			return s, nil
+		}
+
+		next := &Section{
+			document: document,
+			id:       model.NewSectionID(),
+			level:    s.level + 1,
+			sections: make([]*Section, 0),
+			parent:   s,
+			start:    s.end,
+			end:      end,
+		}
+
+		next.branch = append(slices.Clone(s.branch), next.id)
+
+		if split {
+			next.level = s.level
+			next.parent = s.parent
+			next.branch = append(slices.Clone(s.parent.branch), next.id)
+			s.parent.sections = append(s.parent.sections, next)
+		} else {
+			s.sections = append(s.sections, next)
+		}
+
+		split = true
+
+		return next, nil
+	}
+
 	err := ast.Walk(root, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
 			return ast.WalkContinue, nil
@@ -133,7 +172,7 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 
 				if current.parent != nil {
 					current.parent.sections = append(current.parent.sections, current)
-					current.branch = append(current.parent.branch, current.id)
+					current.branch = append(slices.Clone(current.parent.branch), current.id)
 				} else {
 					document.sections = append(document.sections, current)
 					current.branch = []model.SectionID{current.id}
@@ -150,7 +189,7 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 
 				if current.parent != nil {
 					current.parent.sections = append(current.parent.sections, current)
-					current.branch = append(current.parent.branch, current.id)
+					current.branch = append(slices.Clone(current.parent.branch), current.id)
 				} else {
 					document.sections = append(document.sections, current)
 					current.branch = []model.SectionID{current.id}
@@ -162,6 +201,15 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 				lastLine := lines.At(lines.Len() - 1)
 				current.start = firstLine.Start - (el.Level + 1)
 				current.AppendRange(lastLine.Stop)
+
+				// A heading longer than MaxWordPerSection is split at the end
+				// of its line, so the next block opens a section of its own.
+				next, err := splitAfter(current, lastLine.Stop)
+				if err != nil {
+					return ast.WalkStop, errors.WithStack(err)
+				}
+
+				current = next
 			} else {
 				return ast.WalkContinue, nil
 			}
@@ -189,40 +237,22 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 				return ast.WalkContinue, nil
 			}
 
+			// A node inside the current section adds nothing to it. The
+			// inlines of a heading are such nodes, since the heading branch
+			// already covers the whole line and counts its words. Splitting on
+			// one would open a section that starts past its own end.
+			if end <= current.end {
+				return ast.WalkContinue, nil
+			}
+
 			current.AppendRange(end)
 
-			currentChunk, err := current.Content()
+			next, err := splitAfter(current, end)
 			if err != nil {
 				return ast.WalkStop, errors.WithStack(err)
 			}
 
-			if totalWords := len(corpusText.SplitByWords(string(currentChunk))); totalWords < opts.MaxWordPerSection {
-				return ast.WalkContinue, nil
-			}
-
-			current = &Section{
-				document: document,
-				id:       model.NewSectionID(),
-				level:    current.level + 1,
-				sections: make([]*Section, 0),
-				parent:   previous,
-				start:    current.end,
-				end:      end,
-			}
-
-			current.branch = append(previous.branch, current.id)
-
-			if split {
-				current.level = previous.level
-				current.parent = previous.parent
-				current.branch = append(previous.parent.branch, current.id)
-				previous.parent.sections = append(previous.parent.sections, current)
-			} else {
-				current.start = previous.end
-				current.parent.sections = append(current.parent.sections, current)
-			}
-
-			split = true
+			current = next
 		}
 
 		return ast.WalkContinue, nil

@@ -121,7 +121,7 @@ func collectDocuments(v reflect.Value) []*Document {
 	var walk func(v reflect.Value)
 	walk = func(v reflect.Value) {
 		switch v.Kind() {
-		case reflect.Ptr:
+		case reflect.Pointer:
 			if v.IsNil() {
 				return
 			}
