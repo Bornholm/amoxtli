@@ -55,6 +55,10 @@ func (w *wrappedDocument) Chunk(start int, end int) ([]byte, error) {
 		end = len(w.d.Content)
 	}
 
+	if start > end {
+		return nil, errors.Errorf("invalid chunk range [%d:%d]", start, end)
+	}
+
 	return w.d.Content[start:end], nil
 }
 
