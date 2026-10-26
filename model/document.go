@@ -21,6 +21,9 @@ type Document interface {
 	Collections() []Collection
 	Sections() []Section
 	Content() ([]byte, error)
+	// Chunk returns the bytes of the content in [start:end]. It clamps a start
+	// below 0 and an end past the content, and returns an error when start
+	// still lies past end. model/testsuite.TestChunk checks this contract.
 	Chunk(start, end int) ([]byte, error)
 }
 

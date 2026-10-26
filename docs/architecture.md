@@ -378,6 +378,23 @@ source `file:` de la tâche — le répertoire du fichier *original*, pas celui 
 la copie temporaire sur laquelle travaille le handler. Voir
 [images.md](images.md).
 
+#### Découpage en sections
+
+`markdown.Parse` ouvre une section à chaque titre et la range sous le titre
+précédent de niveau plus haut (un `##` sous le dernier `#`). Il compte ensuite les mots de la section courante à
+chaque bloc ajouté. Quand elle atteint `MaxWordPerSection` (250 par défaut,
+`markdown.WithMaxWordPerSection`), il ouvre une nouvelle section juste après le
+bloc qui a fait déborder la précédente. Ce bloc reste donc dans la section
+qu'il a remplie, qui peut dépasser la limite.
+
+Un titre n'est jamais coupé en deux. S'il fait à lui seul plus de
+`MaxWordPerSection` mots, ce qui arrive avec un paragraphe docx stylé en titre
+puis converti par pandoc, le découpage tombe à la fin de sa ligne et le bloc
+suivant ouvre sa propre section.
+
+Chaque section porte sa branche, la liste des identifiants de ses ancêtres
+suivie du sien. `ingest/gorm` l'enregistre telle quelle.
+
 ### Runner de tâches persistant (`task/gorm`)
 
 L'ingestion (`IndexFile`, `Reindex`, `CleanupIndex`) est asynchrone : elle

@@ -6,9 +6,9 @@ import (
 	"github.com/bornholm/amoxtli/model"
 )
 
-// TestChunk checks the contract of model.Document.Chunk: an out-of-bounds
-// range is clamped to the content, an inverted one is reported as an error
-// rather than panicking. factory must return a document holding data.
+// TestChunk checks the contract of model.Document.Chunk. Chunk clamps a range
+// that runs out of the content and returns an error for an inverted one,
+// where slicing would panic. factory must return a document holding data.
 func TestChunk(t *testing.T, factory func(t *testing.T, data []byte) model.Document) {
 	type testCase struct {
 		Name          string
