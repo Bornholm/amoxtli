@@ -128,6 +128,34 @@ func TestParseDocumentStartingWithHeading(t *testing.T) {
 	}
 }
 
+// TestParseLongHeadingWithInlines: a heading longer than MaxWordPerSection and
+// holding several inline nodes — a paragraph styled as a title by a docx
+// converter — used to be split on one of its inlines, opening a section whose
+// start lay past its end and making Parse panic on the next one.
+func TestParseLongHeadingWithInlines(t *testing.T) {
+	words := strings.Repeat("word ", 300)
+	source := "# " + words + "*bold* " + words + "\n\nBody.\n"
+
+	doc, err := Parse([]byte(source), WithMaxWordPerSection(250))
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	if err := model.WalkSections(doc, func(s model.Section) error {
+		if s.Start() > s.End() {
+			return errors.Errorf("section %s starts at %d, past its end %d", s.ID(), s.Start(), s.End())
+		}
+		if _, err := s.Content(); err != nil {
+			return errors.WithStack(err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	dumpDocument(t, doc)
+}
+
 // findSection looks a section up by ID in the document tree.
 func findSection(doc *Document, id model.SectionID) (model.Section, error) {
 	var found model.Section

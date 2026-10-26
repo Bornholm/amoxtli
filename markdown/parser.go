@@ -189,6 +189,14 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 				return ast.WalkContinue, nil
 			}
 
+			// A node lying within the current section — the inlines of a
+			// heading, whose range already covers the whole line — adds no
+			// content to it: splitting there would open a section starting
+			// past its own end.
+			if end <= current.end {
+				return ast.WalkContinue, nil
+			}
+
 			current.AppendRange(end)
 
 			currentChunk, err := current.Content()
