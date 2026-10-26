@@ -1,6 +1,7 @@
 package bleve
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/url"
@@ -184,7 +185,7 @@ func (i *Index) getIndexableResource(ctx context.Context, section model.Section)
 		return "", nil, errors.WithStack(err)
 	}
 
-	if len(content) == 0 {
+	if len(bytes.TrimSpace(content)) == 0 {
 		return "", nil, nil
 	}
 
