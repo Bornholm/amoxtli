@@ -192,7 +192,8 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 			// A node lying within the current section — the inlines of a
 			// heading, whose range already covers the whole line — adds no
 			// content to it: splitting there would open a section starting
-			// past its own end.
+			// past its own end. A heading is thus never a split point, and one
+			// longer than MaxWordPerSection stays whole in a single section.
 			if end <= current.end {
 				return ast.WalkContinue, nil
 			}

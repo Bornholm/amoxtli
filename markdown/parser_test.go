@@ -134,9 +134,14 @@ func TestParseDocumentStartingWithHeading(t *testing.T) {
 // converter — used to be split on one of its inlines, opening a section whose
 // start lay past its end and making Parse panic on the next one.
 func TestParseLongHeadingWithInlines(t *testing.T) {
-	words := strings.Repeat("word ", 300)
-	source := "# " + words + "*bold* " + words + "\n\nBody.\n"
+	// The text before the heading keeps its section from being pruned as
+	// redundant with the root one, so that it can be looked up.
+	const intro = "intro\n\n"
 
+	words := strings.Repeat("word ", 300)
+	source := intro + "# " + words + "*bold* " + words + "\n\nBody.\n"
+
+	headingStart := len(intro)
 	headingEnd := strings.Index(source, "\n\nBody.")
 
 	doc, err := Parse([]byte(source), WithMaxWordPerSection(250))
@@ -144,7 +149,7 @@ func TestParseLongHeadingWithInlines(t *testing.T) {
 		t.Fatalf("%+v", errors.WithStack(err))
 	}
 
-	foundBody := false
+	var heading model.Section
 
 	if err := model.WalkSections(doc, func(s model.Section) error {
 		if s.Start() > s.End() {
@@ -152,20 +157,19 @@ func TestParseLongHeadingWithInlines(t *testing.T) {
 		}
 
 		// The heading is one node: no section may begin or end within it.
-		if s.Start() > 0 && s.Start() < headingEnd {
-			return errors.Errorf("section %s starts at %d, within the heading [0:%d]", s.ID(), s.Start(), headingEnd)
+		if s.Start() > headingStart && s.Start() < headingEnd {
+			return errors.Errorf("section %s starts at %d, within the heading [%d:%d]", s.ID(), s.Start(), headingStart, headingEnd)
 		}
-		if s.End() > 0 && s.End() < headingEnd {
-			return errors.Errorf("section %s ends at %d, within the heading [0:%d]", s.ID(), s.End(), headingEnd)
+		if s.End() > headingStart && s.End() < headingEnd {
+			return errors.Errorf("section %s ends at %d, within the heading [%d:%d]", s.ID(), s.End(), headingStart, headingEnd)
 		}
 
-		content, err := s.Content()
-		if err != nil {
+		if _, err := s.Content(); err != nil {
 			return errors.WithStack(err)
 		}
 
-		if strings.Contains(string(content), "Body.") {
-			foundBody = true
+		if s.Start() == headingStart {
+			heading = s
 		}
 
 		return nil
@@ -173,11 +177,23 @@ func TestParseLongHeadingWithInlines(t *testing.T) {
 		t.Fatalf("%+v", errors.WithStack(err))
 	}
 
-	if !foundBody {
-		t.Error("the paragraph following the heading is in no section")
+	if heading == nil {
+		dumpDocument(t, doc)
+		t.Fatalf("expected a section starting with the heading at %d", headingStart)
 	}
 
-	dumpDocument(t, doc)
+	content, err := heading.Content()
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	if !strings.Contains(string(content), "bold") {
+		t.Error("the section of the heading misses its emphasis")
+	}
+
+	if e, g := 601, len(text.SplitByWords(string(content))); g < e {
+		t.Errorf("the section of the heading holds %d words, expected at least the %d of the heading", g, e)
+	}
 }
 
 // TestParseSplitsLongBody: not splitting on the nodes a section already covers
@@ -213,6 +229,21 @@ func TestParseSplitsLongBody(t *testing.T) {
 	}
 }
 
+// TestParseSplitBranches: the sections opened by the word-count split get their
+// branch the same way as those opened by a heading, and must not share it
+// either.
+func TestParseSplitBranches(t *testing.T) {
+	paragraph := strings.Repeat("word ", 300) + "\n\n"
+	source := "intro\n\n# A\n\n## B\n\n" + strings.Repeat(paragraph, 4)
+
+	doc, err := Parse([]byte(source), WithMaxWordPerSection(250))
+	if err != nil {
+		t.Fatalf("%+v", errors.WithStack(err))
+	}
+
+	assertBranches(t, doc)
+}
+
 // TestParseSiblingBranches: the branch of a section used to be appended to its
 // parent's without a copy, so that once that slice had spare capacity the next
 // sibling overwrote the last ID of the previous one. A document whose first
@@ -224,6 +255,14 @@ func TestParseSiblingBranches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%+v", errors.WithStack(err))
 	}
+
+	assertBranches(t, doc)
+}
+
+// assertBranches checks that the branch of every section is the one of its
+// parent followed by its own ID.
+func assertBranches(t *testing.T, doc *Document) {
+	t.Helper()
 
 	if err := model.WalkSections(doc, func(s model.Section) error {
 		branch := s.Branch()
