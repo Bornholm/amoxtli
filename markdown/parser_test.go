@@ -129,75 +129,96 @@ func TestParseDocumentStartingWithHeading(t *testing.T) {
 	}
 }
 
-// TestParseLongHeadingWithInlines: a heading longer than MaxWordPerSection and
-// holding several inline nodes — a paragraph styled as a title by a docx
-// converter — used to be split on one of its inlines, opening a section whose
-// start lay past its end and making Parse panic on the next one.
-func TestParseLongHeadingWithInlines(t *testing.T) {
-	// The text before the heading keeps its section from being pruned as
-	// redundant with the root one, so that it can be looked up.
-	const intro = "intro\n\n"
-
-	words := strings.Repeat("word ", 300)
-	source := intro + "# " + words + "*bold* " + words + "\n\nBody.\n"
-
-	headingStart := len(intro)
-	headingEnd := strings.Index(source, "\n\nBody.")
-
-	doc, err := Parse([]byte(source), WithMaxWordPerSection(250))
-	if err != nil {
-		t.Fatalf("%+v", errors.WithStack(err))
+// TestParseLongHeading: a heading longer than MaxWordPerSection is split at the
+// end of its line, so the block after it opens a section of its own. Pandoc
+// produces such headings from a docx paragraph styled as a title. When one
+// held several inline nodes, Parse used to split on one of them, open a
+// section starting past its end, and panic on the next inline.
+func TestParseLongHeading(t *testing.T) {
+	type testCase struct {
+		Name    string
+		Heading string
 	}
 
-	var heading model.Section
+	words := strings.Repeat(" word", 300)
 
-	if err := model.WalkSections(doc, func(s model.Section) error {
-		if s.Start() > s.End() {
-			return errors.Errorf("section %s starts at %d, past its end %d", s.ID(), s.Start(), s.End())
-		}
-
-		// The heading is one node: no section may begin or end within it.
-		if s.Start() > headingStart && s.Start() < headingEnd {
-			return errors.Errorf("section %s starts at %d, within the heading [%d:%d]", s.ID(), s.Start(), headingStart, headingEnd)
-		}
-		if s.End() > headingStart && s.End() < headingEnd {
-			return errors.Errorf("section %s ends at %d, within the heading [%d:%d]", s.ID(), s.End(), headingStart, headingEnd)
-		}
-
-		if _, err := s.Content(); err != nil {
-			return errors.WithStack(err)
-		}
-
-		if s.Start() == headingStart {
-			heading = s
-		}
-
-		return nil
-	}); err != nil {
-		t.Fatalf("%+v", errors.WithStack(err))
+	testCases := []testCase{
+		{Name: "text only", Heading: "#" + words + words},
+		{Name: "with inlines", Heading: "#" + words + " *bold*" + words},
 	}
 
-	if heading == nil {
-		dumpDocument(t, doc)
-		t.Fatalf("expected a section starting with the heading at %d", headingStart)
-	}
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			// The text before the heading keeps pruneRedundant from merging
+			// its section into the root one, so the test can look it up.
+			const intro = "intro\n\n"
 
-	content, err := heading.Content()
-	if err != nil {
-		t.Fatalf("%+v", errors.WithStack(err))
-	}
+			source := intro + tc.Heading + "\n\nBody.\n"
 
-	if !strings.Contains(string(content), "bold") {
-		t.Error("the section of the heading misses its emphasis")
-	}
+			headingStart := len(intro)
+			headingEnd := headingStart + len(tc.Heading)
 
-	if e, g := 601, len(text.SplitByWords(string(content))); g < e {
-		t.Errorf("the section of the heading holds %d words, expected at least the %d of the heading", g, e)
+			doc, err := Parse([]byte(source), WithMaxWordPerSection(250))
+			if err != nil {
+				t.Fatalf("%+v", errors.WithStack(err))
+			}
+
+			var heading, body model.Section
+
+			if err := model.WalkSections(doc, func(s model.Section) error {
+				if s.Start() > s.End() {
+					return errors.Errorf("section %s starts at %d, past its end %d", s.ID(), s.Start(), s.End())
+				}
+
+				// The heading is one node: no section may begin or end within it.
+				if s.Start() > headingStart && s.Start() < headingEnd {
+					return errors.Errorf("section %s starts at %d, within the heading [%d:%d]", s.ID(), s.Start(), headingStart, headingEnd)
+				}
+				if s.End() > headingStart && s.End() < headingEnd {
+					return errors.Errorf("section %s ends at %d, within the heading [%d:%d]", s.ID(), s.End(), headingStart, headingEnd)
+				}
+
+				content, err := s.Content()
+				if err != nil {
+					return errors.WithStack(err)
+				}
+
+				switch {
+				case s.Start() == headingStart:
+					heading = s
+				case s.Start() >= headingEnd && strings.Contains(string(content), "Body."):
+					body = s
+				}
+
+				return nil
+			}); err != nil {
+				t.Fatalf("%+v", errors.WithStack(err))
+			}
+
+			if heading == nil {
+				dumpDocument(t, doc)
+				t.Fatalf("expected a section starting with the heading at %d", headingStart)
+			}
+
+			content, err := heading.Content()
+			if err != nil {
+				t.Fatalf("%+v", errors.WithStack(err))
+			}
+
+			if e, g := 600, len(text.SplitByWords(string(content))); g < e {
+				t.Errorf("the section of the heading holds %d words, expected at least the %d of the heading", g, e)
+			}
+
+			if body == nil {
+				dumpDocument(t, doc)
+				t.Fatal("expected the paragraph following the heading to open a section of its own")
+			}
+		})
 	}
 }
 
-// TestParseSplitsLongBody: not splitting on the nodes a section already covers
-// must leave the split on the blocks that extend it alone — a body longer than
+// TestParseSplitsLongBody: skipping the nodes a section already covers must not
+// stop the split on the blocks that extend it. A body longer than
 // MaxWordPerSection still ends up in several sections.
 func TestParseSplitsLongBody(t *testing.T) {
 	first := strings.Repeat("first ", 300)
@@ -229,9 +250,8 @@ func TestParseSplitsLongBody(t *testing.T) {
 	}
 }
 
-// TestParseSplitBranches: the sections opened by the word-count split get their
-// branch the same way as those opened by a heading, and must not share it
-// either.
+// TestParseSplitBranches: the sections the word-count split opens build their
+// branch like those a heading opens, and must not share it either.
 func TestParseSplitBranches(t *testing.T) {
 	paragraph := strings.Repeat("word ", 300) + "\n\n"
 	source := "intro\n\n# A\n\n## B\n\n" + strings.Repeat(paragraph, 4)
@@ -244,10 +264,11 @@ func TestParseSplitBranches(t *testing.T) {
 	assertBranches(t, doc)
 }
 
-// TestParseSiblingBranches: the branch of a section used to be appended to its
-// parent's without a copy, so that once that slice had spare capacity the next
-// sibling overwrote the last ID of the previous one. A document whose first
-// heading is not pruned — some text before it — kept the corrupted branches.
+// TestParseSiblingBranches: Parse used to append a section's ID to its
+// parent's branch without a copy. Once that slice had spare capacity, the next
+// sibling overwrote the last ID of the previous one. Documents with text before
+// their first heading kept the corrupted branches, since that heading is not
+// pruned.
 func TestParseSiblingBranches(t *testing.T) {
 	const source = "intro\n\n# A\n\n## B\n\n### B1\n\nfirst\n\n### B2\n\nsecond\n\n### B3\n\nthird\n"
 
