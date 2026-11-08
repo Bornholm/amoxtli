@@ -213,83 +213,53 @@ func (i *Index) Search(ctx context.Context, query string, opts index.SearchOptio
 		queries = append(queries, bleve.NewDisjunctionQuery(collectionQueries...))
 	}
 
-	req := bleve.NewSearchRequest(bleve.NewConjunctionQuery(queries...))
-
-	req.From = 0
-	req.Fields = []string{"source"}
-
-	if opts.MaxResults > 0 {
-		req.Size = opts.MaxResults
+	// A hit is a section, but MaxResults counts sources: page through the
+	// hits until that many sources are reached (a long document can fill a
+	// page on its own), within a bound on the hits read.
+	maxResults := opts.MaxResults
+	if maxResults <= 0 {
+		maxResults = 10
 	}
+	pageSize := maxResults * 4
+	maxHits := maxResults * maxHitsPerResult
 
-	result, err := i.index.SearchInContext(ctx, req)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
+	var hits []index.Hit
+	for from := 0; from < maxHits; from += pageSize {
+		req := bleve.NewSearchRequest(bleve.NewConjunctionQuery(queries...))
+		req.From = from
+		req.Size = min(pageSize, maxHits-from)
+		req.Fields = []string{"source"}
 
-	mappedScores := map[string]float64{}
-	mappedSections := map[string][]model.SectionID{}
-	mappedSectionScores := map[string]map[model.SectionID]float64{}
-
-	for _, r := range result.Hits {
-		rawSource, ok := r.Fields["source"].(string)
-		if !ok {
-			continue
-		}
-
-		source, err := url.Parse(rawSource)
+		result, err := i.index.SearchInContext(ctx, req)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
 
-		sectionID := model.SectionID(r.ID)
+		for _, r := range result.Hits {
+			rawSource, ok := r.Fields["source"].(string)
+			if !ok {
+				continue
+			}
 
-		source.Fragment = ""
-		key := source.String()
+			source, err := url.Parse(rawSource)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			source.Fragment = ""
 
-		sectionIDs, exists := mappedSections[key]
-		if !exists {
-			sectionIDs = make([]model.SectionID, 0)
-			mappedSectionScores[key] = map[model.SectionID]float64{}
+			hits = append(hits, index.Hit{Source: source.String(), Section: model.SectionID(r.ID), Score: r.Score})
 		}
 
-		sectionIDs = append(sectionIDs, sectionID)
-
-		mappedSections[key] = sectionIDs
-		mappedScores[key] += r.Score
-		mappedSectionScores[key][sectionID] += r.Score
+		if len(result.Hits) < req.Size || index.CountSources(hits) >= maxResults {
+			break
+		}
 	}
 
-	searchResults := make([]*index.SearchResult, 0)
-
-	for rawSource, sectionIDs := range mappedSections {
-		source, err := url.Parse(rawSource)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-
-		searchResults = append(searchResults, &index.SearchResult{
-			Source:        source,
-			Sections:      sectionIDs,
-			Score:         mappedScores[rawSource],
-			SectionScores: mappedSectionScores[rawSource],
-		})
-	}
-
-	slices.SortFunc(searchResults, func(r1 *index.SearchResult, r2 *index.SearchResult) int {
-		score1 := mappedScores[r1.Source.String()]
-		score2 := mappedScores[r2.Source.String()]
-		if score1 > score2 {
-			return -1
-		}
-		if score1 < score2 {
-			return 1
-		}
-		return 0
-	})
-
-	return searchResults, nil
+	return index.AggregateHits(hits, maxResults)
 }
+
+// maxHitsPerResult bounds the section hits read per requested source.
+const maxHitsPerResult = 64
 
 // Close releases the resources held by the underlying bleve index.
 func (i *Index) Close() error {
