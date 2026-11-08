@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/internal/cdc"
@@ -46,12 +47,18 @@ type Index struct {
 	simpleUnion       bool
 	efSearchFactor    int
 	// bm25 scores the full-text leg with BM25 instead of ts_rank (see
-	// bm25.go); bm25Mu, bm25Chunks and bm25Changed track its lexeme
-	// statistics.
-	bm25        bool
-	bm25Mu      sync.Mutex
-	bm25Chunks  int64
-	bm25Changed atomic.Int64
+	// bm25.go). bm25Mu guards bm25Chunks, the number of chunks the stored
+	// lexeme statistics were computed on (0: none known), and bm25Checked,
+	// when they were last compared with the table; bm25Changed counts the
+	// chunks this process wrote or deleted since. bm25RefreshMu and
+	// bm25Refreshing let one recomputation run at a time.
+	bm25           bool
+	bm25Mu         sync.Mutex
+	bm25Chunks     int64
+	bm25Checked    time.Time
+	bm25Changed    atomic.Int64
+	bm25RefreshMu  sync.Mutex
+	bm25Refreshing atomic.Bool
 }
 
 const (
@@ -609,6 +616,25 @@ func (i *Index) tsvectorExpr(configExpr, textExpr string) string {
 	return lang + " || to_tsvector('simple', unaccent(" + textExpr + "))"
 }
 
+// queryLexemesExpr builds the SQL producing the lexemes a query searches for,
+// as a text array: the language's, and with the 'simple' union the unstemmed
+// words too, except the language's stop words. ts_rank has no IDF, and BM25's
+// is not negligible on a small table: a stop word kept from the 'simple'
+// config made either rank a section on its articles and pronouns.
+func (i *Index) queryLexemesExpr(configExpr, textExpr string) string {
+	lang := "tsvector_to_array(to_tsvector(" + configExpr + ", unaccent(" + textExpr + ")))"
+	if !i.simpleUnion {
+		return lang
+	}
+
+	return `(SELECT array_agg(w) FROM (
+			SELECT unnest(` + lang + `) AS w
+			UNION
+			SELECT w FROM unnest(tsvector_to_array(to_tsvector('simple', unaccent(` + textExpr + `)))) AS w
+			WHERE to_tsvector(` + configExpr + `, w) <> ''::tsvector
+		) words)`
+}
+
 // rankExpr builds the ts_rank call ordering the full-text leg. The
 // normalization argument is omitted when zero so that an index configured with
 // the defaults emits exactly the SQL it always did.
@@ -639,9 +665,7 @@ func (i *Index) ftsSearch(ctx context.Context, pool *pgxpool.Pool, query string,
 			SELECT to_tsquery('simple', string_agg(quoted, ' | ')) AS query
 			FROM (
 				SELECT '''' || replace(lexeme, '''', '''''') || '''' AS quoted
-				FROM unnest(tsvector_to_array(
-					` + i.tsvectorExpr(configParam+"::regconfig", queryParam) + `
-				)) AS lexeme
+				FROM unnest(` + i.queryLexemesExpr(configParam+"::regconfig", queryParam) + `) AS lexeme
 			) lexemes
 		)
 		SELECT c.id, c.source, c.section_id

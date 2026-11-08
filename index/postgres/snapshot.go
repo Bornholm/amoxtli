@@ -124,6 +124,11 @@ func (i *Index) RestoreSnapshot(ctx context.Context, r io.Reader) error {
 		return errors.WithStack(err)
 	}
 
+	// The lexeme statistics described the chunks just removed.
+	if err := i.forgetLexemeStats(ctx, pool); err != nil {
+		return errors.WithStack(err)
+	}
+
 	batchSize := 1000
 	batch := make([]*SnapshottedRecord, 0, batchSize)
 

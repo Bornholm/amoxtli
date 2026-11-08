@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/bornholm/amoxtli/index"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/errors"
 )
@@ -22,14 +21,18 @@ import (
 // times longer.
 //
 // The BM25 leg keeps a table of the number of chunks each lexeme occurs in,
-// built with ts_stat and refreshed when the chunks have changed by more than
-// a tenth since. It drops from the query the lexemes found in more than
+// built with ts_stat. It drops from the query the lexemes found in more than
 // bm25MaxDFRatio of the chunks, keeps the bm25MaxLexemes rarest, matches the
 // chunks containing one of the rarest of those through the GIN index and
-// scores them with BM25. The term frequency
-// is the number of positions of the lexeme in the chunk's tsvector, and the
-// chunk length its number of lexemes. Taking the term frequency as 1 lost 6
-// points of recall at 10 on the AN.
+// scores them with BM25. The term frequency is the number of positions of the
+// lexeme in the chunk's tsvector, and the chunk length its number of lexemes.
+// Taking the term frequency as 1 lost 6 points of recall at 10 on the AN.
+//
+// The statistics are computed again once the chunks have changed by more than
+// bm25RefreshRatio: counted here for this process's writes, and checked
+// against the table every bm25CheckEvery for the writes of other processes and
+// for restores. A search never waits for that recomputation, except the first
+// one on a table that has no statistics yet.
 
 const (
 	bm25K1 = 1.2
@@ -39,21 +42,31 @@ const (
 	// them makes the query match a large part of the table. 0.3 gained under
 	// a point of recall at 10 on the AN for twice the time; 0.03 lost 4.
 	bm25MaxDFRatio = 0.1
+	// bm25MinDFCutoff is the floor of that cutoff, in chunks: on a small
+	// table a tenth of the chunks is less than one, which would drop every
+	// lexeme, and matching all the chunks costs nothing there.
+	bm25MinDFCutoff = 1000
 	// bm25MaxLexemes keeps the rarest lexemes of a long query. On the AN
 	// (long written questions), 24 gave a recall at 10 of .678 on val, 48
 	// .712 and 96 .711; 12 fell to .627.
 	bm25MaxLexemes = 48
 	// bm25MatchPostings bounds the chunks the query matches: only the rarest
-	// kept lexemes select the candidates, until their document frequencies
-	// add up to this number; all the kept lexemes still score them. Each
-	// lexeme under the bm25MaxDFRatio cutoff may occur in 67,000 chunks of a
-	// 672,000-chunk corpus (MLDR), and scoring every match took 2.1 s per
-	// query. With 20,000 it takes 0.5 s for the same recall on MLDR and the
-	// AN; 5,000 lost a point of recall at 50 on MLDR.
+	// kept lexemes select the candidates, added in order while their document
+	// frequencies sum to less than this number (the rarest one is always
+	// added, and it may occur in up to the bm25MaxDFRatio cutoff); all the
+	// kept lexemes still score them. Each lexeme under the cutoff may occur
+	// in 67,000 chunks of a 672,000-chunk corpus (MLDR), and scoring every
+	// match took 2.1 s per query. With 20,000 it takes 0.5 s for the same
+	// recall on MLDR and the AN; 5,000 lost a point of recall at 50 on MLDR.
 	bm25MatchPostings = 20000
 	// bm25RefreshRatio is the share of the chunks that may change before the
 	// lexeme statistics are computed again.
 	bm25RefreshRatio = 0.1
+	// bm25CheckEvery is how often the statistics are checked against the
+	// number of chunks in the table.
+	bm25CheckEvery = time.Minute
+	// bm25RefreshTimeout bounds a recomputation run in the background.
+	bm25RefreshTimeout = 30 * time.Minute
 )
 
 func bm25Migrations() []string {
@@ -79,30 +92,99 @@ func (i *Index) noteChunksChanged(n int64) {
 	}
 }
 
-// ensureLexemeStats computes the lexeme statistics when there are none yet,
-// or when the chunks changed by more than bm25RefreshRatio since. Another
-// process may be computing them at the same time: an advisory lock makes it
-// wait, then the statistics are read again.
+// forgetLexemeStats drops the statistics, here and in the database, after the
+// whole table was replaced (RestoreSnapshot).
+func (i *Index) forgetLexemeStats(ctx context.Context, pool *pgxpool.Pool) error {
+	i.bm25Mu.Lock()
+	defer i.bm25Mu.Unlock()
+	for _, sql := range []string{`TRUNCATE amoxtli_lexeme_stats`, `DELETE FROM amoxtli_lexeme_stats_meta`} {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	i.bm25Chunks = 0
+	i.bm25Changed.Store(0)
+	return nil
+}
+
+// ensureLexemeStats makes sure the search has statistics to read. With none
+// usable it computes them before returning; with stale ones it starts a
+// recomputation in the background and returns at once.
 func (i *Index) ensureLexemeStats(ctx context.Context, pool *pgxpool.Pool) error {
+	stale, err := i.checkLexemeStats(ctx, pool)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !stale {
+		return nil
+	}
+	i.bm25Mu.Lock()
+	have := i.bm25Chunks > 0
+	i.bm25Mu.Unlock()
+	if !have {
+		return i.refreshLexemeStats(ctx, pool, true)
+	}
+	if i.bm25Refreshing.CompareAndSwap(false, true) {
+		go func() {
+			defer i.bm25Refreshing.Store(false)
+			ctx, cancel := context.WithTimeout(context.Background(), bm25RefreshTimeout)
+			defer cancel()
+			if err := i.refreshLexemeStats(ctx, pool, false); err != nil {
+				slog.ErrorContext(ctx, "postgres: could not refresh the lexeme statistics", slog.Any("error", err))
+			}
+		}()
+	}
+	return nil
+}
+
+// checkLexemeStats reports whether the statistics must be computed again.
+// Without statistics in memory, or every bm25CheckEvery, it compares the
+// stored statistics with the number of chunks in the table.
+func (i *Index) checkLexemeStats(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 	i.bm25Mu.Lock()
 	defer i.bm25Mu.Unlock()
 
-	if i.bm25Chunks > 0 && float64(i.bm25Changed.Load()) <= bm25RefreshRatio*float64(i.bm25Chunks) {
-		return nil
+	if i.bm25Chunks > 0 && time.Since(i.bm25Checked) < bm25CheckEvery {
+		return float64(i.bm25Changed.Load()) > bm25RefreshRatio*float64(i.bm25Chunks), nil
 	}
 
-	var chunks int64
-	err := pool.QueryRow(ctx, `SELECT chunks FROM amoxtli_lexeme_stats_meta WHERE id = 1`).Scan(&chunks)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-	case err != nil:
-		return errors.WithStack(err)
+	var stored, current int64
+	err := pool.QueryRow(ctx, `SELECT
+			coalesce((SELECT chunks FROM amoxtli_lexeme_stats_meta WHERE id = 1), 0),
+			(SELECT count(*) FROM amoxtli_chunks)`).Scan(&stored, &current)
+	if err != nil {
+		return false, errors.WithStack(err)
 	}
-	if chunks > 0 && i.bm25Chunks == 0 && i.bm25Changed.Load() == 0 {
-		// Computed by an earlier process, nothing written since here.
-		i.bm25Chunks = chunks
-		return nil
+	i.bm25Checked = time.Now()
+	if stored == 0 {
+		i.bm25Chunks = 0
+		return true, nil
 	}
+	// Adopt what another process computed, or what this one computed last.
+	i.bm25Chunks = stored
+	drift := max(current-stored, stored-current)
+	return float64(max(drift, i.bm25Changed.Load())) > bm25RefreshRatio*float64(stored), nil
+}
+
+// refreshLexemeStats computes the statistics from the chunks; with
+// onlyIfMissing, not when another search computed them while this one waited.
+// Another process may be computing them at the same time: an advisory lock
+// makes it wait.
+func (i *Index) refreshLexemeStats(ctx context.Context, pool *pgxpool.Pool, onlyIfMissing bool) error {
+	i.bm25RefreshMu.Lock()
+	defer i.bm25RefreshMu.Unlock()
+
+	if onlyIfMissing {
+		i.bm25Mu.Lock()
+		have := i.bm25Chunks > 0
+		i.bm25Mu.Unlock()
+		if have {
+			return nil
+		}
+	}
+
+	// The writes counted from here on are not covered by this computation.
+	counted := i.bm25Changed.Load()
 
 	start := time.Now()
 	tx, err := pool.Begin(ctx)
@@ -127,6 +209,7 @@ func (i *Index) ensureLexemeStats(ctx context.Context, pool *pgxpool.Pool) error
 			return errors.Wrapf(err, "could not compute the lexeme statistics")
 		}
 	}
+	var chunks int64
 	if err := tx.QueryRow(ctx, `SELECT chunks FROM amoxtli_lexeme_stats_meta WHERE id = 1`).Scan(&chunks); err != nil {
 		return errors.WithStack(err)
 	}
@@ -134,8 +217,11 @@ func (i *Index) ensureLexemeStats(ctx context.Context, pool *pgxpool.Pool) error
 		return errors.WithStack(err)
 	}
 
+	i.bm25Mu.Lock()
 	i.bm25Chunks = max(chunks, 1)
-	i.bm25Changed.Store(0)
+	i.bm25Checked = time.Now()
+	i.bm25Changed.Add(-counted)
+	i.bm25Mu.Unlock()
 	slog.DebugContext(ctx, "postgres: lexeme statistics computed", slog.Int64("chunks", chunks), slog.Duration("elapsed", time.Since(start)))
 	return nil
 }
@@ -152,7 +238,7 @@ func (i *Index) ftsSearchBM25(ctx context.Context, pool *pgxpool.Pool, query str
 	configParam := a.bind(config)
 	queryParam := a.bind(query)
 
-	qexpr := i.tsvectorExpr(configParam+"::regconfig", queryParam)
+	qexpr := i.queryLexemesExpr(configParam+"::regconfig", queryParam)
 	sql := fmt.Sprintf(`
 		WITH meta AS (
 			SELECT chunks::float8 AS n, greatest(avg_len, 1) AS avg_len
@@ -160,7 +246,7 @@ func (i *Index) ftsSearchBM25(ctx context.Context, pool *pgxpool.Pool, query str
 		),
 		ql AS (
 			SELECT DISTINCT lexeme
-			FROM unnest(tsvector_to_array(`+qexpr+`)) AS lexeme
+			FROM unnest(`+qexpr+`) AS lexeme
 		),
 		kept AS (
 			SELECT ql.lexeme,
@@ -168,7 +254,7 @@ func (i *Index) ftsSearchBM25(ctx context.Context, pool *pgxpool.Pool, query str
 			FROM ql
 			CROSS JOIN meta m
 			LEFT JOIN amoxtli_lexeme_stats s ON s.lexeme = ql.lexeme
-			WHERE coalesce(s.ndoc, 0) <= %[1]g * m.n
+			WHERE coalesce(s.ndoc, 0) <= greatest(%[1]g * m.n, %[4]d)
 			ORDER BY idf DESC
 			LIMIT %[2]d
 		),
@@ -190,7 +276,7 @@ func (i *Index) ftsSearchBM25(ctx context.Context, pool *pgxpool.Pool, query str
 		cand AS (
 			SELECT c.id, c.source, c.section_id, c.tsv
 			FROM amoxtli_chunks c
-			CROSS JOIN q`, bm25MaxDFRatio, bm25MaxLexemes, bm25MatchPostings)
+			CROSS JOIN q`, bm25MaxDFRatio, bm25MaxLexemes, bm25MatchPostings, bm25MinDFCutoff)
 
 	if len(filter) > 0 {
 		sql += metadataJoin
