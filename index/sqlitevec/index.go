@@ -43,7 +43,7 @@ type Index struct {
 	connLock chan struct{}
 	// readers is the pool of dedicated read connections (NewIndexAtPath). When
 	// nil (NewIndex), searches take turns on the single caller-owned
-	// connection, under the write lock; with a pool, searches run on their own
+	// connection, under the connection lock; with a pool, searches run on their own
 	// connection and rely on WAL snapshot isolation instead, so they neither
 	// serialize on the writer nor on each other.
 	readers chan *sqlite3.Conn
@@ -225,7 +225,7 @@ func (i *Index) DeleteByID(ctx context.Context, ids ...model.SectionID) error {
 
 // deleteVecRows removes every vector-side row (embeddings_collections,
 // embeddings_vec2, embeddings_vec_map) attached to the given embeddings ids.
-// Callers hold the write lock and run inside a retry/savepoint.
+// Callers hold the connection lock and run inside a retry/savepoint.
 func deleteVecRows(conn *sqlite3.Conn, embeddingsIDs []int) error {
 	jsonIDsBytes, err := json.Marshal(embeddingsIDs)
 	if err != nil {
@@ -374,8 +374,8 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 		}
 	}()
 
-	// Compute the embeddings BEFORE taking the write lock: the LLM calls are the
-	// slow part, and holding the write lock across them would block every
+	// Compute the embeddings BEFORE taking the connection lock: the LLM calls are the
+	// slow part, and holding the connection lock across them would block every
 	// concurrent search on a NewIndex index (which takes the same lock) for
 	// their whole duration. As a bonus, a failure here leaves the existing content intact
 	// (the delete below only runs once the vectors are ready).
@@ -1177,7 +1177,7 @@ func resolveMatches(conn *sqlite3.Conn, matches []vecMatch) ([]index.Hit, error)
 // together with its release function. With a read pool (NewIndexAtPath) the
 // connection is one of the pooled readers — no lock is taken, WAL snapshot
 // isolation guarantees a consistent view during concurrent writes. Without a
-// pool (NewIndex) the single shared connection is returned under the write
+// pool (NewIndex) the single shared connection is returned under the connection
 // lock: a sqlite3.Conn is not safe for concurrent use, so two searches must
 // not run on it at the same time either (the wasm module fails with an out of
 // bounds memory access). Use NewIndexAtPath for concurrent searches.

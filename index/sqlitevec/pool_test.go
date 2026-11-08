@@ -2,8 +2,10 @@ package sqlitevec
 
 import (
 	"context"
+	"encoding/gob"
 	"fmt"
 	"io"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/markdown"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/pkg/errors"
 )
@@ -189,12 +192,15 @@ func TestIndexAtPathReadsAllDuringIndexing(t *testing.T) {
 	indexDoc(t, ctx, idx, "mem://alpha", "# Alpha\n\nThis section is about ALPHA topics.\n")
 
 	var wg sync.WaitGroup
+	errs := make(chan error, 21)
 	wg.Go(func() {
 		for n := range 10 {
-			indexDoc(t, ctx, idx, fmt.Sprintf("mem://gamma-%d", n), "# Gamma\n\nThis section is about GAMMA topics.\n")
+			if err := indexMarkdown(ctx, idx, fmt.Sprintf("mem://gamma-%d", n), "# Gamma\n\nThis section is about GAMMA topics.\n"); err != nil {
+				errs <- err
+				return
+			}
 		}
 	})
-	errs := make(chan error, 20)
 	for range 4 {
 		wg.Go(func() {
 			for range 5 {
@@ -221,4 +227,45 @@ func TestIndexAtPathReadsAllDuringIndexing(t *testing.T) {
 	for err := range errs {
 		t.Fatalf("concurrent read failed: %+v", errors.WithStack(err))
 	}
+}
+
+// TestAbandonedSnapshotReleasesTheIndex checks that a reader that stops
+// after the snapshot's header and closes the stream leaves the index usable.
+func TestAbandonedSnapshotReleasesTheIndex(t *testing.T) {
+	ctx := context.Background()
+	idx := newHermeticIndex(t, &keywordClient{})
+	indexDoc(t, ctx, idx, "mem://alpha", "# Alpha\n\nThis section is about ALPHA topics.\n")
+
+	snapshot, err := idx.GenerateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	var metadata SnapshottedMetadata
+	if err := gob.NewDecoder(snapshot).Decode(&metadata); err != nil {
+		t.Fatalf("%+v", err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := indexMarkdown(waitCtx, idx, "mem://beta", "# Beta\n\nThis section is about BETA topics.\n"); err != nil {
+		t.Fatalf("indexing after an abandoned snapshot: %+v", err)
+	}
+}
+
+// indexMarkdown indexes body as the document at source, for goroutines that
+// cannot call t.Fatalf.
+func indexMarkdown(ctx context.Context, idx *Index, source, body string) error {
+	doc, err := markdown.Parse([]byte(body))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	u, err := url.Parse(source)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	doc.SetSource(u)
+	return errors.WithStack(idx.Index(ctx, doc))
 }

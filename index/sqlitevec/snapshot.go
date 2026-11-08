@@ -35,12 +35,26 @@ type SnapshottedRecord struct {
 	Metadata string
 }
 
+// snapshotBatch is how many records GenerateSnapshot reads under the
+// connection lock at a time.
+const snapshotBatch = 500
+
 // GenerateSnapshot implements snapshot.Snapshotable.
+//
+// The records are read in batches under the connection lock, and written to
+// the stream with the lock released: a slow or departed reader never holds
+// up the index. Each batch is read in one statement; a write between two
+// batches may or may not be in the snapshot, as a write during a file copy
+// would. Closing the returned reader, or ctx ending, stops the export. Do not
+// restore an index from its own export: the restore empties the index before
+// the export has read it.
 func (i *Index) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
 	r, w := io.Pipe()
 
 	go func() {
 		defer w.Close()
+		stop := context.AfterFunc(ctx, func() { w.CloseWithError(ctx.Err()) })
+		defer stop()
 
 		encoder := gob.NewEncoder(w)
 
@@ -53,66 +67,100 @@ func (i *Index) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
 			return
 		}
 
-		err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
-			// One record per chunk. The vector blob lives in vec0; a chunk in
-			// several collections has one identical vector row per collection,
-			// so any of them (MIN map id) is representative.
-			sql := `
-				SELECT
-					e.id,
-					e.source,
-					e.section_id,
-					e.chunk_index,
-					(
-						SELECT v.embedding FROM embeddings_vec2 v
-						WHERE v.rowid = ( SELECT MIN(m.id) FROM embeddings_vec_map m WHERE m.embeddings_id = e.id )
-					),
-					COALESCE(json_group_array(ec.collection_id) FILTER ( WHERE ec.collection_id IS NOT NULL ), '[]') AS collections,
-					COALESCE(dm.metadata, '') AS metadata
-				FROM embeddings e
-				LEFT JOIN embeddings_collections ec ON e.id = ec.embeddings_id
-				LEFT JOIN document_metadata dm ON dm.source = e.source
-				GROUP BY e.id, e.source, e.section_id, e.chunk_index, dm.metadata
-				;
-			`
-
-			stmt, _, err := conn.Prepare(sql)
+		var after int64
+		for {
+			batch, last, err := i.snapshotRecords(ctx, after)
 			if err != nil {
-				return errors.WithStack(err)
+				w.CloseWithError(errors.WithStack(err))
+				return
 			}
-
-			defer stmt.Close()
-
-			for stmt.Step() {
-				record := SnapshottedRecord{}
-				record.Source = stmt.ColumnText(1)
-				record.SectionID = stmt.ColumnText(2)
-				record.ChunkIndex = stmt.ColumnInt(3)
-				record.Embeddings = stmt.ColumnBlob(4, []byte{})
-				rawCollections := stmt.ColumnBlob(5, []byte{})
-				if err := json.Unmarshal(rawCollections, &record.Collections); err != nil {
-					return errors.WithStack(err)
-				}
-				record.Metadata = stmt.ColumnText(6)
-
+			for _, record := range batch {
 				if err := encoder.Encode(record); err != nil {
-					return errors.WithStack(err)
+					w.CloseWithError(errors.WithStack(err))
+					return
 				}
 			}
-
-			if err := stmt.Err(); err != nil {
-				return errors.WithStack(err)
+			if len(batch) < snapshotBatch {
+				return
 			}
-
-			return nil
-		}, sqlite3.LOCKED, sqlite3.BUSY)
-		if err != nil {
-			w.CloseWithError(errors.WithStack(err))
-			return
+			after = last
 		}
 	}()
 
-	return io.NopCloser(r), nil
+	return r, nil
+}
+
+// snapshotRecords reads, under the connection lock, the records of the
+// chunks whose id follows after, in id order, and the last id read.
+func (i *Index) snapshotRecords(ctx context.Context, after int64) ([]SnapshottedRecord, int64, error) {
+	var (
+		batch []SnapshottedRecord
+		last  int64
+	)
+	err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		// A retry reads the whole batch again.
+		batch, last = batch[:0], after
+
+		// One record per chunk. The vector blob lives in vec0; a chunk in
+		// several collections has one identical vector row per collection,
+		// so any of them (MIN map id) is representative.
+		sql := `
+			SELECT
+				e.id,
+				e.source,
+				e.section_id,
+				e.chunk_index,
+				(
+					SELECT v.embedding FROM embeddings_vec2 v
+					WHERE v.rowid = ( SELECT MIN(m.id) FROM embeddings_vec_map m WHERE m.embeddings_id = e.id )
+				),
+				COALESCE(json_group_array(ec.collection_id) FILTER ( WHERE ec.collection_id IS NOT NULL ), '[]') AS collections,
+				COALESCE(dm.metadata, '') AS metadata
+			FROM embeddings e
+			LEFT JOIN embeddings_collections ec ON e.id = ec.embeddings_id
+			LEFT JOIN document_metadata dm ON dm.source = e.source
+			WHERE e.id > ?
+			GROUP BY e.id, e.source, e.section_id, e.chunk_index, dm.metadata
+			ORDER BY e.id
+			LIMIT ?
+			;
+		`
+
+		stmt, _, err := conn.Prepare(sql)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
+		defer stmt.Close()
+
+		if err := stmt.BindInt64(1, after); err != nil {
+			return errors.WithStack(err)
+		}
+		if err := stmt.BindInt(2, snapshotBatch); err != nil {
+			return errors.WithStack(err)
+		}
+
+		for stmt.Step() {
+			record := SnapshottedRecord{}
+			last = stmt.ColumnInt64(0)
+			record.Source = stmt.ColumnText(1)
+			record.SectionID = stmt.ColumnText(2)
+			record.ChunkIndex = stmt.ColumnInt(3)
+			record.Embeddings = stmt.ColumnBlob(4, []byte{})
+			rawCollections := stmt.ColumnBlob(5, []byte{})
+			if err := json.Unmarshal(rawCollections, &record.Collections); err != nil {
+				return errors.WithStack(err)
+			}
+			record.Metadata = stmt.ColumnText(6)
+			batch = append(batch, record)
+		}
+
+		return errors.WithStack(stmt.Err())
+	}, sqlite3.LOCKED, sqlite3.BUSY)
+	if err != nil {
+		return nil, 0, err
+	}
+	return batch, last, nil
 }
 
 // RestoreSnapshot implements snapshot.Snapshotable.
