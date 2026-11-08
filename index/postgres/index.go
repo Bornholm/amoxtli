@@ -440,6 +440,7 @@ func collectChunks(document model.Document, limitChars int) ([]*indexableChunk, 
 		// chunks around it, and the others keep their embeddings cache key.
 		textStr := strings.TrimSpace(string(content))
 
+		// A blank section gives no chunk: cdc.Split drops the blank pieces.
 		for idx, chunkText := range cdc.Split(textStr, limitChars, overlapChars) {
 			chunksToProcess = append(chunksToProcess, &indexableChunk{
 				Section:  s,

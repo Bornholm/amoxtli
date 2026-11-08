@@ -219,6 +219,17 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 				lastLine := lines.At(lines.Len() - 1)
 				current.start = firstLine.Start - (el.Level + 1)
 				current.AppendRange(lastLine.Stop)
+
+				// A heading longer than the bound is split at the end of its
+				// line, so the next block opens a section of its own.
+				currentWords = -1
+				words, err := countWords()
+				if err != nil {
+					return ast.WalkStop, errors.WithStack(err)
+				}
+				if words >= policy.Max {
+					current = splitSection(current)
+				}
 			} else {
 				return ast.WalkContinue, nil
 			}
@@ -280,10 +291,16 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 				previousBlock = block
 			}
 
-			if end > current.end {
-				current.AppendRange(end)
-				currentWords = -1
+			// A node inside the current section adds nothing to it. The
+			// inlines of a heading are such nodes, since the heading branch
+			// already covers the whole line and counts its words. Splitting on
+			// one would open a section that starts past its own end.
+			if end <= current.end {
+				return ast.WalkContinue, nil
 			}
+
+			current.AppendRange(end)
+			currentWords = -1
 
 			words, err := countWords()
 			if err != nil {
@@ -323,6 +340,13 @@ func sectionWords(s *Section) (int, error) {
 // document — and puts their children in their place rather than dropping the
 // branch with them.
 //
+// It also drops the sections whose range is empty. A word-count split opens a
+// section right after the node that filled the previous one, and nothing fills
+// it when that node is the last one, or when a heading of the same or a higher
+// level comes next. Such a section holds no text, yet the indexes would store it.
+// The root section stays, even empty: a document always has one. An inverted
+// range is a parser bug, so it stays too, where the tests can see it.
+//
 // It runs on the finished tree instead of during the walk: a heading looks
 // redundant the moment it is entered, before the sub-sections that make it a
 // branch even exist, so pruning it there took its whole subtree along. A
@@ -335,7 +359,7 @@ func pruneRedundant(sections []*Section, parent *Section) []*Section {
 	for _, s := range sections {
 		s.sections = pruneRedundant(s.sections, s)
 
-		if parent != nil && s.start == parent.start && s.end == parent.end {
+		if parent != nil && (s.start == s.end || (s.start == parent.start && s.end == parent.end)) {
 			for _, child := range s.sections {
 				child.parent = parent
 				rebranch(child, parent.branch)

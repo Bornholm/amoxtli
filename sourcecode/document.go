@@ -36,6 +36,10 @@ func (d *Document) Chunk(start int, end int) ([]byte, error) {
 		end = len(d.data)
 	}
 
+	if start > end {
+		return nil, errors.Errorf("invalid chunk range [%d:%d]", start, end)
+	}
+
 	return d.data[start:end], nil
 }
 
