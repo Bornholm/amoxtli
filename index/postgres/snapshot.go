@@ -120,12 +120,15 @@ func (i *Index) RestoreSnapshot(ctx context.Context, r io.Reader) error {
 		return errors.WithStack(err)
 	}
 
-	if _, err := pool.Exec(ctx, `TRUNCATE amoxtli_chunks CASCADE;`); err != nil {
+	// Every chunk removed counts as a change for the lexeme statistics, and
+	// every chunk restored (restoreRecords).
+	if _, err := pool.Exec(ctx, `INSERT INTO amoxtli_lexeme_changes (id, n)
+		SELECT 1, count(*) FROM amoxtli_chunks
+		ON CONFLICT (id) DO UPDATE SET n = amoxtli_lexeme_changes.n + EXCLUDED.n`); err != nil {
 		return errors.WithStack(err)
 	}
 
-	// The lexeme statistics described the chunks just removed.
-	if err := i.forgetLexemeStats(ctx, pool); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE amoxtli_chunks CASCADE;`); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -198,6 +201,10 @@ func (i *Index) restoreRecords(ctx context.Context, records ...*SnapshottedRecor
 				return errors.WithStack(err)
 			}
 		}
+	}
+
+	if err := noteChunksChanged(ctx, tx, int64(len(records))); err != nil {
+		return errors.WithStack(err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
