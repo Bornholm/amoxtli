@@ -16,7 +16,6 @@ import (
 	"log/slog"
 	"math"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -563,51 +562,12 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		hitsByID[hit.ID] = hit
 	}
 
-	mappedScores := map[string]float64{}
-	mappedSections := map[string][]model.SectionID{}
-	mappedSectionScores := map[string]map[model.SectionID]float64{}
-
+	hits := make([]index.Hit, 0, len(hitsByID))
 	for id, hit := range hitsByID {
-		sectionID := model.SectionID(hit.SectionID)
-		if _, ok := mappedSectionScores[hit.Source]; !ok {
-			mappedSectionScores[hit.Source] = map[model.SectionID]float64{}
-		}
-		if !slices.Contains(mappedSections[hit.Source], sectionID) {
-			mappedSections[hit.Source] = append(mappedSections[hit.Source], sectionID)
-		}
-		mappedScores[hit.Source] += fusedScores[id]
-		mappedSectionScores[hit.Source][sectionID] += fusedScores[id]
+		hits = append(hits, index.Hit{Source: hit.Source, Section: model.SectionID(hit.SectionID), Score: fusedScores[id]})
 	}
 
-	searchResults := make([]*index.SearchResult, 0, len(mappedSections))
-
-	for rawSource, sectionIDs := range mappedSections {
-		source, err := url.Parse(rawSource)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-
-		searchResults = append(searchResults, &index.SearchResult{
-			Source:        source,
-			Sections:      sectionIDs,
-			Score:         mappedScores[rawSource],
-			SectionScores: mappedSectionScores[rawSource],
-		})
-	}
-
-	slices.SortFunc(searchResults, func(r1 *index.SearchResult, r2 *index.SearchResult) int {
-		score1 := mappedScores[r1.Source.String()]
-		score2 := mappedScores[r2.Source.String()]
-		if score1 > score2 {
-			return -1
-		}
-		if score1 < score2 {
-			return 1
-		}
-		return 0
-	})
-
-	return searchResults, nil
+	return index.AggregateHits(hits, 0)
 }
 
 // tsvectorExpr builds the SQL producing a chunk's (or a query's) tsvector.
