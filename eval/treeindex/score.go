@@ -211,7 +211,8 @@ func Beam(p *Paper, unit, node, fallback []float64, beam int) []float64 {
 	}
 
 	reached := make(map[int]bool)
-	frontier := p.Root.Children
+	// Cloned: sorting must not reorder the paper's own tree.
+	frontier := slices.Clone(p.Root.Children)
 	for len(frontier) > 0 {
 		slices.SortStableFunc(frontier, func(a, b *Unit) int { return cmp.Compare(score(b), score(a)) })
 		var next []*Unit
