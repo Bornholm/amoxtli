@@ -9,16 +9,18 @@ package indecisrel
 
 import (
 	"context"
+	"slices"
 
 	"github.com/bornholm/amoxtli/retrieval"
+	"github.com/bornholm/amoxtli/retrieval/relevancedata"
 	"github.com/bornholm/indecis"
 	"github.com/pkg/errors"
 )
 
 // Question names the model must answer.
 const (
-	QuestionRelevant   = "pertinent"
-	QuestionSufficient = "suffisance"
+	QuestionRelevant   = relevancedata.QuestionRelevant
+	QuestionSufficient = relevancedata.QuestionSufficient
 )
 
 // Model adapts an indecis model to retrieval.RelevanceModel.
@@ -36,7 +38,32 @@ func Load(dir string, opts ...indecis.Option) (*Model, error) {
 	if !m.Paired() {
 		return nil, errors.Errorf("indecisrel: %s: the model does not read (query, passage) pairs", dir)
 	}
+	if err := checkSchema(m.Schema()); err != nil {
+		return nil, errors.Wrapf(err, "indecisrel: %s", dir)
+	}
 	return &Model{model: m}, nil
+}
+
+// checkSchema makes sure the model answers the questions Score reads: a
+// missing one would read as zero, silently.
+func checkSchema(schema indecis.Schema) error {
+	var relevant, sufficient bool
+	for _, q := range schema {
+		switch q.Name {
+		case QuestionRelevant:
+			relevant = q.Kind == indecis.Noul
+		case QuestionSufficient:
+			sufficient = q.Kind == indecis.Score &&
+				slices.Contains(q.Options, relevancedata.SufficiencyNone) &&
+				slices.Contains(q.Options, relevancedata.SufficiencyPartial) &&
+				slices.Contains(q.Options, relevancedata.SufficiencyComplete)
+		}
+	}
+	if !relevant || !sufficient {
+		return errors.Errorf("the model must answer %q (yes/no) and %q (%s, %s, %s)", QuestionRelevant, QuestionSufficient,
+			relevancedata.SufficiencyNone, relevancedata.SufficiencyPartial, relevancedata.SufficiencyComplete)
+	}
+	return nil
 }
 
 // Score implements retrieval.RelevanceModel.
@@ -56,8 +83,8 @@ func (m *Model) Score(ctx context.Context, query string, passages []string) ([]r
 		sufficiency := d[QuestionSufficient].Probs
 		scores[i] = retrieval.PassageScore{
 			Relevant: d[QuestionRelevant].P,
-			Complete: sufficiency["complete"],
-			Partial:  sufficiency["partielle"],
+			Complete: sufficiency[relevancedata.SufficiencyComplete],
+			Partial:  sufficiency[relevancedata.SufficiencyPartial],
 		}
 	}
 

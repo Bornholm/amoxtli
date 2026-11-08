@@ -16,7 +16,7 @@ func Schema() indecis.Schema {
 	return indecis.Schema{
 		indecis.NewNoul(QuestionRelevant, "The passage answers the query or brings context needed to answer it."),
 		indecis.NewScore(QuestionSufficient, "The passages are enough to answer the query without outside knowledge.",
-			"aucune", "partielle", "complete"),
+			relevancedata.SufficiencyNone, relevancedata.SufficiencyPartial, relevancedata.SufficiencyComplete),
 	}
 }
 
