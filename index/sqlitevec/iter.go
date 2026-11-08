@@ -11,12 +11,17 @@ import (
 // All implements index.Index.
 func (i *Index) All(ctx context.Context, yield func(model.SectionID) bool) error {
 	batchSize := 1000
-	page := 0
+	// The pages follow the id order, from the last id read: a write between
+	// two pages neither skips nor repeats the rows that were already there.
+	var after int64
 
 	for {
 		var batch []model.SectionID
+		from := after
 		err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
-			sql := `SELECT section_id FROM embeddings LIMIT ? OFFSET ?;`
+			// A retry reads the whole page again, from the same id.
+			batch, after = batch[:0], from
+			sql := `SELECT id, section_id FROM embeddings WHERE id > ? ORDER BY id LIMIT ?;`
 
 			stmt, _, err := conn.Prepare(sql)
 			if err != nil {
@@ -25,17 +30,17 @@ func (i *Index) All(ctx context.Context, yield func(model.SectionID) bool) error
 
 			defer stmt.Close()
 
-			if err := stmt.BindInt(1, batchSize); err != nil {
+			if err := stmt.BindInt64(1, from); err != nil {
 				return errors.WithStack(err)
 			}
 
-			if err := stmt.BindInt(2, page*batchSize); err != nil {
+			if err := stmt.BindInt(2, batchSize); err != nil {
 				return errors.WithStack(err)
 			}
 
 			for stmt.Step() {
-				sectionID := model.SectionID(stmt.ColumnText(0))
-				batch = append(batch, sectionID)
+				after = stmt.ColumnInt64(0)
+				batch = append(batch, model.SectionID(stmt.ColumnText(1)))
 			}
 
 			if err := stmt.Err(); err != nil {
@@ -60,6 +65,5 @@ func (i *Index) All(ctx context.Context, yield func(model.SectionID) bool) error
 
 		batch = nil
 
-		page++
 	}
 }

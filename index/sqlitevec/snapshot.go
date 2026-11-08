@@ -118,7 +118,14 @@ func (i *Index) writeSnapshot(ctx context.Context, file *os.File) error {
 
 		defer stmt.Close()
 
-		for stmt.Step() {
+		for n := 0; stmt.Step(); n++ {
+			// The export holds the lock: give it up as soon as the caller
+			// has gone.
+			if n%256 == 0 {
+				if err := ctx.Err(); err != nil {
+					return errors.WithStack(err)
+				}
+			}
 			record := SnapshottedRecord{}
 			record.Source = stmt.ColumnText(1)
 			record.SectionID = stmt.ColumnText(2)
