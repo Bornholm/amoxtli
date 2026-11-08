@@ -601,7 +601,7 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		hits = append(hits, index.Hit{Source: hit.Source, Section: model.SectionID(hit.SectionID), Score: fusedScores[id]})
 	}
 
-	return index.AggregateHits(hits, 0)
+	return index.AggregateHits(hits, opts.MaxResults)
 }
 
 // tsvectorExpr builds the SQL producing a chunk's (or a query's) tsvector.
