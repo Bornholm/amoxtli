@@ -377,6 +377,7 @@ type RetrievalConfig struct {
 	Iterative       IterativeConfig     `yaml:"iterative"`
 	Decomposition   DecompositionConfig `yaml:"decomposition"`
 	Translation     TranslationConfig   `yaml:"translation"`
+	Relevance       RelevanceConfig     `yaml:"relevance"`
 }
 
 // TranslationConfig widens the query sent to the full-text index with its
@@ -389,6 +390,21 @@ type TranslationConfig struct {
 	// MaxLanguages bounds how many corpus languages the query is translated
 	// into, most represented first. Zero defers to the library default (2).
 	MaxLanguages int `yaml:"max_languages"`
+}
+
+// RelevanceConfig points at a local relevance model (indecis), trained on the
+// workspace's corpus with `amoxtli relevance dataset` and `amoxtli relevance
+// train`. When set, it reranks the results without any chat call. The
+// grounding evaluator stays the LLM's: its verdict decides the iterative
+// rounds, and the model's sufficiency head is not reliable enough for that.
+type RelevanceConfig struct {
+	// Model is the directory of the model, relative to the .amoxtli directory
+	// or absolute. Empty disables it.
+	Model string `yaml:"model"`
+	// Weight is the share of the model in the reranking score, between 0
+	// (fused order only) and 1 (model only), the rest coming from the fused
+	// order. Unset defers to the library default (0.2).
+	Weight *float64 `yaml:"weight"`
 }
 
 type IterativeConfig struct {
@@ -734,6 +750,10 @@ func (c *Config) Validate() error {
 
 	if c.LLM.Cache.MaxSize < 0 {
 		return errors.New("llm.cache.max_size must not be negative")
+	}
+
+	if w := c.Retrieval.Relevance.Weight; w != nil && (*w < 0 || *w > 1) {
+		return errors.New("retrieval.relevance.weight must be between 0 and 1")
 	}
 
 	switch c.Store.Driver {

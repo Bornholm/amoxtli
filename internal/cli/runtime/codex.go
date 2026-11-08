@@ -22,9 +22,11 @@ import (
 	"github.com/bornholm/amoxtli/llmx"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
+	"github.com/bornholm/amoxtli/retrieval/indecisrel"
 	"github.com/bornholm/amoxtli/sourcecode"
 	"github.com/bornholm/amoxtli/vision"
 	"github.com/bornholm/genai/llm"
+	"github.com/bornholm/indecis"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/errors"
 )
@@ -33,6 +35,8 @@ import (
 type Runtime struct {
 	Codex *amoxtli.Codex
 	Store *gormStore.Store
+	// LLM is the default chat client, nil when llm.chat is not configured.
+	LLM llm.Client
 
 	lock    *Lock
 	closers []io.Closer
@@ -85,6 +89,9 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 	if cached, ok := client.(*llmx.CachingClient); ok {
 		rt.llmCache = cached
 	}
+	if cfg.HasChat() {
+		rt.LLM = client
+	}
 
 	// The toggle alone, not LLMCacheEnabled: the vision description cache
 	// shares the directory and may be in use without llm.chat nor
@@ -126,6 +133,17 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 	}
 
 	opts = append(opts, retrievalOptions(cfg, client, stageClients)...)
+
+	if cfg.Retrieval.Relevance.Model != "" {
+		relevance, err := indecisrel.Load(ws.Resolve(cfg.Retrieval.Relevance.Model), indecis.WithInt8())
+		if err != nil {
+			return nil, errors.Wrap(err, "could not load the relevance model")
+		}
+		opts = append(opts, amoxtli.WithRelevanceModel(relevance), amoxtli.WithReranking())
+		if w := cfg.Retrieval.Relevance.Weight; w != nil {
+			opts = append(opts, amoxtli.WithRelevanceRerankWeight(*w))
+		}
+	}
 
 	// The vision describer is shared by the converter (standalone image files)
 	// and the enrichment of the images embedded in documents, so both hit the
