@@ -101,6 +101,7 @@ func NewRootCommand() *cobra.Command {
 		newBackupCommand(opts),
 		newRestoreCommand(opts),
 		newMCPCommand(opts),
+		newRelevanceCommand(opts),
 	)
 
 	return cmd

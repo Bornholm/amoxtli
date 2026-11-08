@@ -130,6 +130,12 @@ retrieval:
   # relevance is almost always judgeable from the beginning of a section. 0 uses
   # the built-in default (200).
   max_section_words: 0
+  # Local relevance model (indecis) built for this corpus with
+  # "amoxtli relevance dataset" then "amoxtli relevance train". It reranks the
+  # results on the CPU, without any chat call.
+  relevance:
+    model: ""
+    weight: 0
   iterative:
     enabled: false
     max_rounds: 2

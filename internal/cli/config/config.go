@@ -377,6 +377,7 @@ type RetrievalConfig struct {
 	Iterative       IterativeConfig     `yaml:"iterative"`
 	Decomposition   DecompositionConfig `yaml:"decomposition"`
 	Translation     TranslationConfig   `yaml:"translation"`
+	Relevance       RelevanceConfig     `yaml:"relevance"`
 }
 
 // TranslationConfig widens the query sent to the full-text index with its
@@ -389,6 +390,19 @@ type TranslationConfig struct {
 	// MaxLanguages bounds how many corpus languages the query is translated
 	// into, most represented first. Zero defers to the library default (2).
 	MaxLanguages int `yaml:"max_languages"`
+}
+
+// RelevanceConfig points at a local relevance model (indecis), trained on the
+// workspace's corpus with `amoxtli relevance dataset` and `amoxtli relevance
+// train`. When set, it reranks the results without any chat call, and replaces
+// the LLM in the grounding evaluator.
+type RelevanceConfig struct {
+	// Model is the directory of the model, relative to the .amoxtli directory
+	// or absolute. Empty disables it.
+	Model string `yaml:"model"`
+	// Weight is the share of the model in the reranking score, the rest
+	// coming from the fused order. Zero defers to the library default (0.2).
+	Weight float64 `yaml:"weight"`
 }
 
 type IterativeConfig struct {
