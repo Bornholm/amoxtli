@@ -24,3 +24,5 @@ __pycache__
 docs/*.pdf
 
 /.amoxtli
+# Playwright CLI output (may contain credentials)
+.playwright-cli/

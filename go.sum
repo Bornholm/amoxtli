@@ -61,6 +61,8 @@ github.com/bornholm/genai v0.33.1 h1:rrXzuBIytduy0edIsBH6/CiQV+iW0ZkxuvmZHBdFzI4
 github.com/bornholm/genai v0.33.1/go.mod h1:ajuzZJvHAhy2SOsjxVNI1WUZaYKvGfabRE9UnLWirr0=
 github.com/bornholm/go-x v0.0.0-20260127104343-c6737ea35324 h1:urrNBFQGXI3uvAivANnjEBdZVMDfmWn/okKIwDDqJ/w=
 github.com/bornholm/go-x v0.0.0-20260127104343-c6737ea35324/go.mod h1:LrDsNbXXqkdlQ/tlcbWKUF/FoFA/WjUEtNDRa/Xl19c=
+github.com/bornholm/indecis v0.3.0 h1:JjjYsDQOs2Rf23f19kfw0dXGjq+JUZom9NdUr+/qHZs=
+github.com/bornholm/indecis v0.3.0/go.mod h1:nNkoX8XEWjrabPBAQQBdwkaZBPcaFSjYQWMD4FMTf/I=
 github.com/cenkalti/backoff/v4 v4.3.0 h1:MyRJ/UdXutAwSAT+s3wNd7MfTIcy71VQueUuFK343L8=
 github.com/cenkalti/backoff/v4 v4.3.0/go.mod h1:Y3VNntkOUPxTVeUxJ/G5vcM//AlwfmyYozVcomhLiZE=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=

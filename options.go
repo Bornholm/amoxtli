@@ -89,8 +89,20 @@ type options struct {
 	// reranker. Mutually exclusive with reranking: the manager holds a single
 	// reranker slot.
 	lexicalReranking bool
-	lexicalWeights   retrieval.LexicalWeights
-	lexicalTokenizer retrieval.Tokenizer
+	// relevanceModel, when set, replaces the LLM in the reranker and the
+	// evidence evaluator.
+	relevanceModel retrieval.RelevanceModel
+	// relevanceWeight is the share of the relevance model in the reranking
+	// score.
+	relevanceWeight float64
+	// relevanceThreshold is the probability above which the relevance model
+	// keeps a section in the evidence evaluator; nil keeps the default.
+	relevanceThreshold *float64
+	// relevanceGrounding makes the relevance model judge the evidence even
+	// when an LLM client serves the grounding stage.
+	relevanceGrounding bool
+	lexicalWeights     retrieval.LexicalWeights
+	lexicalTokenizer   retrieval.Tokenizer
 	// Indexers composing the search pipeline.
 	indexers []Indexer
 	// Explicit components.
@@ -130,6 +142,7 @@ func defaultOptions() *options {
 		// WithGroundingMode(GroundingFilter).
 		groundingMode:              retrieval.GroundingDemote,
 		groundingMinScore:          0.4,
+		relevanceWeight:            retrieval.DefaultRerankWeight,
 		iterativeMaxRounds:         1,
 		decompositionMaxSubQueries: 3,
 		closeTimeout:               30 * time.Second,
@@ -417,6 +430,52 @@ func WithQueryDecomposition(maxSubQueries int) Option {
 func WithReranking() Option {
 	return func(o *options) {
 		o.reranking = true
+	}
+}
+
+// WithRelevanceModel runs the reranker (WithReranking) with a local relevance
+// model instead of an LLM: each section is scored against the query, which
+// costs no token and takes milliseconds. The evidence evaluator
+// (WithGroundingCheck) uses it only when no LLM client serves the grounding
+// stage, since the model's sufficiency verdict is less reliable than the
+// LLM's. Query reformulation, decomposition and HyDE still need an LLM
+// client.
+func WithRelevanceModel(m retrieval.RelevanceModel) Option {
+	return func(o *options) {
+		o.relevanceModel = m
+	}
+}
+
+// WithRelevanceGrounding makes the relevance model judge the evidence
+// (WithGroundingCheck) even when an LLM client serves the grounding stage,
+// typically to measure it against the LLM. Only meaningful with
+// WithRelevanceModel.
+func WithRelevanceGrounding() Option {
+	return func(o *options) {
+		o.relevanceGrounding = true
+	}
+}
+
+// WithRelevanceThreshold sets the probability above which the relevance
+// model judges a section relevant in the evidence evaluator (default
+// retrieval.DefaultRelevanceThreshold). A threshold of 0 keeps every section:
+// the evaluator then only produces the grounding verdict that gates iterative
+// re-retrieval, and leaves the order of the results to the reranker. Only
+// meaningful when the relevance model judges the evidence (see
+// WithRelevanceModel and WithRelevanceGrounding).
+func WithRelevanceThreshold(threshold float64) Option {
+	return func(o *options) {
+		o.relevanceThreshold = &threshold
+	}
+}
+
+// WithRelevanceRerankWeight sets the share of the relevance model in the
+// reranking score, between 0 (fusion order only) and 1 (model only). Default
+// retrieval.DefaultRerankWeight. Only meaningful with WithRelevanceModel and
+// WithReranking.
+func WithRelevanceRerankWeight(weight float64) Option {
+	return func(o *options) {
+		o.relevanceWeight = weight
 	}
 }
 
