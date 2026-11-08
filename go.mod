@@ -12,7 +12,7 @@ require (
 	github.com/blevesearch/bleve/v2 v2.5.0
 	github.com/bornholm/genai v0.33.1
 	github.com/bornholm/go-x v0.0.0-20260127104343-c6737ea35324
-	github.com/bornholm/indecis v0.3.0
+	github.com/bornholm/indecis v0.10.0
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 	github.com/dustin/go-humanize v1.0.1
 	github.com/hybridgroup/yzma v1.23.0
