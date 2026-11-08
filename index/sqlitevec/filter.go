@@ -340,6 +340,7 @@ func bindArgs(stmt *sqlite3.Stmt, start int, args []any) (int, error) {
 // UpdateMetadata implements index.MetadataUpdater.
 func (i *Index) UpdateMetadata(ctx context.Context, source *url.URL, metadata map[string]any) error {
 	i.rwLock.Lock()
+	i.oversampleStale.Store(true)
 	defer i.rwLock.Unlock()
 
 	return i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
