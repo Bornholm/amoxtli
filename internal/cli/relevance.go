@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/bornholm/amoxtli"
 	"github.com/bornholm/amoxtli/index"
@@ -55,6 +56,9 @@ func newRelevanceDatasetCommand(opts *rootOptions) *cobra.Command {
 				if rt.LLM == nil {
 					return errors.New("relevance dataset: llm.chat must be configured to label the pairs")
 				}
+				if sections < 1 || candidates < 1 || concurrency < 1 || minWords < 0 {
+					return errors.New("relevance dataset: --sections, --candidates and --concurrency must be at least 1, --min-words not negative")
+				}
 
 				sample, err := relevancedata.Sample(relevancedata.WalkStore(ctx, rt.Store), sections,
 					relevancedata.All(relevancedata.Leaves(), relevancedata.MinWords(minWords)), seed)
@@ -66,8 +70,14 @@ func newRelevanceDatasetCommand(opts *rootOptions) *cobra.Command {
 				}
 
 				// Candidates come from the plain hybrid search: no LLM stage,
-				// and no relevance model already configured.
+				// and no relevance model already configured. The searches are
+				// serialized: the local vector index (sqlite-vec under wasm)
+				// does not survive concurrent queries. Only the LLM calls
+				// overlap.
+				var searchMu sync.Mutex
 				search := func(ctx context.Context, query string, maxResults int, collections []model.CollectionID) ([]*index.SearchResult, error) {
+					searchMu.Lock()
+					defer searchMu.Unlock()
 					return rt.Codex.Search(ctx, query,
 						amoxtli.WithSearchMaxResults(maxResults),
 						amoxtli.WithSearchProfile(amoxtli.ProfileFast))
