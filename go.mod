@@ -1,6 +1,6 @@
 module github.com/bornholm/amoxtli
 
-go 1.26.0
+go 1.27
 
 // Dev convenience (sibling modules):
 // replace github.com/bornholm/genai => ../genai
@@ -12,6 +12,7 @@ require (
 	github.com/blevesearch/bleve/v2 v2.5.0
 	github.com/bornholm/genai v0.33.1
 	github.com/bornholm/go-x v0.0.0-20260127104343-c6737ea35324
+	github.com/bornholm/indecis v0.10.0
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 	github.com/dustin/go-humanize v1.0.1
 	github.com/hybridgroup/yzma v1.23.0
@@ -35,6 +36,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/sdk/metric v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
+	golang.org/x/crypto v0.49.0
 	golang.org/x/image v0.44.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/term v0.41.0
@@ -134,7 +136,6 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
-	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.40.0 // indirect

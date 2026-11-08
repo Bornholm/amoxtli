@@ -744,3 +744,57 @@ func TestCodexPersistentTaskResume(t *testing.T) {
 		t.Errorf("expected staged file to be removed after indexing, stat err: %v", err)
 	}
 }
+
+// constantRelevance scores every passage the same.
+type constantRelevance struct{}
+
+func (constantRelevance) Score(ctx context.Context, query string, passages []string) ([]retrieval.PassageScore, error) {
+	return make([]retrieval.PassageScore, len(passages)), nil
+}
+
+// TestEvidenceEvaluatorChoice: the relevance model judges the evidence only
+// without an LLM client for grounding, unless WithRelevanceGrounding asks for
+// it; the LLM's verdict decides the iterative rounds otherwise.
+func TestEvidenceEvaluatorChoice(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name      string
+		opts      []Option
+		wantModel bool
+	}{
+		{"model and llm", []Option{WithLLMClient(failingLLM{err: errors.New("unused")})}, false},
+		{"model alone", []Option{WithDisableHyDE(), WithDisableJudge()}, true},
+		{"model forced", []Option{WithLLMClient(failingLLM{err: errors.New("unused")}), WithRelevanceGrounding()}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bleveIdx, err := bleveIndex.OpenOrCreate(ctx, filepath.Join(dir, "index.bleve"))
+			if err != nil {
+				t.Fatalf("%+v", errors.WithStack(err))
+			}
+			t.Cleanup(func() { bleveIdx.Close() })
+			store, err := gormStore.NewSQLiteStore(filepath.Join(dir, "data.sqlite"))
+			if err != nil {
+				t.Fatalf("%+v", errors.WithStack(err))
+			}
+			t.Cleanup(func() { store.Close() })
+
+			opts := append([]Option{
+				WithStore(store),
+				WithIndexers(Indexer{ID: "bleve", Index: bleveIdx, Weight: 1}),
+				WithGroundingCheck(),
+				WithRelevanceModel(constantRelevance{}),
+			}, tc.opts...)
+			codex, err := New(ctx, opts...)
+			if err != nil {
+				t.Fatalf("%+v", errors.WithStack(err))
+			}
+			t.Cleanup(func() { codex.Close() })
+
+			_, isModel := codex.evaluator.(*retrieval.ModelEvidenceEvaluator)
+			if isModel != tc.wantModel {
+				t.Fatalf("evaluator %T, want the model's: %v", codex.evaluator, tc.wantModel)
+			}
+		})
+	}
+}

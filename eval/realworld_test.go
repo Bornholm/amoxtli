@@ -2,6 +2,7 @@ package eval_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,11 +25,15 @@ import (
 	gormStore "github.com/bornholm/amoxtli/ingest/gorm"
 	"github.com/bornholm/amoxtli/llmx"
 	"github.com/bornholm/amoxtli/llmx/yzma"
+	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/retrieval"
+	"github.com/bornholm/amoxtli/retrieval/indecisrel"
+	"github.com/bornholm/amoxtli/retrieval/relevancedata"
 	"github.com/bornholm/amoxtli/task"
 	"github.com/bornholm/genai/llm"
 	"github.com/bornholm/genai/llm/provider"
 	"github.com/bornholm/genai/llm/provider/openai"
+	"github.com/bornholm/indecis"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ncruces/go-sqlite3"
 	"github.com/pkg/errors"
@@ -243,9 +249,35 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 	if !hyde {
 		codexOpts = append(codexOpts, amoxtli.WithDisableHyDE())
 	}
+	// A local relevance model (indecis) replaces the LLM in the reranker and
+	// the grounding evaluator; the iterative loop still needs the LLM for HyDE
+	// and reformulation.
+	relevanceDir := os.Getenv("AMOXTLI_EVAL_RELEVANCE_MODEL")
+	if relevanceDir != "" {
+		relevance, err := indecisrel.Load(relevanceDir, indecis.WithInt8())
+		if err != nil {
+			t.Fatalf("load relevance model: %+v", err)
+		}
+		weight := envFloat(t, "AMOXTLI_EVAL_RELEVANCE_WEIGHT", retrieval.DefaultRerankWeight)
+		// The model judges the evidence too, LLM client or not: that is
+		// what this evaluation measures.
+		codexOpts = append(codexOpts,
+			amoxtli.WithRelevanceModel(relevance),
+			amoxtli.WithRelevanceRerankWeight(weight),
+			amoxtli.WithRelevanceGrounding(),
+		)
+		mode += fmt.Sprintf(" + relevance-model(w%.2f)", weight)
+		if v := os.Getenv("AMOXTLI_EVAL_RELEVANCE_THRESHOLD"); v != "" {
+			threshold := envFloat(t, "AMOXTLI_EVAL_RELEVANCE_THRESHOLD", retrieval.DefaultRelevanceThreshold)
+			codexOpts = append(codexOpts, amoxtli.WithRelevanceThreshold(threshold))
+			mode += fmt.Sprintf("(t%.2f)", threshold)
+		}
+	}
 	// A single chat client feeds every LLM feature (HyDE, reranker, grounding
 	// evaluator, query reformulator). WithLLMClient must be set exactly once.
-	if hyde || rerank || iterative || grounding || translate {
+	llmRerank := rerank && relevanceDir == ""
+	llmGrounding := grounding && relevanceDir == ""
+	if hyde || llmRerank || iterative || llmGrounding || translate {
 		codexOpts = append(codexOpts, amoxtli.WithLLMClient(chatClient(t)))
 	}
 	if translate {
@@ -357,6 +389,27 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 	evalStart := time.Now()
 	progressEvery := time.Duration(envInt(t, "AMOXTLI_EVAL_PROGRESS_SECONDS", 15)) * time.Second
 	lastLog := evalStart
+	// AMOXTLI_EVAL_RELEVANCE_PAIRS builds training pairs for a relevance
+	// model from the ingested corpus, labeled by the chat LLM
+	// (AMOXTLI_EVAL_RELEVANCE_PAIRS_N sections, default 800), and writes them
+	// as JSONL before the evaluation runs.
+	if path := os.Getenv("AMOXTLI_EVAL_RELEVANCE_PAIRS"); path != "" {
+		buildRelevancePairs(t, ctx, codex, store, path, envInt(t, "AMOXTLI_EVAL_RELEVANCE_PAIRS_N", 800))
+	}
+
+	// AMOXTLI_EVAL_DUMP_CANDIDATES writes, for each query, the sources
+	// retrieved in order (JSONL), e.g. to mine hard negatives for a relevance
+	// model.
+	var dump *json.Encoder
+	if path := os.Getenv("AMOXTLI_EVAL_DUMP_CANDIDATES"); path != "" {
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatalf("create candidates dump: %+v", err)
+		}
+		defer f.Close()
+		dump = json.NewEncoder(f)
+	}
+
 	done := 0
 	retriever := eval.FromSearchResults(func(ctx context.Context, query string, k int) ([]*index.SearchResult, error) {
 		var res []*index.SearchResult
@@ -371,6 +424,15 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 			}
 		} else {
 			res, err = codex.Search(ctx, query, amoxtli.WithSearchMaxResults(k))
+		}
+		if dump != nil && err == nil {
+			sources := make([]string, 0, len(res))
+			for _, r := range res {
+				sources = append(sources, r.Source.String())
+			}
+			if err := dump.Encode(map[string]any{"query": query, "sources": sources}); err != nil {
+				t.Fatalf("dump candidates: %+v", err)
+			}
 		}
 		done++
 		if progressEvery > 0 && time.Since(lastLog) >= progressEvery {
@@ -830,4 +892,39 @@ func sortedKeys(m map[string]*eval.Report) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func buildRelevancePairs(t *testing.T, ctx context.Context, codex *amoxtli.Codex, store ingest.Store, path string, n int) {
+	start := time.Now()
+	sections, err := relevancedata.Sample(relevancedata.WalkStore(ctx, store), n,
+		relevancedata.All(relevancedata.Leaves(), relevancedata.MinWords(30)), 1)
+	if err != nil {
+		t.Fatalf("sample sections: %+v", err)
+	}
+
+	// The searches are serialized: the local vector index (sqlite-vec under
+	// wasm) does not survive concurrent queries. Only the LLM calls overlap.
+	var searchMu sync.Mutex
+	search := func(ctx context.Context, query string, maxResults int, collections []model.CollectionID) ([]*index.SearchResult, error) {
+		searchMu.Lock()
+		defer searchMu.Unlock()
+		return codex.Search(ctx, query, amoxtli.WithSearchMaxResults(maxResults))
+	}
+	builder := relevancedata.NewBuilder(chatClient(t), store, search, relevancedata.Options{
+		Concurrency: envInt(t, "AMOXTLI_EVAL_RELEVANCE_PAIRS_CONCURRENCY", 4),
+	})
+	pairs, stats, err := builder.Build(ctx, sections)
+	if err != nil {
+		t.Fatalf("build relevance pairs: %+v", err)
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create relevance pairs: %+v", err)
+	}
+	defer f.Close()
+	if err := relevancedata.WriteJSONL(f, pairs); err != nil {
+		t.Fatalf("write relevance pairs: %+v", err)
+	}
+	t.Logf("relevance pairs: %s in %s, written to %s", stats, time.Since(start).Round(time.Second), path)
 }
