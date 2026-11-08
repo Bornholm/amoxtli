@@ -18,6 +18,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/internal/cdc"
@@ -43,6 +45,13 @@ type Index struct {
 	rankNormalization int
 	simpleUnion       bool
 	efSearchFactor    int
+	// bm25 scores the full-text leg with BM25 instead of ts_rank (see
+	// bm25.go); bm25Mu, bm25Chunks and bm25Changed track its lexeme
+	// statistics.
+	bm25        bool
+	bm25Mu      sync.Mutex
+	bm25Chunks  int64
+	bm25Changed atomic.Int64
 }
 
 const (
@@ -95,6 +104,9 @@ type Options struct {
 	// so ts_rank silently weighs irregular words double. Defaults to true, the
 	// behaviour every existing index was built with.
 	SimpleConfigUnion bool
+	// BM25 scores the full-text leg with BM25, from lexeme statistics kept in
+	// the database, instead of ts_rank. See bm25.go.
+	BM25 bool
 }
 
 // ts_rank normalization flags, as documented by PostgreSQL. They are a bit
@@ -176,6 +188,14 @@ func WithSimpleConfigUnion(union bool) OptionFunc {
 	}
 }
 
+// WithBM25 scores the full-text leg with BM25 instead of ts_rank (see
+// Options.BM25).
+func WithBM25(enabled bool) OptionFunc {
+	return func(opts *Options) {
+		opts.BM25 = enabled
+	}
+}
+
 func NewOptions(funcs ...OptionFunc) *Options {
 	opts := &Options{
 		VectorSize:        DefaultVectorSize,
@@ -197,7 +217,8 @@ func NewOptions(funcs ...OptionFunc) *Options {
 func NewIndex(pool *pgxpool.Pool, client llm.Client, funcs ...OptionFunc) *Index {
 	opts := NewOptions(funcs...)
 	return &Index{
-		getPool:           createGetPool(pool, migrations(opts.VectorSize)),
+		getPool:           createGetPool(pool, append(migrations(opts.VectorSize), bm25Migrations()...)),
+		bm25:              opts.BM25,
 		llm:               client,
 		model:             opts.EmbeddingsModel,
 		maxWords:          opts.MaxWords,
@@ -264,9 +285,11 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE source = $1`, source.String()); err != nil {
+	tag, err := tx.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE source = $1`, source.String())
+	if err != nil {
 		return errors.WithStack(err)
 	}
+	i.noteChunksChanged(tag.RowsAffected() + int64(len(chunksToProcess)))
 
 	// Refresh this index's copy of the document metadata in the same
 	// transaction as its chunks, so the two can never disagree. The delete
@@ -445,9 +468,11 @@ func (i *Index) DeleteBySource(ctx context.Context, source *url.URL) error {
 		return errors.WithStack(err)
 	}
 
-	if _, err := pool.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE source = $1`, source.String()); err != nil {
+	tag, err := pool.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE source = $1`, source.String())
+	if err != nil {
 		return errors.WithStack(err)
 	}
+	i.noteChunksChanged(tag.RowsAffected())
 
 	// A stale metadata row would let a filter match a document this index no
 	// longer holds.
@@ -470,9 +495,11 @@ func (i *Index) DeleteByID(ctx context.Context, ids ...model.SectionID) error {
 		rawIDs = append(rawIDs, string(id))
 	}
 
-	if _, err := pool.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE section_id = ANY($1)`, rawIDs); err != nil {
+	tag, err := pool.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE section_id = ANY($1)`, rawIDs)
+	if err != nil {
 		return errors.WithStack(err)
 	}
+	i.noteChunksChanged(tag.RowsAffected())
 
 	return nil
 }
@@ -598,6 +625,9 @@ func (i *Index) rankExpr(tsvExpr, queryExpr string) string {
 // as a disjunction of lexemes, mirroring the OR semantics of a bleve match
 // query; ts_rank orders the hits.
 func (i *Index) ftsSearch(ctx context.Context, pool *pgxpool.Pool, query string, filter index.Filter, opts index.SearchOptions, limit int) ([]chunkHit, error) {
+	if i.bm25 {
+		return i.ftsSearchBM25(ctx, pool, query, filter, opts, limit)
+	}
 	config := detectTextSearchConfig(query, i.defaultConfig)
 
 	a := &args{}
