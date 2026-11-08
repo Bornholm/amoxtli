@@ -31,9 +31,15 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Question names of the relevance model, shared with indecisrel.
+// Question names of the relevance model, shared with indecisrel, and the
+// values of the sufficiency score.
 const (
-	QuestionRelevant = "pertinent"
+	QuestionRelevant   = "pertinent"
+	QuestionSufficient = "suffisance"
+
+	SufficiencyNone     = "aucune"
+	SufficiencyPartial  = "partielle"
+	SufficiencyComplete = "complete"
 )
 
 // Pair is a labeled (query, passage) pair, written as an indecis example: the
@@ -229,7 +235,7 @@ func (b *Builder) buildOne(ctx context.Context, section model.Section, style str
 		candidates = append(candidates, candidate{id: id, text: truncateWords(string(c), b.opts.MaxSectionWords)})
 	}
 
-	relevant, err := b.label(ctx, query, candidates)
+	relevant, complete, err := b.label(ctx, query, candidates)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -239,10 +245,19 @@ func (b *Builder) buildOne(ctx context.Context, section model.Section, style str
 
 	pairs := make([]Pair, 0, len(candidates))
 	for _, c := range candidates {
+		// The sufficiency of a single passage: none when it is not relevant,
+		// complete when it answers the query alone, partial otherwise.
+		sufficiency := SufficiencyNone
+		switch {
+		case relevant[c.id] && complete[c.id]:
+			sufficiency = SufficiencyComplete
+		case relevant[c.id]:
+			sufficiency = SufficiencyPartial
+		}
 		pairs = append(pairs, Pair{
 			Query:   query,
 			Passage: c.text,
-			Labels:  map[string]any{QuestionRelevant: relevant[c.id]},
+			Labels:  map[string]any{QuestionRelevant: relevant[c.id], QuestionSufficient: sufficiency},
 			Family:  string(section.ID()),
 			Section: c.id,
 		})
@@ -333,10 +348,15 @@ or contradict it when the query is a statement, or bring information needed to
 answer it. A document that is only on the same topic, without the information
 the query asks for, is NOT relevant.
 
-## Output Format (strict JSON, no markdown fencing)
-{"relevant": ["id1", "id2"]}`
+Then, among the relevant documents, select those that answer the query
+completely on their own, with no other document and no outside knowledge.
 
-func (b *Builder) label(ctx context.Context, query string, candidates []candidate) (map[model.SectionID]bool, error) {
+## Output Format (strict JSON, no markdown fencing)
+{"relevant": ["id1", "id2"], "complete": ["id1"]}`
+
+// label returns the candidates the LLM judged relevant, and among them those
+// it judged to answer the query completely on their own.
+func (b *Builder) label(ctx context.Context, query string, candidates []candidate) (map[model.SectionID]bool, map[model.SectionID]bool, error) {
 	var sb strings.Builder
 	sb.WriteString("## Query\n\n")
 	sb.WriteString(query)
@@ -347,17 +367,18 @@ func (b *Builder) label(ctx context.Context, query string, candidates []candidat
 
 	seed, err := text.IntHash(labelPrompt + sb.String())
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, nil, errors.WithStack(err)
 	}
 
 	completion, err := b.llm.ChatCompletion(ctx,
-		llm.WithJSONResponse(llm.NewResponseSchema("Relevance", "The identifiers of the documents relevant to the query",
+		llm.WithJSONResponse(llm.NewResponseSchema("Relevance", "The identifiers of the documents relevant to the query, and of those answering it completely",
 			map[string]any{
 				"type": "object",
-				"properties": map[string]any{"relevant": map[string]any{
-					"type": "array", "items": map[string]any{"type": "string"},
-				}},
-				"required":             []string{"relevant"},
+				"properties": map[string]any{
+					"relevant": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"complete": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				},
+				"required":             []string{"relevant", "complete"},
 				"additionalProperties": false,
 			})),
 		llm.WithMessages(
@@ -368,23 +389,31 @@ func (b *Builder) label(ctx context.Context, query string, candidates []candidat
 		llm.WithSeed(seed),
 	)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, nil, errors.WithStack(err)
 	}
 
 	responses, err := llm.ParseJSON[struct {
 		Relevant []string `json:"relevant"`
+		Complete []string `json:"complete"`
 	}](completion.Message())
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, nil, errors.WithStack(err)
 	}
 
+	sectionID := func(id string) model.SectionID {
+		return model.SectionID(strings.TrimSpace(strings.TrimPrefix(id, "Document ")))
+	}
 	relevant := map[model.SectionID]bool{}
+	complete := map[model.SectionID]bool{}
 	for _, r := range responses {
 		for _, id := range r.Relevant {
-			relevant[model.SectionID(strings.TrimSpace(strings.TrimPrefix(id, "Document ")))] = true
+			relevant[sectionID(id)] = true
+		}
+		for _, id := range r.Complete {
+			complete[sectionID(id)] = true
 		}
 	}
-	return relevant, nil
+	return relevant, complete, nil
 }
 
 func truncateWords(s string, n int) string {
@@ -407,6 +436,9 @@ func MinWords(n int) SectionFilter {
 // produced by walk that pass the filter. walk calls its argument for every
 // candidate section, typically every section of every stored document.
 func Sample(walk func(func(model.Section) error) error, n int, keep SectionFilter, seed uint64) ([]model.Section, error) {
+	if n < 1 {
+		return nil, errors.Errorf("cannot draw %d sections", n)
+	}
 	rng := rand.New(rand.NewPCG(seed, seed^0xda942042e4dd58b5))
 	sample := make([]model.Section, 0, n)
 	seen := 0
@@ -432,8 +464,7 @@ func Sample(walk func(func(model.Section) error) error, n int, keep SectionFilte
 	return sample, nil
 }
 
-// Leaves keeps the sections without subsections, whose text is not repeated
-// by another section.
+// Leaves keeps the sections without subsections.
 func Leaves() SectionFilter {
 	return func(s model.Section, _ int) bool { return len(s.Sections()) == 0 }
 }

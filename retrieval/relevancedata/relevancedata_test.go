@@ -12,8 +12,8 @@ import (
 	"github.com/bornholm/genai/llm"
 )
 
-// stubLLM writes the first word of the passage as the query, and judges
-// relevant the documents containing the query.
+// stubLLM writes the first word of the passage as the query, judges relevant
+// the documents containing the query, and complete those starting with it.
 type stubLLM struct {
 	llm.Client
 }
@@ -25,14 +25,17 @@ func (m *stubLLM) ChatCompletion(ctx context.Context, funcs ...llm.ChatCompletio
 	var response any
 	if strings.HasPrefix(user, "## Query") {
 		query := strings.TrimSpace(strings.SplitN(strings.TrimPrefix(user, "## Query"), "## Documents", 2)[0])
-		relevant := []string{}
+		relevant, complete := []string{}, []string{}
 		for _, doc := range strings.Split(user, "### Document ")[1:] {
 			id, body, _ := strings.Cut(doc, "\n")
 			if strings.Contains(body, query) {
 				relevant = append(relevant, id)
 			}
+			if strings.HasPrefix(strings.TrimSpace(body), query) {
+				complete = append(complete, id)
+			}
 		}
-		response = map[string]any{"relevant": relevant}
+		response = map[string]any{"relevant": relevant, "complete": complete}
 	} else {
 		response = map[string]any{"query": strings.Fields(user)[0]}
 	}
@@ -88,11 +91,20 @@ func TestBuild(t *testing.T) {
 
 	// Query "felines": dogs is not relevant, tiger and cats are.
 	got := map[model.SectionID]bool{}
+	sufficiency := map[model.SectionID]any{}
 	for _, p := range pairs {
 		if p.Query != "felines" || p.Family != "cats" {
 			t.Fatalf("pair = %+v, want query felines from cats", p)
 		}
 		got[p.Section] = p.Relevant()
+		sufficiency[p.Section] = p.Labels[QuestionSufficient]
+	}
+	// cats starts with the query: complete on its own.
+	wantSufficiency := map[model.SectionID]any{"dogs": SufficiencyNone, "tiger": SufficiencyPartial, "cats": SufficiencyComplete}
+	for id, s := range wantSufficiency {
+		if sufficiency[id] != s {
+			t.Fatalf("sufficiency = %v, want %v", sufficiency, wantSufficiency)
+		}
 	}
 	want := map[model.SectionID]bool{"dogs": false, "tiger": true, "cats": true}
 	if len(got) != len(want) {
