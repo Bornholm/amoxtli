@@ -92,9 +92,14 @@ func TestBuild(t *testing.T) {
 	// Query "felines": dogs is not relevant, tiger and cats are.
 	got := map[model.SectionID]bool{}
 	sufficiency := map[model.SectionID]any{}
+	var joined []Pair
 	for _, p := range pairs {
 		if p.Query != "felines" || p.Family != "cats" {
 			t.Fatalf("pair = %+v, want query felines from cats", p)
+		}
+		if _, ok := p.Labels[QuestionRelevant]; !ok {
+			joined = append(joined, p)
+			continue
 		}
 		got[p.Section] = p.Relevant()
 		sufficiency[p.Section] = p.Labels[QuestionSufficient]
@@ -115,7 +120,11 @@ func TestBuild(t *testing.T) {
 			t.Fatalf("pairs = %v, want %v", got, want)
 		}
 	}
-	if stats.Positives != 2 || stats.Negatives != 1 || stats.Dropped != 0 {
+	// tiger and cats joined: complete, since cats answers alone.
+	if len(joined) != 1 || joined[0].Labels[QuestionSufficient] != SufficiencyComplete {
+		t.Fatalf("joined pairs = %+v, want one, complete", joined)
+	}
+	if stats.Positives != 2 || stats.Negatives != 1 || stats.Joined != 1 || stats.Dropped != 0 {
 		t.Fatalf("stats = %+v", stats)
 	}
 }

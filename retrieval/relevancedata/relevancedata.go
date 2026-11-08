@@ -103,11 +103,14 @@ type Stats struct {
 	Dropped   int
 	Positives int
 	Negatives int
+	// Joined counts the pairs whose passage joins several relevant
+	// sections, labeled for sufficiency only.
+	Joined int
 }
 
 func (s Stats) String() string {
-	return fmt.Sprintf("%d sections, %d queries dropped, %d positive pairs, %d negative pairs",
-		s.Sections, s.Dropped, s.Positives, s.Negatives)
+	return fmt.Sprintf("%d sections, %d queries dropped, %d positive pairs, %d negative pairs, %d joined pairs",
+		s.Sections, s.Dropped, s.Positives, s.Negatives, s.Joined)
 }
 
 // Builder builds labeled pairs from sections of an indexed corpus.
@@ -158,9 +161,13 @@ func (b *Builder) Build(ctx context.Context, sections []model.Section) ([]Pair, 
 				stats.Dropped++
 			}
 			for _, p := range pairs {
-				if p.Relevant() {
+				_, labeled := p.Labels[QuestionRelevant]
+				switch {
+				case !labeled:
+					stats.Joined++
+				case p.Relevant():
 					stats.Positives++
-				} else {
+				default:
 					stats.Negatives++
 				}
 			}
@@ -260,6 +267,31 @@ func (b *Builder) buildOne(ctx context.Context, section model.Section, style str
 			Labels:  map[string]any{QuestionRelevant: relevant[c.id], QuestionSufficient: sufficiency},
 			Family:  string(section.ID()),
 			Section: c.id,
+		})
+	}
+
+	// The evidence evaluator judges sufficiency on the most relevant passages
+	// joined (retrieval.DefaultSufficiencyPassages of them): one more pair
+	// shows the model such a block. It is complete when one of its passages
+	// answers alone; the LLM did not judge the block as a whole, so a block
+	// complete only together is labeled partial.
+	var joined []string
+	sufficiency := SufficiencyPartial
+	for _, c := range candidates {
+		if relevant[c.id] && len(joined) < retrieval.DefaultSufficiencyPassages {
+			joined = append(joined, c.text)
+			if complete[c.id] {
+				sufficiency = SufficiencyComplete
+			}
+		}
+	}
+	if len(joined) > 1 {
+		pairs = append(pairs, Pair{
+			Query:   query,
+			Passage: strings.Join(joined, "\n\n"),
+			Labels:  map[string]any{QuestionSufficient: sufficiency},
+			Family:  string(section.ID()),
+			Section: section.ID(),
 		})
 	}
 	return pairs, nil
