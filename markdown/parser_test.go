@@ -3,6 +3,7 @@ package markdown
 import (
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -79,6 +80,20 @@ func TestParser(t *testing.T) {
 			if e, g := tc.ExpectedSections, model.CountSections(doc); e != g {
 				t.Errorf("len(doc.Sections()): expected '%d', got '%v'", e, g)
 			}
+
+			// Each section's branch ends with its own id, under its parent's
+			// branch: siblings must not share, and overwrite, a backing array.
+			var check func(parent []model.SectionID, sections []model.Section)
+			check = func(parent []model.SectionID, sections []model.Section) {
+				for _, s := range sections {
+					want := append(slices.Clone(parent), s.ID())
+					if got := s.Branch(); !slices.Equal(got, want) {
+						t.Errorf("section %s: branch %v, want %v", s.ID(), got, want)
+					}
+					check(s.Branch(), s.Sections())
+				}
+			}
+			check(nil, doc.Sections())
 
 			dumpDocument(t, doc)
 

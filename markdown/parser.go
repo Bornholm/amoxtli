@@ -145,12 +145,13 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 			end:      previous.end,
 		}
 
-		next.branch = append(previous.branch, next.id)
+		// Cloned: siblings must not share, and overwrite, a backing array.
+		next.branch = append(slices.Clone(previous.branch), next.id)
 
 		if split {
 			next.level = previous.level
 			next.parent = previous.parent
-			next.branch = append(previous.parent.branch, next.id)
+			next.branch = append(slices.Clone(previous.parent.branch), next.id)
 			previous.parent.sections = append(previous.parent.sections, next)
 		} else {
 			previous.sections = append(previous.sections, next)
@@ -189,7 +190,7 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 
 				if current.parent != nil {
 					current.parent.sections = append(current.parent.sections, current)
-					current.branch = append(current.parent.branch, current.id)
+					current.branch = append(slices.Clone(current.parent.branch), current.id)
 				} else {
 					document.sections = append(document.sections, current)
 					current.branch = []model.SectionID{current.id}
@@ -206,7 +207,7 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 
 				if current.parent != nil {
 					current.parent.sections = append(current.parent.sections, current)
-					current.branch = append(current.parent.branch, current.id)
+					current.branch = append(slices.Clone(current.parent.branch), current.id)
 				} else {
 					document.sections = append(document.sections, current)
 					current.branch = []model.SectionID{current.id}
