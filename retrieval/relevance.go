@@ -30,8 +30,23 @@ type PassageScore struct {
 // RelevanceModel scores passages against a query without generating text,
 // typically a small local cross-encoder. It is the seam through which the
 // evidence evaluator and the reranker run without an LLM.
+//
+// Score returns exactly one score per passage, in the order of the passages;
+// the stages fail with an error on any other number.
 type RelevanceModel interface {
 	Score(ctx context.Context, query string, passages []string) ([]PassageScore, error)
+}
+
+// scorePassages calls the model and checks that it kept the contract.
+func scorePassages(ctx context.Context, m RelevanceModel, query string, passages []string) ([]PassageScore, error) {
+	scores, err := m.Score(ctx, query, passages)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if len(scores) != len(passages) {
+		return nil, errors.Errorf("the relevance model returned %d scores for %d passages", len(scores), len(passages))
+	}
+	return scores, nil
 }
 
 // Defaults of the relevance model stages.
@@ -121,7 +136,7 @@ func (e *ModelEvidenceEvaluator) Evaluate(ctx context.Context, query string, res
 		return evaluation, nil
 	}
 
-	scores, err := e.model.Score(ctx, query, texts)
+	scores, err := scorePassages(ctx, e.model, query, texts)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -148,7 +163,7 @@ func (e *ModelEvidenceEvaluator) Evaluate(ctx context.Context, query string, res
 	for _, i := range relevant[:min(e.passages, len(relevant))] {
 		joined = append(joined, texts[i])
 	}
-	verdict, err := e.model.Score(ctx, query, []string{strings.Join(joined, "\n\n")})
+	verdict, err := scorePassages(ctx, e.model, query, []string{strings.Join(joined, "\n\n")})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -225,7 +240,8 @@ func NewModelReranker(m RelevanceModel, store SectionStore, funcs ...ModelRerank
 
 // Rerank implements ingest.Reranker.
 func (r *ModelReranker) Rerank(ctx context.Context, query string, results []*index.SearchResult) ([]*index.SearchResult, error) {
-	if len(results) <= 1 {
+	// A single result is still worth it: its sections get reordered.
+	if len(allSectionIDs(results)) <= 1 {
 		return results, nil
 	}
 
@@ -234,7 +250,7 @@ func (r *ModelReranker) Rerank(ctx context.Context, query string, results []*ind
 		return nil, errors.WithStack(err)
 	}
 
-	scores, err := r.model.Score(ctx, query, texts)
+	scores, err := scorePassages(ctx, r.model, query, texts)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

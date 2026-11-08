@@ -137,3 +137,40 @@ func TestModelReranker_BlendsWithFusionOrder(t *testing.T) {
 		t.Fatalf("order(0.8) = %v, want [a c b]", got)
 	}
 }
+
+// shortRelevance breaks the RelevanceModel contract: one score fewer than
+// passages, or one more.
+type shortRelevance struct{ delta int }
+
+func (m shortRelevance) Score(ctx context.Context, query string, passages []string) ([]PassageScore, error) {
+	return make([]PassageScore, max(0, len(passages)+m.delta)), nil
+}
+
+func TestModelStages_RejectWrongScoreCount(t *testing.T) {
+	results := []*index.SearchResult{
+		resultForSource("docB", "b"),
+		resultForSource("docA", "a"),
+	}
+	for _, delta := range []int{-1, 1} {
+		if _, err := NewModelReranker(shortRelevance{delta}, rerankStore()).Rerank(context.Background(), "q", results); err == nil {
+			t.Errorf("reranker with %+d scores: no error", delta)
+		}
+		if _, err := NewModelEvidenceEvaluator(shortRelevance{delta}, rerankStore()).Evaluate(context.Background(), "q", results); err == nil {
+			t.Errorf("evaluator with %+d scores: no error", delta)
+		}
+	}
+}
+
+func TestModelReranker_ReordersTheSectionsOfASingleResult(t *testing.T) {
+	results := []*index.SearchResult{resultForSource("docA", "b", "c", "a")}
+
+	out, err := NewModelReranker(&stubRelevance{}, rerankStore(), WithRerankWeight(1)).Rerank(context.Background(), "q", results)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	got := out[0].Sections
+	if len(got) != 3 || got[0] != "a" || got[1] != "c" || got[2] != "b" {
+		t.Fatalf("sections = %v, want [a c b]", got)
+	}
+}
