@@ -140,7 +140,7 @@ func TestEncryption_MigratesExistingClearContent(t *testing.T) {
 		t.Error("legacy clear content unreadable after enabling encryption")
 	}
 
-	sealed, skipped, err := store.EncryptExistingDocuments(ctx)
+	sealed, _, err := store.EncryptExistingDocuments(ctx)
 	if err != nil {
 		t.Fatalf("migration failed: %+v", errors.WithStack(err))
 	}
@@ -148,7 +148,7 @@ func TestEncryption_MigratesExistingClearContent(t *testing.T) {
 		t.Errorf("sealed %d documents, want 1", sealed)
 	}
 
-	sealed, skipped, err = store.EncryptExistingDocuments(ctx)
+	sealed, skipped, err := store.EncryptExistingDocuments(ctx)
 	if err != nil {
 		t.Fatalf("second migration failed: %+v", errors.WithStack(err))
 	}

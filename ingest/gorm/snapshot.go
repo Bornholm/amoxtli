@@ -162,6 +162,10 @@ func (w *snapshottedDocumentWrapper) Chunk(start int, end int) ([]byte, error) {
 		end = len(w.snapshot.Content)
 	}
 
+	if start > end {
+		return nil, errors.Errorf("invalid chunk range [%d:%d]", start, end)
+	}
+
 	return w.snapshot.Content[start:end], nil
 }
 
