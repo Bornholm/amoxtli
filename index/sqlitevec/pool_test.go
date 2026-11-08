@@ -49,14 +49,17 @@ func TestIndexAtPathConcurrentSearchesDuringIndexing(t *testing.T) {
 
 	var wg sync.WaitGroup
 
+	errs := make(chan error, searchers*searchesPerRoutine+1)
+
 	// Writer leg: keep re-indexing while the searches run.
 	wg.Go(func() {
 		for n := range 5 {
-			indexDoc(t, ctx, idx, fmt.Sprintf("mem://gamma-%d", n), "# Gamma\n\nThis section is about GAMMA topics.\n")
+			if err := indexMarkdown(ctx, idx, fmt.Sprintf("mem://gamma-%d", n), "# Gamma\n\nThis section is about GAMMA topics.\n"); err != nil {
+				errs <- err
+				return
+			}
 		}
 	})
-
-	errs := make(chan error, searchers*searchesPerRoutine)
 	for range searchers {
 		wg.Go(func() {
 			for range searchesPerRoutine {
@@ -268,4 +271,41 @@ func indexMarkdown(ctx context.Context, idx *Index, source, body string) error {
 	}
 	doc.SetSource(u)
 	return errors.WithStack(idx.Index(ctx, doc))
+}
+
+// TestSnapshotIsTakenAtOnePointInTime checks that a write made after
+// GenerateSnapshot returns is not in the snapshot: a document indexed again
+// meanwhile is restored once, in its version at the time of the snapshot.
+func TestSnapshotIsTakenAtOnePointInTime(t *testing.T) {
+	ctx := context.Background()
+	idx := newHermeticIndex(t, &keywordClient{})
+	indexDoc(t, ctx, idx, "mem://alpha", "# Alpha\n\nThis section is about ALPHA topics.\n")
+	indexDoc(t, ctx, idx, "mem://beta", "# Beta\n\nThis section is about BETA topics.\n")
+	before := countSections(t, ctx, idx)
+
+	snapshot, err := idx.GenerateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	defer snapshot.Close()
+
+	indexDoc(t, ctx, idx, "mem://alpha", "# Alpha\n\nNew text about ALPHA.\n\n## More\n\nAnd a second section.\n")
+	indexDoc(t, ctx, idx, "mem://gamma", "# Gamma\n\nThis section is about GAMMA topics.\n")
+
+	restored := newHermeticIndex(t, &keywordClient{})
+	if err := restored.RestoreSnapshot(ctx, snapshot); err != nil {
+		t.Fatalf("%+v", err)
+	}
+	if got := countSections(t, ctx, restored); got != before {
+		t.Fatalf("restored %d sections, the index had %d when the snapshot was taken", got, before)
+	}
+}
+
+func countSections(t *testing.T, ctx context.Context, idx *Index) int {
+	t.Helper()
+	n := 0
+	if err := idx.All(ctx, func(model.SectionID) bool { n++; return true }); err != nil {
+		t.Fatalf("%+v", err)
+	}
+	return n
 }

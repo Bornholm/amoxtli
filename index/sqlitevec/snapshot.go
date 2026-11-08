@@ -1,11 +1,13 @@
 package sqlitevec
 
 import (
+	"bufio"
 	"context"
 	"encoding/gob"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/bornholm/amoxtli/backup"
@@ -35,71 +37,57 @@ type SnapshottedRecord struct {
 	Metadata string
 }
 
-// snapshotBatch is how many records GenerateSnapshot reads under the
-// connection lock at a time.
-const snapshotBatch = 500
-
 // GenerateSnapshot implements snapshot.Snapshotable.
 //
-// The records are read in batches under the connection lock, and written to
-// the stream with the lock released: a slow or departed reader never holds
-// up the index. Each batch is read in one statement; a write between two
-// batches may or may not be in the snapshot, as a write during a file copy
-// would. Closing the returned reader, or ctx ending, stops the export. Do not
-// restore an index from its own export: the restore empties the index before
-// the export has read it.
+// The whole index is read in one statement under the connection lock and
+// written to a temporary file; the returned reader streams that file with the
+// lock released, and Close removes it. The snapshot is therefore the state of
+// the index at one point in time, and a slow or departed reader never holds
+// up the index, at the cost of disk space for the snapshot.
 func (i *Index) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
-	r, w := io.Pipe()
-
-	go func() {
-		defer w.Close()
-		stop := context.AfterFunc(ctx, func() { w.CloseWithError(ctx.Err()) })
-		defer stop()
-
-		encoder := gob.NewEncoder(w)
-
-		metadata := SnapshottedMetadata{
-			Model: i.model,
-		}
-
-		if err := encoder.Encode(metadata); err != nil {
-			w.CloseWithError(errors.WithStack(err))
-			return
-		}
-
-		var after int64
-		for {
-			batch, last, err := i.snapshotRecords(ctx, after)
-			if err != nil {
-				w.CloseWithError(errors.WithStack(err))
-				return
-			}
-			for _, record := range batch {
-				if err := encoder.Encode(record); err != nil {
-					w.CloseWithError(errors.WithStack(err))
-					return
-				}
-			}
-			if len(batch) < snapshotBatch {
-				return
-			}
-			after = last
-		}
-	}()
-
-	return r, nil
+	file, err := os.CreateTemp("", "amoxtli-sqlitevec-snapshot-*")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	snapshot := &tempSnapshot{File: file}
+	if err := i.writeSnapshot(ctx, file); err != nil {
+		snapshot.Close()
+		return nil, errors.WithStack(err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		snapshot.Close()
+		return nil, errors.WithStack(err)
+	}
+	return snapshot, nil
 }
 
-// snapshotRecords reads, under the connection lock, the records of the
-// chunks whose id follows after, in id order, and the last id read.
-func (i *Index) snapshotRecords(ctx context.Context, after int64) ([]SnapshottedRecord, int64, error) {
-	var (
-		batch []SnapshottedRecord
-		last  int64
-	)
-	err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
-		// A retry reads the whole batch again.
-		batch, last = batch[:0], after
+// tempSnapshot is a snapshot written to a temporary file, removed on Close.
+type tempSnapshot struct{ *os.File }
+
+func (s *tempSnapshot) Close() error {
+	err := s.File.Close()
+	if rerr := os.Remove(s.Name()); rerr != nil && err == nil {
+		err = rerr
+	}
+	return errors.WithStack(err)
+}
+
+// writeSnapshot encodes the metadata and every record to file, under the
+// connection lock. A retry starts the file again.
+func (i *Index) writeSnapshot(ctx context.Context, file *os.File) error {
+	return i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		if err := file.Truncate(0); err != nil {
+			return errors.WithStack(err)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return errors.WithStack(err)
+		}
+		buffered := bufio.NewWriter(file)
+		encoder := gob.NewEncoder(buffered)
+
+		if err := encoder.Encode(SnapshottedMetadata{Model: i.model}); err != nil {
+			return errors.WithStack(err)
+		}
 
 		// One record per chunk. The vector blob lives in vec0; a chunk in
 		// several collections has one identical vector row per collection,
@@ -119,10 +107,7 @@ func (i *Index) snapshotRecords(ctx context.Context, after int64) ([]Snapshotted
 			FROM embeddings e
 			LEFT JOIN embeddings_collections ec ON e.id = ec.embeddings_id
 			LEFT JOIN document_metadata dm ON dm.source = e.source
-			WHERE e.id > ?
 			GROUP BY e.id, e.source, e.section_id, e.chunk_index, dm.metadata
-			ORDER BY e.id
-			LIMIT ?
 			;
 		`
 
@@ -133,16 +118,8 @@ func (i *Index) snapshotRecords(ctx context.Context, after int64) ([]Snapshotted
 
 		defer stmt.Close()
 
-		if err := stmt.BindInt64(1, after); err != nil {
-			return errors.WithStack(err)
-		}
-		if err := stmt.BindInt(2, snapshotBatch); err != nil {
-			return errors.WithStack(err)
-		}
-
 		for stmt.Step() {
 			record := SnapshottedRecord{}
-			last = stmt.ColumnInt64(0)
 			record.Source = stmt.ColumnText(1)
 			record.SectionID = stmt.ColumnText(2)
 			record.ChunkIndex = stmt.ColumnInt(3)
@@ -152,15 +129,18 @@ func (i *Index) snapshotRecords(ctx context.Context, after int64) ([]Snapshotted
 				return errors.WithStack(err)
 			}
 			record.Metadata = stmt.ColumnText(6)
-			batch = append(batch, record)
+
+			if err := encoder.Encode(record); err != nil {
+				return errors.WithStack(err)
+			}
 		}
 
-		return errors.WithStack(stmt.Err())
+		if err := stmt.Err(); err != nil {
+			return errors.WithStack(err)
+		}
+
+		return errors.WithStack(buffered.Flush())
 	}, sqlite3.LOCKED, sqlite3.BUSY)
-	if err != nil {
-		return nil, 0, err
-	}
-	return batch, last, nil
 }
 
 // RestoreSnapshot implements snapshot.Snapshotable.
