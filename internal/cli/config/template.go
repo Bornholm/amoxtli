@@ -133,9 +133,11 @@ retrieval:
   # Local relevance model (indecis) built for this corpus with
   # "amoxtli relevance dataset" then "amoxtli relevance train". It reranks the
   # results on the CPU, without any chat call.
+  # weight: share of the model in the reranking score, from 0 (fused order
+  # only) to 1 (model only); left out, the built-in default (0.2).
   relevance:
     model: ""
-    weight: 0
+    # weight: 0.2
   iterative:
     enabled: false
     max_rounds: 2

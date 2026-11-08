@@ -140,8 +140,8 @@ func Open(ctx context.Context, ws *workspace.Workspace, cfg *config.Config, comm
 			return nil, errors.Wrap(err, "could not load the relevance model")
 		}
 		opts = append(opts, amoxtli.WithRelevanceModel(relevance), amoxtli.WithReranking())
-		if cfg.Retrieval.Relevance.Weight > 0 {
-			opts = append(opts, amoxtli.WithRelevanceRerankWeight(cfg.Retrieval.Relevance.Weight))
+		if w := cfg.Retrieval.Relevance.Weight; w != nil {
+			opts = append(opts, amoxtli.WithRelevanceRerankWeight(*w))
 		}
 	}
 

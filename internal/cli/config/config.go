@@ -400,9 +400,10 @@ type RelevanceConfig struct {
 	// Model is the directory of the model, relative to the .amoxtli directory
 	// or absolute. Empty disables it.
 	Model string `yaml:"model"`
-	// Weight is the share of the model in the reranking score, the rest
-	// coming from the fused order. Zero defers to the library default (0.2).
-	Weight float64 `yaml:"weight"`
+	// Weight is the share of the model in the reranking score, between 0
+	// (fused order only) and 1 (model only), the rest coming from the fused
+	// order. Unset defers to the library default (0.2).
+	Weight *float64 `yaml:"weight"`
 }
 
 type IterativeConfig struct {
@@ -748,6 +749,10 @@ func (c *Config) Validate() error {
 
 	if c.LLM.Cache.MaxSize < 0 {
 		return errors.New("llm.cache.max_size must not be negative")
+	}
+
+	if w := c.Retrieval.Relevance.Weight; w != nil && (*w < 0 || *w > 1) {
+		return errors.New("retrieval.relevance.weight must be between 0 and 1")
 	}
 
 	switch c.Store.Driver {
