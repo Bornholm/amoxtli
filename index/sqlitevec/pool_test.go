@@ -103,3 +103,46 @@ func TestIndexAtPathRejectsIdentityMismatchEagerly(t *testing.T) {
 		t.Fatalf("expected an identity mismatch error mentioning embeddings_model, got %v", err)
 	}
 }
+
+// TestIndexConcurrentSearchesOnSharedConnection checks that concurrent
+// searches on an index built by NewIndex, over one caller-owned connection,
+// do not use that connection at the same time: a sqlite3.Conn is not safe
+// for concurrent use, and the wasm module fails with an out of bounds memory
+// access. Query decomposition searches its sub-questions concurrently.
+func TestIndexConcurrentSearchesOnSharedConnection(t *testing.T) {
+	ctx := context.Background()
+	idx := newHermeticIndex(t, &keywordClient{})
+
+	indexDoc(t, ctx, idx, "mem://alpha", "# Alpha\n\nThis section is about ALPHA topics.\n")
+	indexDoc(t, ctx, idx, "mem://beta", "# Beta\n\nThis section is about BETA topics.\n")
+
+	const (
+		searchers          = 8
+		searchesPerRoutine = 20
+	)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, searchers*searchesPerRoutine)
+	for range searchers {
+		wg.Go(func() {
+			for range searchesPerRoutine {
+				results, err := idx.Search(ctx, "a question about ALPHA", index.SearchOptions{MaxResults: 5})
+				if err != nil {
+					errs <- err
+					return
+				}
+				if len(results) == 0 {
+					errs <- errors.New("no results")
+					return
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("concurrent search failed: %+v", errors.WithStack(err))
+	}
+}

@@ -36,13 +36,14 @@ type Index struct {
 	getConn func(ctx context.Context) (*sqlite3.Conn, error)
 	llm     llm.Client
 	model   string
-	// rwLock allows concurrent Search operations while serializing Index/Delete
+	// rwLock serializes Index/Delete, and the searches that run on the single
+	// caller-owned connection of NewIndex.
 	rwLock sync.RWMutex
 	// readers is the pool of dedicated read connections (NewIndexAtPath). When
-	// nil (NewIndex), searches share the single caller-owned connection under
-	// the read lock; with a pool, searches run on their own connection and rely
-	// on WAL snapshot isolation instead, so they neither serialize on the
-	// writer nor on each other.
+	// nil (NewIndex), searches take turns on the single caller-owned
+	// connection, under the write lock; with a pool, searches run on their own
+	// connection and rely on WAL snapshot isolation instead, so they neither
+	// serialize on the writer nor on each other.
 	readers chan *sqlite3.Conn
 	// ownedConns are the connections opened (and closed) by the index itself.
 	ownedConns []*sqlite3.Conn
@@ -1165,8 +1166,10 @@ func resolveMatches(conn *sqlite3.Conn, matches []vecMatch) ([]index.Hit, error)
 // together with its release function. With a read pool (NewIndexAtPath) the
 // connection is one of the pooled readers — no lock is taken, WAL snapshot
 // isolation guarantees a consistent view during concurrent writes. Without a
-// pool (NewIndex) the single shared connection is returned under the read
-// lock, preserving the historical serialization against writers.
+// pool (NewIndex) the single shared connection is returned under the write
+// lock: a sqlite3.Conn is not safe for concurrent use, so two searches must
+// not run on it at the same time either (the wasm module fails with an out of
+// bounds memory access). Use NewIndexAtPath for concurrent searches.
 func (i *Index) acquireReader(ctx context.Context) (*sqlite3.Conn, func(), error) {
 	if i.readers != nil {
 		select {
@@ -1182,8 +1185,8 @@ func (i *Index) acquireReader(ctx context.Context) (*sqlite3.Conn, func(), error
 		return nil, nil, errors.WithStack(err)
 	}
 
-	i.rwLock.RLock()
-	return conn, i.rwLock.RUnlock, nil
+	i.rwLock.Lock()
+	return conn, i.rwLock.Unlock, nil
 }
 
 func (i *Index) withRetry(ctx context.Context, fn func(ctx context.Context, conn *sqlite3.Conn) error, codes ...sqlite3.ErrorCode) error {
