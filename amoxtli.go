@@ -271,16 +271,21 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	// The fused evidence evaluator (relevance filtering + grounding verdict) is
 	// shared across Search (filtering), CheckGrounding (verdict) and the
 	// orchestrator/SearchIterative (both). It replaces the pipeline Judge when
-	// enabled.
-	if opts.groundingCheck && opts.relevanceModel != nil {
+	// enabled. The LLM keeps it whenever a grounding client is configured: the
+	// local model's sufficiency head is overconfident (it answers "complete"
+	// and never asks for another round), so it judges only without an LLM.
+	// WithRelevanceGrounding asks for the model all the same.
+	groundingClient := opts.clientFor(StageGrounding)
+	useModel := opts.relevanceModel != nil && (groundingClient == nil || opts.relevanceGrounding)
+	if opts.groundingCheck && groundingClient != nil && !useModel {
+		codex.evaluator = retrieval.NewLLMEvidenceEvaluator(groundingClient, store, opts.maxTotalWords,
+			retrieval.WithMaxSectionWords(opts.maxSectionWords))
+	} else if opts.groundingCheck && useModel {
 		evaluatorOpts := []retrieval.ModelEvaluatorOption{retrieval.WithModelMaxSectionWords(opts.maxSectionWords)}
 		if opts.relevanceThreshold != nil {
 			evaluatorOpts = append(evaluatorOpts, retrieval.WithRelevanceThreshold(*opts.relevanceThreshold))
 		}
 		codex.evaluator = retrieval.NewModelEvidenceEvaluator(opts.relevanceModel, store, evaluatorOpts...)
-	} else if groundingClient := opts.clientFor(StageGrounding); opts.groundingCheck && groundingClient != nil {
-		codex.evaluator = retrieval.NewLLMEvidenceEvaluator(groundingClient, store, opts.maxTotalWords,
-			retrieval.WithMaxSectionWords(opts.maxSectionWords))
 	}
 	codex.groundingFailOpen = opts.groundingFailOpen
 	codex.groundingMode = opts.groundingMode

@@ -259,9 +259,12 @@ func evaluateCorpus(t *testing.T, ctx context.Context, corpus *eval.Corpus, data
 			t.Fatalf("load relevance model: %+v", err)
 		}
 		weight := envFloat(t, "AMOXTLI_EVAL_RELEVANCE_WEIGHT", retrieval.DefaultRerankWeight)
+		// The model judges the evidence too, LLM client or not: that is
+		// what this evaluation measures.
 		codexOpts = append(codexOpts,
 			amoxtli.WithRelevanceModel(relevance),
 			amoxtli.WithRelevanceRerankWeight(weight),
+			amoxtli.WithRelevanceGrounding(),
 		)
 		mode += fmt.Sprintf(" + relevance-model(w%.2f)", weight)
 		if v := os.Getenv("AMOXTLI_EVAL_RELEVANCE_THRESHOLD"); v != "" {

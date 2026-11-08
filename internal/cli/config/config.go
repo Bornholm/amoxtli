@@ -394,8 +394,9 @@ type TranslationConfig struct {
 
 // RelevanceConfig points at a local relevance model (indecis), trained on the
 // workspace's corpus with `amoxtli relevance dataset` and `amoxtli relevance
-// train`. When set, it reranks the results without any chat call, and replaces
-// the LLM in the grounding evaluator.
+// train`. When set, it reranks the results without any chat call. The
+// grounding evaluator stays the LLM's: its verdict decides the iterative
+// rounds, and the model's sufficiency head is not reliable enough for that.
 type RelevanceConfig struct {
 	// Model is the directory of the model, relative to the .amoxtli directory
 	// or absolute. Empty disables it.
