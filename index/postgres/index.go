@@ -16,11 +16,13 @@ import (
 	"log/slog"
 	"math"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/internal/cdc"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/genai/llm"
 	"github.com/jackc/pgx/v5"
@@ -43,6 +45,12 @@ type Index struct {
 	rankNormalization int
 	simpleUnion       bool
 	efSearchFactor    int
+	// bm25 scores the full-text leg with BM25 instead of ts_rank (see
+	// bm25.go); bm25RefreshMu and bm25Refreshing let one recomputation of its
+	// statistics run at a time.
+	bm25           bool
+	bm25RefreshMu  sync.Mutex
+	bm25Refreshing atomic.Bool
 }
 
 const (
@@ -95,6 +103,9 @@ type Options struct {
 	// so ts_rank silently weighs irregular words double. Defaults to true, the
 	// behaviour every existing index was built with.
 	SimpleConfigUnion bool
+	// BM25 scores the full-text leg with BM25, from lexeme statistics kept in
+	// the database, instead of ts_rank. See bm25.go.
+	BM25 bool
 }
 
 // ts_rank normalization flags, as documented by PostgreSQL. They are a bit
@@ -176,6 +187,14 @@ func WithSimpleConfigUnion(union bool) OptionFunc {
 	}
 }
 
+// WithBM25 scores the full-text leg with BM25 instead of ts_rank (see
+// Options.BM25).
+func WithBM25(enabled bool) OptionFunc {
+	return func(opts *Options) {
+		opts.BM25 = enabled
+	}
+}
+
 func NewOptions(funcs ...OptionFunc) *Options {
 	opts := &Options{
 		VectorSize:        DefaultVectorSize,
@@ -197,7 +216,8 @@ func NewOptions(funcs ...OptionFunc) *Options {
 func NewIndex(pool *pgxpool.Pool, client llm.Client, funcs ...OptionFunc) *Index {
 	opts := NewOptions(funcs...)
 	return &Index{
-		getPool:           createGetPool(pool, migrations(opts.VectorSize)),
+		getPool:           createGetPool(pool, append(migrations(opts.VectorSize), bm25Migrations()...)),
+		bm25:              opts.BM25,
 		llm:               client,
 		model:             opts.EmbeddingsModel,
 		maxWords:          opts.MaxWords,
@@ -228,6 +248,8 @@ const (
 
 	targetBatchTokens = 6000
 
+	// overlapChars is the overlap of the windows cutting a single line
+	// longer than a chunk.
 	overlapChars = 200
 )
 
@@ -262,9 +284,11 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE source = $1`, source.String()); err != nil {
+	tag, err := tx.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE source = $1`, source.String())
+	if err != nil {
 		return errors.WithStack(err)
 	}
+	changed := tag.RowsAffected() + int64(len(chunksToProcess))
 
 	// Refresh this index's copy of the document metadata in the same
 	// transaction as its chunks, so the two can never disagree. The delete
@@ -353,6 +377,11 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 		return errors.WithStack(err)
 	}
 
+	// Last, so that the counter's row stays locked as briefly as possible.
+	if err := noteChunksChanged(ctx, tx, changed); err != nil {
+		return errors.WithStack(err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return errors.WithStack(err)
 	}
@@ -405,46 +434,19 @@ func collectChunks(document model.Document, limitChars int) ([]*indexableChunk, 
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		textStr := string(content)
-		textLen := len(textStr)
+		// Trimmed like the sqlite-vec index, so that a fresh parse and the store
+		// round-trip give the same chunks. Oversized sections are cut at
+		// content-defined paragraph boundaries: an edit then only changes the
+		// chunks around it, and the others keep their embeddings cache key.
+		textStr := strings.TrimSpace(string(content))
 
-		if textLen <= limitChars {
-			if strings.TrimSpace(textStr) != "" { // On ignore les sections vides
-				chunksToProcess = append(chunksToProcess, &indexableChunk{
-					Section:  s,
-					Text:     textStr,
-					ChunkIdx: 0,
-				})
-			}
-		} else {
-			runes := []rune(textStr)
-			runesLen := len(runes)
-
-			limitRunes := limitChars
-			overlapRunes := overlapChars
-
-			currentChunkIdx := 0
-			for start := 0; start < runesLen; {
-				end := start + limitRunes
-				if end > runesLen {
-					end = runesLen
-				}
-
-				chunkText := string(runes[start:end])
-
-				chunksToProcess = append(chunksToProcess, &indexableChunk{
-					Section:  s,
-					Text:     chunkText,
-					ChunkIdx: currentChunkIdx,
-				})
-				currentChunkIdx++
-
-				if end == runesLen {
-					break
-				}
-
-				start += (limitRunes - overlapRunes)
-			}
+		// A blank section gives no chunk: cdc.Split drops the blank pieces.
+		for idx, chunkText := range cdc.Split(textStr, limitChars, overlapChars) {
+			chunksToProcess = append(chunksToProcess, &indexableChunk{
+				Section:  s,
+				Text:     chunkText,
+				ChunkIdx: idx,
+			})
 		}
 
 		for _, child := range s.Sections() {
@@ -471,7 +473,11 @@ func (i *Index) DeleteBySource(ctx context.Context, source *url.URL) error {
 		return errors.WithStack(err)
 	}
 
-	if _, err := pool.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE source = $1`, source.String()); err != nil {
+	tag, err := pool.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE source = $1`, source.String())
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := noteChunksChanged(ctx, pool, tag.RowsAffected()); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -496,7 +502,11 @@ func (i *Index) DeleteByID(ctx context.Context, ids ...model.SectionID) error {
 		rawIDs = append(rawIDs, string(id))
 	}
 
-	if _, err := pool.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE section_id = ANY($1)`, rawIDs); err != nil {
+	tag, err := pool.Exec(ctx, `DELETE FROM amoxtli_chunks WHERE section_id = ANY($1)`, rawIDs)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := noteChunksChanged(ctx, pool, tag.RowsAffected()); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -588,51 +598,12 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		hitsByID[hit.ID] = hit
 	}
 
-	mappedScores := map[string]float64{}
-	mappedSections := map[string][]model.SectionID{}
-	mappedSectionScores := map[string]map[model.SectionID]float64{}
-
+	hits := make([]index.Hit, 0, len(hitsByID))
 	for id, hit := range hitsByID {
-		sectionID := model.SectionID(hit.SectionID)
-		if _, ok := mappedSectionScores[hit.Source]; !ok {
-			mappedSectionScores[hit.Source] = map[model.SectionID]float64{}
-		}
-		if !slices.Contains(mappedSections[hit.Source], sectionID) {
-			mappedSections[hit.Source] = append(mappedSections[hit.Source], sectionID)
-		}
-		mappedScores[hit.Source] += fusedScores[id]
-		mappedSectionScores[hit.Source][sectionID] += fusedScores[id]
+		hits = append(hits, index.Hit{Source: hit.Source, Section: model.SectionID(hit.SectionID), Score: fusedScores[id]})
 	}
 
-	searchResults := make([]*index.SearchResult, 0, len(mappedSections))
-
-	for rawSource, sectionIDs := range mappedSections {
-		source, err := url.Parse(rawSource)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-
-		searchResults = append(searchResults, &index.SearchResult{
-			Source:        source,
-			Sections:      sectionIDs,
-			Score:         mappedScores[rawSource],
-			SectionScores: mappedSectionScores[rawSource],
-		})
-	}
-
-	slices.SortFunc(searchResults, func(r1 *index.SearchResult, r2 *index.SearchResult) int {
-		score1 := mappedScores[r1.Source.String()]
-		score2 := mappedScores[r2.Source.String()]
-		if score1 > score2 {
-			return -1
-		}
-		if score1 < score2 {
-			return 1
-		}
-		return 0
-	})
-
-	return searchResults, nil
+	return index.AggregateHits(hits, limit)
 }
 
 // tsvectorExpr builds the SQL producing a chunk's (or a query's) tsvector.
@@ -645,6 +616,25 @@ func (i *Index) tsvectorExpr(configExpr, textExpr string) string {
 	}
 
 	return lang + " || to_tsvector('simple', unaccent(" + textExpr + "))"
+}
+
+// queryLexemesExpr builds the SQL producing the lexemes a query searches for,
+// as a text array: the language's, and with the 'simple' union the unstemmed
+// words too, except the language's stop words. ts_rank has no IDF, and BM25's
+// is not negligible on a small table: a stop word kept from the 'simple'
+// config made either rank a section on its articles and pronouns.
+func (i *Index) queryLexemesExpr(configExpr, textExpr string) string {
+	lang := "tsvector_to_array(to_tsvector(" + configExpr + ", unaccent(" + textExpr + ")))"
+	if !i.simpleUnion {
+		return lang
+	}
+
+	return `(SELECT array_agg(w) FROM (
+			SELECT unnest(` + lang + `) AS w
+			UNION
+			SELECT w FROM unnest(tsvector_to_array(to_tsvector('simple', unaccent(` + textExpr + `)))) AS w
+			WHERE to_tsvector(` + configExpr + `, w) <> ''::tsvector
+		) words)`
 }
 
 // rankExpr builds the ts_rank call ordering the full-text leg. The
@@ -663,6 +653,9 @@ func (i *Index) rankExpr(tsvExpr, queryExpr string) string {
 // as a disjunction of lexemes, mirroring the OR semantics of a bleve match
 // query; ts_rank orders the hits.
 func (i *Index) ftsSearch(ctx context.Context, pool *pgxpool.Pool, query string, filter index.Filter, opts index.SearchOptions, limit int) ([]chunkHit, error) {
+	if i.bm25 {
+		return i.ftsSearchBM25(ctx, pool, query, filter, opts, limit)
+	}
 	config := detectTextSearchConfig(query, i.defaultConfig)
 
 	a := &args{}
@@ -674,9 +667,7 @@ func (i *Index) ftsSearch(ctx context.Context, pool *pgxpool.Pool, query string,
 			SELECT to_tsquery('simple', string_agg(quoted, ' | ')) AS query
 			FROM (
 				SELECT '''' || replace(lexeme, '''', '''''') || '''' AS quoted
-				FROM unnest(tsvector_to_array(
-					` + i.tsvectorExpr(configParam+"::regconfig", queryParam) + `
-				)) AS lexeme
+				FROM unnest(` + i.queryLexemesExpr(configParam+"::regconfig", queryParam) + `) AS lexeme
 			) lexemes
 		)
 		SELECT c.id, c.source, c.section_id

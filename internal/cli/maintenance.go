@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/bornholm/amoxtli/internal/cli/runtime"
+	"github.com/bornholm/amoxtli/llmx"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/amoxtli/task"
+	"github.com/dustin/go-humanize"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
@@ -192,7 +194,7 @@ func newCacheCommand(opts *rootOptions) *cobra.Command {
 		Short: "Manage the LLM cache (embeddings and chat completions)",
 	}
 
-	cmd.AddCommand(newCachePurgeCommand(opts))
+	cmd.AddCommand(newCachePurgeCommand(opts), newCachePruneCommand(opts))
 
 	return cmd
 }
@@ -218,6 +220,61 @@ func newCachePurgeCommand(opts *rootOptions) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func newCachePruneCommand(opts *rootOptions) *cobra.Command {
+	var (
+		maxAge  time.Duration
+		maxSize int64
+	)
+
+	cmd := &cobra.Command{
+		Use:   "prune",
+		Short: "Remove the least recently used entries of the on-disk LLM cache",
+		Long: "Remove the LLM cache entries unused for longer than llm.cache.max_age, then\n" +
+			"the least recently used ones until the cache fits in llm.cache.max_size.\n" +
+			"Commands already do it at most once a day; this runs it now.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ws, cfg, err := opts.loadConfig()
+			if err != nil {
+				return err
+			}
+
+			limits := llmx.PruneOptions{MaxAge: cfg.LLMCacheMaxAge(), MaxSize: cfg.LLM.Cache.MaxSize}
+			if cmd.Flags().Changed("max-age") {
+				limits.MaxAge = maxAge
+			}
+			if cmd.Flags().Changed("max-size") {
+				limits.MaxSize = maxSize
+			}
+			if limits.MaxAge < 0 || limits.MaxSize < 0 {
+				return errors.New("--max-age and --max-size must not be negative")
+			}
+
+			dir := ws.Resolve(cfg.LLMCachePath())
+
+			stats, err := llmx.PruneCache(dir, limits)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+
+			if opts.json {
+				return printJSON(cmd.OutOrStdout(), stats)
+			}
+
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Pruned LLM cache at %s: removed %d entries (%s), kept %d (%s)\n",
+				dir, stats.Removed, humanize.IBytes(uint64(stats.Freed)), stats.Kept, humanize.IBytes(uint64(stats.Size)))
+
+			return nil
+		},
+	}
+
+	flags := cmd.Flags()
+	flags.DurationVar(&maxAge, "max-age", 0, "remove the entries unused for longer than this (overrides llm.cache.max_age; 0: no age limit)")
+	flags.Int64Var(&maxSize, "max-size", 0, "bound the cache size in bytes (overrides llm.cache.max_size; 0: no size limit)")
+
+	return cmd
 }
 
 // awaitMaintenanceTask waits for a maintenance task and reports its outcome.

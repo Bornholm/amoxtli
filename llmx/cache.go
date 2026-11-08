@@ -34,9 +34,11 @@ import (
 // are cached below dir/chat under a key covering the messages, seed,
 // temperature and response schema. Files are written atomically (temp file +
 // rename) making the cache safe for concurrent use; an unreadable or corrupted
-// entry is treated as a miss and rewritten. Concurrent misses on the same key
-// are collapsed into a single call to the wrapped client, so a burst of
-// identical requests costs one round-trip rather than one per caller.
+// entry is treated as a miss and rewritten. Reading an entry records its use,
+// so that PruneCache removes the least recently used ones first. Concurrent
+// misses on the same key are collapsed into a single call to the wrapped
+// client, so a burst of identical requests costs one round-trip rather than one
+// per caller.
 //
 // The namespace must identify the embedding space — typically the model name.
 // Reusing a directory with a different model but the same namespace would serve
@@ -249,10 +251,10 @@ func (c *CachingClient) chatPath(opts *llm.ChatCompletionOptions) (string, bool)
 	return filepath.Join(c.dir, "chat", digest[:2], digest+".json"), true
 }
 
-// loadChat reads a cached chat completion; any error (missing, corrupted) is a
-// miss.
+// loadChat reads a cached chat completion, recording its use (see
+// ReadCacheEntry); any error (missing, corrupted) is a miss.
 func (c *CachingClient) loadChat(path string) (*chatCacheEntry, bool) {
-	data, err := os.ReadFile(path)
+	data, err := ReadCacheEntry(path)
 	if err != nil {
 		return nil, false
 	}
@@ -391,9 +393,10 @@ func (c *CachingClient) path(input string, opts *llm.EmbeddingsOptions) string {
 	return filepath.Join(c.dir, "embeddings", key[:2], key+".json")
 }
 
-// load reads a cached vector; any error (missing, corrupted) is a miss.
+// load reads a cached vector, recording its use (see ReadCacheEntry); any
+// error (missing, corrupted) is a miss.
 func (c *CachingClient) load(path string) ([]float64, bool) {
-	data, err := os.ReadFile(path)
+	data, err := ReadCacheEntry(path)
 	if err != nil {
 		return nil, false
 	}

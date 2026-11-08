@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func noEnv(string) (string, bool) { return "", false }
@@ -575,5 +576,46 @@ func TestLexicalRerankingNeedsNoChatClient(t *testing.T) {
 
 	if !cfg.LexicalRerankingEnabled() {
 		t.Error("LexicalRerankingEnabled() = false without a chat client, want true")
+	}
+}
+
+func TestLLMCachePruneLimits(t *testing.T) {
+	cfg, err := Parse("", noEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+	if got := cfg.LLMCacheMaxAge(); got != DefaultLLMCacheMaxAge {
+		t.Errorf("default max_age = %s, want %s", got, DefaultLLMCacheMaxAge)
+	}
+	if cfg.LLM.Cache.MaxSize != 0 {
+		t.Errorf("default max_size = %d, want no limit", cfg.LLM.Cache.MaxSize)
+	}
+
+	cfg, err = Parse("llm:\n  cache:\n    max_age: 720h\n    max_size: 1073741824\n", noEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+	if got := cfg.LLMCacheMaxAge(); got != 720*time.Hour {
+		t.Errorf("max_age = %s, want 720h", got)
+	}
+	if cfg.LLM.Cache.MaxSize != 1<<30 {
+		t.Errorf("max_size = %d, want 1 GiB", cfg.LLM.Cache.MaxSize)
+	}
+
+	cfg, err = Parse("llm:\n  cache:\n    max_age: 0s\n", noEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+	if got := cfg.LLMCacheMaxAge(); got != 0 {
+		t.Errorf("max_age = %s, want 0 (no age limit)", got)
+	}
+
+	for _, raw := range []string{
+		"llm:\n  cache:\n    max_age: -1h\n",
+		"llm:\n  cache:\n    max_size: -1\n",
+	} {
+		if _, err := Parse(raw, noEnv); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+			t.Errorf("Parse(%q) error = %v, want a negative limit rejected", raw, err)
+		}
 	}
 }

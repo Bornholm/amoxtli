@@ -115,6 +115,14 @@ clients par étage (`llm.stages`) bénéficient du même cache de chat. `amoxtli
 cache purge` vide le cache ; les statistiques hits/misses sont journalisées en
 mode `--verbose`.
 
+Le cache est nettoyé au plus une fois par jour, à la fin d'une commande :
+les entrées inutilisées depuis `llm.cache.max_age` (durée Go, défaut `2160h`
+soit 90 jours, `0s` pour désactiver) sont supprimées, puis les moins
+récemment utilisées jusqu'à tenir dans `llm.cache.max_size` octets (défaut
+`0`, sans limite). Lire une entrée compte comme une utilisation. `amoxtli cache
+prune [--max-age <durée>] [--max-size <octets>]` lance ce nettoyage tout de
+suite.
+
 ### Convertisseurs de fichiers
 
 Sans convertisseur, seul le `.md` est indexable. La section `converter` en
@@ -239,6 +247,7 @@ extension→langage (ex. `.phtml: php`). Langages intégrés : `go`, `javascript
 | `task list\|show\|cancel` | Suit les tâches d'indexation |
 | `reindex [-c coll]` / `cleanup [-c coll]` | Maintenance de l'index |
 | `cache purge` | Vide le cache LLM sur disque (embeddings + chat) |
+| `cache prune [--max-age d] [--max-size n]` | Supprime les entrées du cache LLM inutilisées ou en excès de taille |
 | `backup [-o fichier]` / `restore <fichier>` | Sauvegarde/restauration |
 | `mcp` | Serveur MCP sur stdio |
 

@@ -10,9 +10,10 @@
 | `index/postgres` | Backend hybride PostgreSQL (FTS `tsvector` + pgvector, fusion RRF) |
 | `index/pipeline` | Index composite : fusion RRF pondérée par index + transformers (HyDE, Judge, dédup) |
 | `retrieval` | Orchestration de récupération pilotée par le grounding (γ) : vérification, re-retrieval itératif, décomposition de requête, reranker LLM |
-| `llmx` | Décorateurs `llm.Client` : `RetryClient` (retries à backoff + rate-limit optionnel) |
+| `llmx` | Décorateurs `llm.Client` : `RetryClient` (retries à backoff + rate-limit optionnel), `CachingClient` (cache disque des embeddings et du chat seedé, nettoyé par `PruneCache`) |
 | `index/testsuite` | Suite de conformité pour les implémentations de `index.Index` |
 | `markdown` | Parsing/chunking markdown en sections |
+| `internal/cdc` | Découpage défini par le contenu (sections markdown, chunks des sections trop longues) : une modification ne déplace que les coupures voisines |
 | `sourcecode` | Parsing/chunking de code source en sections par déclaration (tree-sitter pur Go, métadonnées `type=code` / `language=<nom>`) |
 | `convert` | Conversion de fichiers vers markdown (`pandoc`, `libreoffice`, `genai`, `vision`) |
 | `vision` | Description d'images par LLM vision (`Describer`) + cache de descriptions indexé par contenu |
@@ -23,6 +24,39 @@
 | `backup` | Abstraction snapshot/restore (index, documents, blobs) |
 | `eval` / `eval/hfqa` | Harnais d'évaluation de la pertinence (Recall@k / MRR / nDCG@k, segmentation par langue) + loader de jeux QA Hugging Face (format SQuAD) |
 | `telemetry` | Intégration OpenTelemetry : tracer/meter partagés + instruments (latence recherche, coût LLM, descriptions d'images) |
+
+## Découpage stable et réindexation
+
+Réindexer un document modifié ne réembedde que les chunks dont le texte a
+changé : le cache d'embeddings (`llmx.CachingClient`) est adressé par le
+contenu exact de chaque chunk. Encore faut-il qu'une modification locale ne
+change que les chunks voisins. Un remplissage glouton jusqu'à une taille
+maximale ne le garantit pas : chaque coupure dépend de tous les blocs qui la
+précèdent, et un article inséré en tête d'une longue section décale toutes les
+coupures suivantes.
+
+Le découpage est donc défini par le contenu (`internal/cdc`) :
+
+- **Ancres.** Un bloc (paragraphe) sur deux, choisi par un hachage de son
+  seul contenu, peut ouvrir un nouveau fragment dès que le fragment courant
+  atteint la moitié de la taille maximale. Deux versions d'un texte se remettent
+  à couper aux mêmes ancres juste après la modification.
+- **Intitulés.** Un bloc court (≤ 12 mots, par exemple « Article L. 12 ») reste
+  collé au bloc qu'il introduit : on ne coupe jamais juste après lui, et il ouvre
+  le fragment suivant plutôt que de terminer un fragment plein.
+- **Deux niveaux.** Le parseur markdown l'applique aux sections
+  (`max_words_per_section`, en mots). Les index vectoriels l'appliquent aux
+  sections qui dépassent la taille d'un chunk (en octets, coupures sur les
+  lignes vides puis les sauts de ligne, fenêtres chevauchantes en dernier
+  recours). Une section parente contient le texte de ses sous-sections, donc
+  ses chunks recoupent les leurs : les textes identiques ne sont embeddés
+  qu'une fois par indexation.
+
+Sur 60 articles d'un même chapitre, insérer un article en tête réembedde 5
+chunks sur 57, contre 59 sur 77 avec un découpage glouton et des fenêtres fixes.
+En contrepartie, les sections sont plus petites en moyenne : une ancre peut
+couper dès la moitié de `max_words_per_section` (*Le Horla* : 280 sections au
+lieu de 205 à 200 mots maximum).
 
 ## Indexeurs personnalisés
 

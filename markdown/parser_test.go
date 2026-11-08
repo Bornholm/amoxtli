@@ -20,20 +20,22 @@ func TestParser(t *testing.T) {
 		MaxWordPerSection int
 	}
 
+	// Content-defined cuts (see cdc.Policy) may close a section from half the
+	// word bound, hence more sections than a greedy packing up to the bound.
 	testCases := []testCase{
 		{
 			File:              "testdata/test.md",
-			ExpectedSections:  9,
+			ExpectedSections:  11,
 			MaxWordPerSection: 5,
 		},
 		{
 			File:              "testdata/le_horla.md",
-			ExpectedSections:  203,
+			ExpectedSections:  280,
 			MaxWordPerSection: 200,
 		},
 		{
 			File:              "../index/testsuite/testdata/documents/programming_go.md",
-			ExpectedSections:  3,
+			ExpectedSections:  4,
 			MaxWordPerSection: 200,
 		},
 		{
@@ -78,6 +80,20 @@ func TestParser(t *testing.T) {
 			if e, g := tc.ExpectedSections, model.CountSections(doc); e != g {
 				t.Errorf("len(doc.Sections()): expected '%d', got '%v'", e, g)
 			}
+
+			// Each section's branch ends with its own id, under its parent's
+			// branch: siblings must not share, and overwrite, a backing array.
+			var check func(parent []model.SectionID, sections []model.Section)
+			check = func(parent []model.SectionID, sections []model.Section) {
+				for _, s := range sections {
+					want := append(slices.Clone(parent), s.ID())
+					if got := s.Branch(); !slices.Equal(got, want) {
+						t.Errorf("section %s: branch %v, want %v", s.ID(), got, want)
+					}
+					check(s.Branch(), s.Sections())
+				}
+			}
+			check(nil, doc.Sections())
 
 			dumpDocument(t, doc)
 

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 
+	"github.com/bornholm/amoxtli/llmx"
 	"github.com/bornholm/amoxtli/telemetry"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
@@ -128,10 +129,10 @@ func (c *CachingDescriber) path(data []byte) string {
 	return filepath.Join(c.dir, "vision", key[:2], key+".json")
 }
 
-// load reads a cached description; any error (missing, corrupted) is a
-// silent miss.
+// load reads a cached description, recording its use for llmx.PruneCache to
+// keep it; any error (missing, corrupted) is a silent miss.
 func (c *CachingDescriber) load(path string) (*Description, bool) {
-	data, err := os.ReadFile(path)
+	data, err := llmx.ReadCacheEntry(path)
 	if err != nil {
 		return nil, false
 	}

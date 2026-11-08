@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"slices"
 
+	"github.com/bornholm/amoxtli/internal/cdc"
 	corpusText "github.com/bornholm/amoxtli/internal/text"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/pkg/errors"
@@ -106,45 +107,60 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 		document.SetMetadata(documentMetadata)
 	}
 
+	policy := cdc.NewPolicy(opts.MaxWordPerSection)
+
+	// split tells whether the current section was itself opened by a split:
+	// the first split of a heading section nests below it, the next ones are
+	// its siblings.
 	split := false
 
-	// splitAfter opens a new section once s holds MaxWordPerSection words and
-	// returns it, or returns s while it has room left. The new section starts
-	// where s ends, so the node that filled s stays in s.
-	splitAfter := func(s *Section, end int) (*Section, error) {
-		chunk, err := s.Content()
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
+	// previousBlock is the last block appended to the current section: a cut
+	// never follows a heading-like one (see cdc.Anchored).
+	previousBlock := ""
 
-		if totalWords := len(corpusText.SplitByWords(string(chunk))); totalWords < opts.MaxWordPerSection {
-			return s, nil
-		}
+	// currentWords caches the word count of the current section, -1 when its
+	// range changed since it was counted: counting renders the section.
+	currentWords := -1
 
+	countWords := func() (int, error) {
+		if currentWords < 0 {
+			words, err := sectionWords(current)
+			if err != nil {
+				return 0, errors.WithStack(err)
+			}
+			currentWords = words
+		}
+		return currentWords, nil
+	}
+
+	// splitSection closes previous and opens the section that follows it.
+	splitSection := func(previous *Section) *Section {
 		next := &Section{
 			document: document,
 			id:       model.NewSectionID(),
-			level:    s.level + 1,
+			level:    previous.level + 1,
 			sections: make([]*Section, 0),
-			parent:   s,
-			start:    s.end,
-			end:      end,
+			parent:   previous,
+			start:    previous.end,
+			end:      previous.end,
 		}
 
-		next.branch = append(slices.Clone(s.branch), next.id)
+		// Cloned: siblings must not share, and overwrite, a backing array.
+		next.branch = append(slices.Clone(previous.branch), next.id)
 
 		if split {
-			next.level = s.level
-			next.parent = s.parent
-			next.branch = append(slices.Clone(s.parent.branch), next.id)
-			s.parent.sections = append(s.parent.sections, next)
+			next.level = previous.level
+			next.parent = previous.parent
+			next.branch = append(slices.Clone(previous.parent.branch), next.id)
+			previous.parent.sections = append(previous.parent.sections, next)
 		} else {
-			s.sections = append(s.sections, next)
+			previous.sections = append(previous.sections, next)
 		}
 
 		split = true
+		currentWords = -1
 
-		return next, nil
+		return next
 	}
 
 	err := ast.Walk(root, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
@@ -159,6 +175,8 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 			// No op
 		case *ast.Heading:
 			split = false
+			previousBlock = ""
+			currentWords = -1
 
 			if uint(el.Level) > current.level {
 				current = &Section{
@@ -202,30 +220,36 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 				current.start = firstLine.Start - (el.Level + 1)
 				current.AppendRange(lastLine.Stop)
 
-				// A heading longer than MaxWordPerSection is split at the end
-				// of its line, so the next block opens a section of its own.
-				next, err := splitAfter(current, lastLine.Stop)
+				// A heading longer than the bound is split at the end of its
+				// line, so the next block opens a section of its own.
+				currentWords = -1
+				words, err := countWords()
 				if err != nil {
 					return ast.WalkStop, errors.WithStack(err)
 				}
-
-				current = next
+				if words >= policy.Max {
+					current = splitSection(current)
+				}
 			} else {
 				return ast.WalkContinue, nil
 			}
 
 		default:
 			var (
-				end int
+				start   int
+				end     int
+				isBlock bool
 			)
 
 			if n.Type() == ast.TypeBlock {
 				if lines := n.Lines(); lines.Len() > 0 {
+					start = lines.At(0).Start
 					lastLine := lines.At(lines.Len() - 1)
 					end = lastLine.Stop
 					if _, isCodeBlock := n.(*ast.FencedCodeBlock); isCodeBlock {
 						end += 4
 					}
+					isBlock = true
 				} else {
 					return ast.WalkContinue, nil
 				}
@@ -237,6 +261,36 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 				return ast.WalkContinue, nil
 			}
 
+			// Content-defined cut (see cdc.Policy.CutBefore): an anchor block
+			// opens a new section once the current one holds half the bound.
+			// Packing blocks up to the bound alone makes every cut depend on all
+			// the blocks before it, so one article inserted at the top of a long
+			// section would shift — and re-embed — every section after it. Only
+			// the blocks not covered yet count: the paragraphs of a list item
+			// were appended along with their list.
+			uncovered := isBlock && start >= current.end
+			block := ""
+			if uncovered {
+				block = string(data[start:min(end, len(data))])
+			}
+
+			// Counting the section words is costly: only for a block that may
+			// open a new section.
+			if uncovered && (cdc.IsLead(block) || cdc.Anchored(previousBlock, block)) {
+				words, err := countWords()
+				if err != nil {
+					return ast.WalkStop, errors.WithStack(err)
+				}
+
+				if policy.CutBefore(words, len(corpusText.SplitByWords(block)), previousBlock, block) {
+					current = splitSection(current)
+				}
+			}
+
+			if uncovered {
+				previousBlock = block
+			}
+
 			// A node inside the current section adds nothing to it. The
 			// inlines of a heading are such nodes, since the heading branch
 			// already covers the whole line and counts its words. Splitting on
@@ -246,13 +300,18 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 			}
 
 			current.AppendRange(end)
+			currentWords = -1
 
-			next, err := splitAfter(current, end)
+			words, err := countWords()
 			if err != nil {
 				return ast.WalkStop, errors.WithStack(err)
 			}
 
-			current = next
+			if words < policy.Max {
+				return ast.WalkContinue, nil
+			}
+
+			current = splitSection(current)
 		}
 
 		return ast.WalkContinue, nil
@@ -264,6 +323,16 @@ func Parse(data []byte, funcs ...OptionFunc) (*Document, error) {
 	document.sections = pruneRedundant(document.sections, nil)
 
 	return document, nil
+}
+
+// sectionWords counts the words of a section's content.
+func sectionWords(s *Section) (int, error) {
+	content, err := s.Content()
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+
+	return len(corpusText.SplitByWords(string(content))), nil
 }
 
 // pruneRedundant drops the sections covering exactly the same range as their

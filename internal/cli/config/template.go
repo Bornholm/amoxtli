@@ -74,10 +74,15 @@ index:
 #   # Persistent on-disk LLM cache: embedding vectors and deterministic seeded
 #   # chat completions (HyDE). Re-indexing unchanged content and repeating a
 #   # query stop hitting the endpoints. Enabled by default ("auto"); purge it
-#   # with "amoxtli cache purge".
+#   # with "amoxtli cache purge". Entries unused for max_age (a Go duration;
+#   # "0s" disables it) are pruned, then the least recently used ones until
+#   # the cache fits in max_size bytes (0: no limit), at most once a day or on
+#   # "amoxtli cache prune".
 #   cache:
 #     enabled: auto
 #     path: cache
+#     max_age: 2160h
+#     max_size: 0
 #   # Dedicated chat client per retrieval stage (hyde, judge, grounding,
 #   # rerank, decompose, reformulate, translate), overriding llm.chat for that
 #   # stage.

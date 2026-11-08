@@ -12,9 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/internal/cdc"
 	"github.com/bornholm/amoxtli/model"
 	"github.com/bornholm/genai/llm"
 	"github.com/ncruces/go-sqlite3"
@@ -44,6 +46,11 @@ type Index struct {
 	readers chan *sqlite3.Conn
 	// ownedConns are the connections opened (and closed) by the index itself.
 	ownedConns []*sqlite3.Conn
+	// oversample caches unfilteredOversample; a write marks it stale.
+	oversampleMu    sync.Mutex
+	oversample      int
+	oversampleAt    time.Time
+	oversampleStale atomic.Bool
 }
 
 // DefaultMaxWords bounds, by default, the number of words per chunk sent to the
@@ -153,6 +160,7 @@ func NewOptions(funcs ...OptionFunc) *Options {
 // DeleteByID implements index.Index.
 func (i *Index) DeleteByID(ctx context.Context, ids ...model.SectionID) error {
 	i.rwLock.Lock()
+	i.oversampleStale.Store(true)
 	defer i.rwLock.Unlock()
 
 	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
@@ -308,6 +316,7 @@ func (i *Index) deleteBySourceLocked(ctx context.Context, source *url.URL) error
 // DeleteBySource implements index.Index.
 func (i *Index) DeleteBySource(ctx context.Context, source *url.URL) error {
 	i.rwLock.Lock()
+	i.oversampleStale.Store(true)
 	defer i.rwLock.Unlock()
 
 	return errors.WithStack(i.deleteBySourceLocked(ctx, source))
@@ -334,6 +343,8 @@ const (
 
 	targetBatchTokens = 6000
 
+	// overlapChars is the overlap of the windows cutting a single line
+	// longer than a chunk.
 	overlapChars = 200
 )
 
@@ -365,6 +376,7 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 	}
 
 	i.rwLock.Lock()
+	i.oversampleStale.Store(true)
 	defer i.rwLock.Unlock()
 
 	if source != nil {
@@ -522,8 +534,8 @@ func bindVecInsert(stmt *sqlite3.Stmt, rowID int64, vecBlob []byte, partition st
 }
 
 // collectChunks walks the document sections and splits their content into the
-// chunks to embed (character-window with overlap for oversized sections). It
-// performs no I/O beyond reading section content and takes no lock.
+// chunks to embed (see cdc.Split for oversized sections). It performs no I/O
+// beyond reading section content and takes no lock.
 func (i *Index) collectChunks(document model.Document) ([]*indexableChunk, error) {
 	var chunksToProcess []*indexableChunk
 
@@ -540,45 +552,16 @@ func (i *Index) collectChunks(document model.Document) ([]*indexableChunk, error
 		// stable between a fresh parse and the store round-trip (the persisted
 		// content is trimmed, the parsed one may keep a trailing newline).
 		textStr := strings.TrimSpace(string(content))
-		textLen := len(textStr)
 
-		if textLen <= limitChars {
-			if textLen > 0 { // On ignore les sections vides
-				chunksToProcess = append(chunksToProcess, &indexableChunk{
-					Section:  s,
-					Text:     textStr,
-					ChunkIdx: 0,
-				})
-			}
-		} else {
-			runes := []rune(textStr)
-			runesLen := len(runes)
-
-			limitRunes := limitChars
-			overlapRunes := overlapChars
-
-			currentChunkIdx := 0
-			for start := 0; start < runesLen; {
-				end := start + limitRunes
-				if end > runesLen {
-					end = runesLen
-				}
-
-				chunkText := string(runes[start:end])
-
-				chunksToProcess = append(chunksToProcess, &indexableChunk{
-					Section:  s,
-					Text:     chunkText,
-					ChunkIdx: currentChunkIdx,
-				})
-				currentChunkIdx++
-
-				if end == runesLen {
-					break
-				}
-
-				start += (limitRunes - overlapRunes)
-			}
+		// Oversized sections are cut at content-defined paragraph boundaries,
+		// not fixed windows: an edit then only changes the chunks around it,
+		// and the others keep their embeddings cache key.
+		for idx, chunkText := range cdc.Split(textStr, limitChars, overlapChars) {
+			chunksToProcess = append(chunksToProcess, &indexableChunk{
+				Section:  s,
+				Text:     chunkText,
+				ChunkIdx: idx,
+			})
 		}
 
 		for _, child := range s.Sections() {
@@ -602,11 +585,47 @@ func (i *Index) collectChunks(document model.Document) ([]*indexableChunk, error
 // as before) and returns the serialized vectors aligned by index with chunks.
 // It performs no database access and holds no lock, so it runs concurrently
 // with searches.
+//
+// Identical chunks are embedded once. They are common: a section's content
+// holds its sub-sections', so a parent whose text is mostly one child's yields
+// the same chunks as that child — and the concurrent batches would all miss an
+// embeddings cache for them at the same time.
 func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk) ([][]byte, error) {
-	vectors := make([][]byte, len(chunks))
+	// texts are the distinct chunk texts, slots map each chunk to its text.
+	var texts []string
+	slots := make([]int, len(chunks))
+	seen := make(map[string]int, len(chunks))
+	for idx, chunk := range chunks {
+		slot, ok := seen[chunk.Text]
+		if !ok {
+			slot = len(texts)
+			seen[chunk.Text] = slot
+			texts = append(texts, chunk.Text)
+		}
+		slots[idx] = slot
+	}
 
-	// First, partition the chunks into batches bounded by item count and token
-	// budget (same policy as before, just materialized up front).
+	unique, err := i.embedTexts(ctx, texts)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	vectors := make([][]byte, len(chunks))
+	for idx, slot := range slots {
+		vectors[idx] = unique[slot]
+	}
+
+	return vectors, nil
+}
+
+// embedTexts runs the embeddings model over texts, in batches computed
+// concurrently, and returns the serialized vectors aligned by index with
+// texts.
+func (i *Index) embedTexts(ctx context.Context, texts []string) ([][]byte, error) {
+	vectors := make([][]byte, len(texts))
+
+	// First, partition the texts into batches bounded by item count and token
+	// budget.
 	type embeddingsBatch struct {
 		idx   []int
 		texts []string
@@ -627,8 +646,8 @@ func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk)
 		batchIdx, batchTexts, batchTokens = nil, nil, 0
 	}
 
-	for idx, chunk := range chunks {
-		tokenEst := estimateTokens(chunk.Text)
+	for idx, text := range texts {
+		tokenEst := estimateTokens(text)
 
 		isBatchFull := (len(batchTexts) >= maxBatchItemCount) ||
 			(batchTokens+tokenEst >= targetBatchTokens)
@@ -638,7 +657,7 @@ func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk)
 		}
 
 		batchIdx = append(batchIdx, idx)
-		batchTexts = append(batchTexts, chunk.Text)
+		batchTexts = append(batchTexts, text)
 		batchTokens += tokenEst
 	}
 	seal()
@@ -673,12 +692,12 @@ func (i *Index) computeEmbeddings(ctx context.Context, chunks []*indexableChunk)
 				return errors.New("vector count mismatch")
 			}
 
-			for j, chunkIdx := range b.idx {
+			for j, textIdx := range b.idx {
 				blob, err := sqlite_vec.SerializeFloat32(toFloat32(embeddings[j]))
 				if err != nil {
 					return errors.WithStack(err)
 				}
-				vectors[chunkIdx] = blob
+				vectors[textIdx] = blob
 			}
 
 			return nil
@@ -800,29 +819,40 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		// when the global top-k lived in other collections). Without a filter
 		// a single leg scans every partition, oversampled to absorb the
 		// duplicate rows of multi-collection chunks.
+		// A match is a chunk and maxResults counts sources, so a long
+		// document can take several of the k matches. The KNN is not widened
+		// to reach maxResults sources, though: the cost of a sqlite-vec scan
+		// grows with k, and on MLDR (10,000 articles of 5,000 words) widening
+		// it made the vector leg 1.7 times slower for the same recall at 1,
+		// 10 and 50 documents, the lexical leg bringing the other sources.
 		var matches []vecMatch
 
 		if len(opts.Collections) > 0 {
 			for _, collection := range opts.Collections {
-				legMatches, err := i.knnLeg(conn, queryVec, maxResults, string(collection), filter)
+				legMatches, err := i.knnLeg(conn, queryVec, min(maxResults, maxKNN), string(collection), filter)
 				if err != nil {
 					return errors.WithStack(err)
 				}
 				matches = append(matches, legMatches...)
 			}
 		} else {
-			matches, err = i.knnLeg(conn, queryVec, maxResults*unfilteredOversample, allPartitions, filter)
+			oversample, err := i.unfilteredOversample(conn)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			matches, err = i.knnLeg(conn, queryVec, min(maxResults*oversample, maxKNN), allPartitions, filter)
 			if err != nil {
 				return errors.WithStack(err)
 			}
 		}
 
-		searchResults, err = resolveMatches(conn, matches, maxResults)
+		hits, err := resolveMatches(conn, matches)
 		if err != nil {
 			return errors.WithStack(err)
 		}
 
-		return nil
+		searchResults, err = index.AggregateHits(hits, maxResults)
+		return errors.WithStack(err)
 	}, sqlite3.BUSY, sqlite3.LOCKED)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -841,10 +871,41 @@ type vecMatch struct {
 // allPartitions makes knnLeg scan every partition (no collection filter).
 const allPartitions = ""
 
-// unfilteredOversample widens the KNN of an unfiltered search: a chunk
+// unfilteredOversample returns how much an unfiltered KNN is widened: a chunk
 // belonging to several collections has one vec0 row per collection, so the
-// raw top-k may contain duplicates that deduplication then removes.
-const unfilteredOversample = 4
+// raw top-k may contain duplicates that deduplication then removes. It is the
+// number of rows per chunk, rounded up (1 when no chunk is shared), computed
+// again a minute after the last time or after a write.
+func (i *Index) unfilteredOversample(conn *sqlite3.Conn) (int, error) {
+	i.oversampleMu.Lock()
+	defer i.oversampleMu.Unlock()
+	if i.oversample > 0 && !i.oversampleStale.Load() && time.Since(i.oversampleAt) < time.Minute {
+		return i.oversample, nil
+	}
+	stmt, _, err := conn.Prepare(`SELECT (SELECT count(*) FROM embeddings_vec_map), (SELECT count(*) FROM embeddings);`)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	defer stmt.Close()
+	oversample := 1
+	if stmt.Step() {
+		rows, chunks := stmt.ColumnInt64(0), stmt.ColumnInt64(1)
+		if chunks > 0 && rows > chunks {
+			// The duplicates may gather in the top-k: one more row per
+			// chunk than the mean.
+			oversample = int((rows+chunks-1)/chunks) + 1
+		}
+	}
+	if err := stmt.Err(); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	i.oversample, i.oversampleAt = oversample, time.Now()
+	i.oversampleStale.Store(false)
+	return oversample, nil
+}
+
+// maxKNN bounds the k of a KNN leg (sqlite-vec refuses k above 4096).
+const maxKNN = 4096
 
 // coarseOversample is the candidate multiplier of the two-stage search: the
 // binary (Hamming) stage preselects k×coarseOversample rows, re-scored with
@@ -944,7 +1005,7 @@ func (i *Index) knnCoarse(conn *sqlite3.Conn, queryVec []byte, k int, partition 
 		stmt.Close()
 		return nil, errors.WithStack(err)
 	}
-	if err := stmt.BindInt(2, k*coarseOversample); err != nil {
+	if err := stmt.BindInt(2, min(k*coarseOversample, maxKNN)); err != nil {
 		stmt.Close()
 		return nil, errors.WithStack(err)
 	}
@@ -1023,13 +1084,10 @@ func (i *Index) knnCoarse(conn *sqlite3.Conn, queryVec []byte, k int, partition 
 
 // resolveMatches maps the KNN hits back to chunks (via embeddings_vec_map),
 // deduplicates chunks reached through several collection partitions (keeping
-// their best distance), truncates to the maxResults best chunks and
-// aggregates them into per-source results, scored like the previous
-// implementation (sum of 1/distance).
-func resolveMatches(conn *sqlite3.Conn, matches []vecMatch, maxResults int) ([]*index.SearchResult, error) {
-	searchResults := make([]*index.SearchResult, 0)
+// their best distance) and scores each chunk 1/distance.
+func resolveMatches(conn *sqlite3.Conn, matches []vecMatch) ([]index.Hit, error) {
 	if len(matches) == 0 {
-		return searchResults, nil
+		return nil, nil
 	}
 
 	rowIDs := make([]int64, 0, len(matches))
@@ -1091,60 +1149,16 @@ func resolveMatches(conn *sqlite3.Conn, matches []vecMatch, maxResults int) ([]*
 		}
 	}
 
-	hits := make([]chunkHit, 0, len(best))
+	hits := make([]index.Hit, 0, len(best))
 	for _, h := range best {
-		hits = append(hits, h)
-	}
-	slices.SortFunc(hits, func(a, b chunkHit) int {
-		if c := cmp.Compare(a.distance, b.distance); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.embeddingsID, b.embeddingsID)
-	})
-	if len(hits) > maxResults {
-		hits = hits[:maxResults]
-	}
-
-	mappedScores := map[string]float64{}
-	mappedSections := map[string][]model.SectionID{}
-	mappedSectionScores := map[string]map[model.SectionID]float64{}
-
-	for _, h := range hits {
-		if _, exists := mappedSections[h.source]; !exists {
-			mappedSections[h.source] = make([]model.SectionID, 0)
-			mappedSectionScores[h.source] = map[model.SectionID]float64{}
-		}
-
 		distance := h.distance
 		if distance == 0 {
 			distance = math.SmallestNonzeroFloat64
 		}
-		score := 1 / distance
-
-		mappedSections[h.source] = append(mappedSections[h.source], model.SectionID(h.sectionID))
-		mappedScores[h.source] += score
-		mappedSectionScores[h.source][model.SectionID(h.sectionID)] += score
+		hits = append(hits, index.Hit{Source: h.source, Section: model.SectionID(h.sectionID), Score: 1 / distance})
 	}
 
-	for rawSource, sectionIDs := range mappedSections {
-		source, err := url.Parse(rawSource)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-
-		searchResults = append(searchResults, &index.SearchResult{
-			Source:        source,
-			Sections:      sectionIDs,
-			Score:         mappedScores[rawSource],
-			SectionScores: mappedSectionScores[rawSource],
-		})
-	}
-
-	slices.SortFunc(searchResults, func(r1, r2 *index.SearchResult) int {
-		return cmp.Compare(mappedScores[r2.Source.String()], mappedScores[r1.Source.String()])
-	})
-
-	return searchResults, nil
+	return hits, nil
 }
 
 // acquireReader hands out a connection suitable for a read-only statement,
