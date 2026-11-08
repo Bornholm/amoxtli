@@ -36,9 +36,11 @@ type Index struct {
 	getConn func(ctx context.Context) (*sqlite3.Conn, error)
 	llm     llm.Client
 	model   string
-	// rwLock serializes Index/Delete, and the searches that run on the single
-	// caller-owned connection of NewIndex.
-	rwLock sync.RWMutex
+	// connLock (see lockConn) serializes the statements run on the writer
+	// connection: Index, Delete, metadata updates, All and snapshots, and the
+	// searches of NewIndex, which share the caller's single connection. A
+	// sqlite3.Conn is not safe for concurrent use.
+	connLock chan struct{}
 	// readers is the pool of dedicated read connections (NewIndexAtPath). When
 	// nil (NewIndex), searches take turns on the single caller-owned
 	// connection, under the write lock; with a pool, searches run on their own
@@ -160,9 +162,12 @@ func NewOptions(funcs ...OptionFunc) *Options {
 
 // DeleteByID implements index.Index.
 func (i *Index) DeleteByID(ctx context.Context, ids ...model.SectionID) error {
-	i.rwLock.Lock()
+	unlock, lerr := i.lockConn(ctx)
+	if lerr != nil {
+		return lerr
+	}
 	i.oversampleStale.Store(true)
-	defer i.rwLock.Unlock()
+	defer unlock()
 
 	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 		// First, get the embeddings IDs to delete
@@ -260,7 +265,7 @@ func deleteVecRows(conn *sqlite3.Conn, embeddingsIDs []int) error {
 }
 
 // deleteBySourceLocked performs the deletion for a given source without acquiring the lock.
-// Callers must hold i.rwLock before calling this method.
+// Callers must hold the connection lock (lockConn) before calling this method.
 func (i *Index) deleteBySourceLocked(ctx context.Context, source *url.URL) error {
 	return i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 		// Drop the metadata copy first, and before the early return below: a
@@ -316,9 +321,12 @@ func (i *Index) deleteBySourceLocked(ctx context.Context, source *url.URL) error
 
 // DeleteBySource implements index.Index.
 func (i *Index) DeleteBySource(ctx context.Context, source *url.URL) error {
-	i.rwLock.Lock()
+	unlock, lerr := i.lockConn(ctx)
+	if lerr != nil {
+		return lerr
+	}
 	i.oversampleStale.Store(true)
-	defer i.rwLock.Unlock()
+	defer unlock()
 
 	return errors.WithStack(i.deleteBySourceLocked(ctx, source))
 }
@@ -368,17 +376,20 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 
 	// Compute the embeddings BEFORE taking the write lock: the LLM calls are the
 	// slow part, and holding the write lock across them would block every
-	// concurrent Search (which only needs the read lock) for their whole
-	// duration. As a bonus, a failure here leaves the existing content intact
+	// concurrent search on a NewIndex index (which takes the same lock) for
+	// their whole duration. As a bonus, a failure here leaves the existing content intact
 	// (the delete below only runs once the vectors are ready).
 	vectors, err := i.computeEmbeddings(ctx, chunksToProcess)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	i.rwLock.Lock()
+	unlock, lerr := i.lockConn(ctx)
+	if lerr != nil {
+		return lerr
+	}
 	i.oversampleStale.Store(true)
-	defer i.rwLock.Unlock()
+	defer unlock()
 
 	if source != nil {
 		if err := i.deleteBySourceLocked(ctx, source); err != nil {
@@ -781,7 +792,7 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		return nil, errors.WithStack(err)
 	}
 
-	// Embed the query BEFORE taking the read lock and outside the retry loop:
+	// Embed the query BEFORE taking the connection and outside the retry loop:
 	// a SQLITE_BUSY/LOCKED retry must repeat only the SQL, never the billable
 	// network round-trip, and the call must not extend the lock's critical
 	// section.
@@ -1185,8 +1196,22 @@ func (i *Index) acquireReader(ctx context.Context) (*sqlite3.Conn, func(), error
 		return nil, nil, errors.WithStack(err)
 	}
 
-	i.rwLock.Lock()
-	return conn, i.rwLock.Unlock, nil
+	unlock, err := i.lockConn(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, unlock, nil
+}
+
+// lockConn takes the connection lock, or gives up when ctx is done: a
+// search whose caller went away does not wait behind a long indexing.
+func (i *Index) lockConn(ctx context.Context) (func(), error) {
+	select {
+	case i.connLock <- struct{}{}:
+		return func() { <-i.connLock }, nil
+	case <-ctx.Done():
+		return nil, errors.WithStack(ctx.Err())
+	}
 }
 
 func (i *Index) withRetry(ctx context.Context, fn func(ctx context.Context, conn *sqlite3.Conn) error, codes ...sqlite3.ErrorCode) error {
@@ -1196,6 +1221,17 @@ func (i *Index) withRetry(ctx context.Context, fn func(ctx context.Context, conn
 	}
 
 	return retryOnConn(ctx, conn, fn, codes...)
+}
+
+// withLockedRetry is withRetry under the connection lock, for the statements
+// that do not run under it already (All, snapshots).
+func (i *Index) withLockedRetry(ctx context.Context, fn func(ctx context.Context, conn *sqlite3.Conn) error, codes ...sqlite3.ErrorCode) error {
+	unlock, err := i.lockConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return i.withRetry(ctx, fn, codes...)
 }
 
 // retryOnConn runs fn on the given connection inside a savepoint, retrying
@@ -1265,6 +1301,7 @@ func NewIndex(conn *sqlite3.Conn, client llm.Client, funcs ...OptionFunc) *Index
 	}
 
 	return &Index{
+		connLock:              make(chan struct{}, 1),
 		maxWords:              opts.MaxWords,
 		vectorSize:            opts.VectorSize,
 		embeddingsConcurrency: opts.EmbeddingsConcurrency,
@@ -1325,6 +1362,7 @@ func NewIndexAtPath(path string, client llm.Client, funcs ...OptionFunc) (*Index
 	}
 
 	return &Index{
+		connLock:              make(chan struct{}, 1),
 		maxWords:              opts.MaxWords,
 		vectorSize:            opts.VectorSize,
 		embeddingsConcurrency: opts.EmbeddingsConcurrency,

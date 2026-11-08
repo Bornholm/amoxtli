@@ -339,9 +339,12 @@ func bindArgs(stmt *sqlite3.Stmt, start int, args []any) (int, error) {
 
 // UpdateMetadata implements index.MetadataUpdater.
 func (i *Index) UpdateMetadata(ctx context.Context, source *url.URL, metadata map[string]any) error {
-	i.rwLock.Lock()
+	unlock, lerr := i.lockConn(ctx)
+	if lerr != nil {
+		return lerr
+	}
 	i.oversampleStale.Store(true)
-	defer i.rwLock.Unlock()
+	defer unlock()
 
 	return i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 		if err := deleteDocumentMetadata(conn, source.String()); err != nil {

@@ -3,12 +3,15 @@ package sqlitevec
 import (
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/bornholm/amoxtli/model"
 	"github.com/pkg/errors"
 )
 
@@ -144,5 +147,78 @@ func TestIndexConcurrentSearchesOnSharedConnection(t *testing.T) {
 
 	for err := range errs {
 		t.Fatalf("concurrent search failed: %+v", errors.WithStack(err))
+	}
+}
+
+// TestSearchOnSharedConnectionHonoursTheContext checks that a search waiting
+// for the shared connection gives up when its context is done, as a search
+// waiting for a pooled reader does.
+func TestSearchOnSharedConnectionHonoursTheContext(t *testing.T) {
+	ctx := context.Background()
+	idx := newHermeticIndex(t, &keywordClient{})
+	indexDoc(t, ctx, idx, "mem://alpha", "# Alpha\n\nThis section is about ALPHA topics.\n")
+
+	unlock, err := idx.lockConn(ctx)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	defer unlock()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, err := idx.Search(waitCtx, "a question about ALPHA", index.SearchOptions{MaxResults: 5}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected the search to give up with its context, got %v", err)
+	}
+}
+
+// TestIndexAtPathReadsAllDuringIndexing runs All and a snapshot export while
+// documents are indexed. Both read through the writer connection of
+// NewIndexAtPath, which the indexing uses at the same time. Run with -race.
+func TestIndexAtPathReadsAllDuringIndexing(t *testing.T) {
+	ctx := context.Background()
+	idx, err := NewIndexAtPath(filepath.Join(t.TempDir(), "index.sqlite"), &keywordClient{},
+		WithEmbeddingsModel("mock"),
+		WithVectorSize(4),
+		WithReadPoolSize(2),
+	)
+	if err != nil {
+		t.Fatalf("could not open index: %+v", errors.WithStack(err))
+	}
+	defer idx.Close()
+
+	indexDoc(t, ctx, idx, "mem://alpha", "# Alpha\n\nThis section is about ALPHA topics.\n")
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for n := range 10 {
+			indexDoc(t, ctx, idx, fmt.Sprintf("mem://gamma-%d", n), "# Gamma\n\nThis section is about GAMMA topics.\n")
+		}
+	})
+	errs := make(chan error, 20)
+	for range 4 {
+		wg.Go(func() {
+			for range 5 {
+				if err := idx.All(ctx, func(model.SectionID) bool { return true }); err != nil {
+					errs <- err
+					return
+				}
+				snapshot, err := idx.GenerateSnapshot(ctx)
+				if err != nil {
+					errs <- err
+					return
+				}
+				_, err = io.Copy(io.Discard, snapshot)
+				snapshot.Close()
+				if err != nil {
+					errs <- err
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent read failed: %+v", errors.WithStack(err))
 	}
 }

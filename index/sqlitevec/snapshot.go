@@ -53,7 +53,7 @@ func (i *Index) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
 			return
 		}
 
-		err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 			// One record per chunk. The vector blob lives in vec0; a chunk in
 			// several collections has one identical vector row per collection,
 			// so any of them (MIN map id) is representative.
@@ -129,7 +129,7 @@ func (i *Index) RestoreSnapshot(ctx context.Context, r io.Reader) error {
 		return errors.Errorf("could not restore snapshot with a different embedding model '%s'", metadata.Model)
 	}
 
-	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+	err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 		for _, sql := range []string{
 			"DELETE FROM embeddings_vec2;",
 			"DELETE FROM embeddings_vec_map;",
@@ -186,7 +186,7 @@ func (i *Index) restoreRecords(ctx context.Context, records ...*SnapshottedRecor
 		slog.DebugContext(ctx, "restored record batch", slog.Any("batchSize", len(records)), slog.Duration("duration", time.Since(start)))
 	}()
 
-	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+	err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 		insertStmt, _, err := conn.Prepare("INSERT INTO embeddings ( source, section_id, chunk_index ) VALUES (?, ?, ?) RETURNING id;")
 		if err != nil {
 			return errors.WithStack(err)

@@ -15,7 +15,7 @@ func (i *Index) All(ctx context.Context, yield func(model.SectionID) bool) error
 
 	for {
 		var batch []model.SectionID
-		err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 			sql := `SELECT section_id FROM embeddings LIMIT ? OFFSET ?;`
 
 			stmt, _, err := conn.Prepare(sql)
