@@ -225,7 +225,11 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 		managerOpts = append(managerOpts, ingest.WithManagerImageEnrichment(imagetext.New(enrichOptions...)))
 	}
 	var reranker stagedReranker
-	if rerankClient := opts.clientFor(StageRerank); opts.reranking && rerankClient != nil {
+	if opts.reranking && opts.relevanceModel != nil {
+		reranker.llm = retrieval.NewModelReranker(opts.relevanceModel, store,
+			retrieval.WithRerankMaxSectionWords(opts.maxSectionWords),
+			retrieval.WithRerankWeight(opts.relevanceWeight))
+	} else if rerankClient := opts.clientFor(StageRerank); opts.reranking && rerankClient != nil {
 		reranker.llm = retrieval.NewLLMReranker(rerankClient, store, opts.maxTotalWords,
 			retrieval.WithMaxSectionWords(opts.maxSectionWords))
 	}
@@ -268,7 +272,13 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 	// shared across Search (filtering), CheckGrounding (verdict) and the
 	// orchestrator/SearchIterative (both). It replaces the pipeline Judge when
 	// enabled.
-	if groundingClient := opts.clientFor(StageGrounding); opts.groundingCheck && groundingClient != nil {
+	if opts.groundingCheck && opts.relevanceModel != nil {
+		evaluatorOpts := []retrieval.ModelEvaluatorOption{retrieval.WithModelMaxSectionWords(opts.maxSectionWords)}
+		if opts.relevanceThreshold != nil {
+			evaluatorOpts = append(evaluatorOpts, retrieval.WithRelevanceThreshold(*opts.relevanceThreshold))
+		}
+		codex.evaluator = retrieval.NewModelEvidenceEvaluator(opts.relevanceModel, store, evaluatorOpts...)
+	} else if groundingClient := opts.clientFor(StageGrounding); opts.groundingCheck && groundingClient != nil {
 		codex.evaluator = retrieval.NewLLMEvidenceEvaluator(groundingClient, store, opts.maxTotalWords,
 			retrieval.WithMaxSectionWords(opts.maxSectionWords))
 	}
