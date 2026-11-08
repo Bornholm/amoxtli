@@ -144,8 +144,8 @@ func TestEncryption_MigratesExistingClearContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migration failed: %+v", errors.WithStack(err))
 	}
-	if sealed != 1 {
-		t.Errorf("sealed %d documents, want 1", sealed)
+	if sealed != 1 || skipped != 0 {
+		t.Errorf("sealed %d and skipped %d documents, want 1 and 0", sealed, skipped)
 	}
 
 	sealed, skipped, err = store.EncryptExistingDocuments(ctx)
