@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/index/testsuite"
@@ -89,8 +90,66 @@ func TestBM25StatisticsFollowRestore(t *testing.T) {
 	if len(results) != 3 {
 		t.Errorf("%d results after the restore, want 3", len(results))
 	}
-	if got := statsChunks(t, ctx, pool); got != 3 {
-		t.Errorf("statistics on %d chunks after the restore, want 3", got)
+	// The statistics are recomputed in the background.
+	waitFor(t, func() bool { return statsChunks(t, ctx, pool) == 3 }, "statistics on the 3 restored chunks")
+}
+
+// TestBM25StatisticsFollowOtherWriters checks that a rewrite by another
+// process, which keeps the number of chunks, still refreshes the statistics.
+func TestBM25StatisticsFollowOtherWriters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping: requires docker + postgres")
+	}
+	if os.Getenv("AMOXTLI_TEST_POSTGRES") == "" {
+		t.Skip("set AMOXTLI_TEST_POSTGRES=1 to run (requires docker + postgres)")
+	}
+
+	ctx := context.Background()
+	connectionStr := startPostgresContainer(t, ctx)
+	pool, err := resetDatabase(t, ctx, connectionStr)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	searcher := NewIndex(pool, nil, WithBM25(true))
+	writer := NewIndex(pool, nil, WithBM25(true))
+
+	indexDocs(t, ctx, writer, "lighthouse", 3)
+	if _, err := searcher.Search(ctx, "lighthouse", index.SearchOptions{MaxResults: 5}); err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	// Same sources, same number of chunks, other words.
+	for k := range 3 {
+		document, err := markdown.Parse(fmt.Appendf(nil, "# beacon %d\n\nthe beacon number %d\n", k, k))
+		if err != nil {
+			t.Fatalf("%+v", errors.WithStack(err))
+		}
+		source, _ := url.Parse(fmt.Sprintf("mem://lighthouse-%d", k))
+		document.SetSource(source)
+		if err := writer.Index(ctx, document); err != nil {
+			t.Fatalf("%+v", err)
+		}
+	}
+
+	if _, err := searcher.Search(ctx, "beacon", index.SearchOptions{MaxResults: 5}); err != nil {
+		t.Fatalf("%+v", err)
+	}
+	waitFor(t, func() bool {
+		var ndoc int
+		err := pool.QueryRow(ctx, `SELECT coalesce((SELECT ndoc FROM amoxtli_lexeme_stats WHERE lexeme = 'beacon'), 0)`).Scan(&ndoc)
+		return err == nil && ndoc == 3
+	}, "statistics counting the new lexeme")
+}
+
+func waitFor(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

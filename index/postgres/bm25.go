@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bornholm/amoxtli/index"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/errors"
 )
@@ -28,11 +29,12 @@ import (
 // lexeme in the chunk's tsvector, and the chunk length its number of lexemes.
 // Taking the term frequency as 1 lost 6 points of recall at 10 on the AN.
 //
-// The statistics are computed again once the chunks have changed by more than
-// bm25RefreshRatio: counted here for this process's writes, and checked
-// against the table every bm25CheckEvery for the writes of other processes and
-// for restores. A search never waits for that recomputation, except the first
-// one on a table that has no statistics yet.
+// The statistics are computed again once more than bm25RefreshRatio of the
+// chunks have been written or deleted since. Every write path counts its
+// chunks in amoxtli_lexeme_changes, in the database, so the writes of other
+// processes and restores count too, whatever they do to the number of rows. A
+// search never waits for the recomputation, except the first one on a table
+// that has no statistics yet.
 
 const (
 	bm25K1 = 1.2
@@ -62,9 +64,6 @@ const (
 	// bm25RefreshRatio is the share of the chunks that may change before the
 	// lexeme statistics are computed again.
 	bm25RefreshRatio = 0.1
-	// bm25CheckEvery is how often the statistics are checked against the
-	// number of chunks in the table.
-	bm25CheckEvery = time.Minute
 	// bm25RefreshTimeout bounds a recomputation run in the background.
 	bm25RefreshTimeout = 30 * time.Minute
 )
@@ -81,50 +80,60 @@ func bm25Migrations() []string {
 			avg_len DOUBLE PRECISION NOT NULL,
 			computed_at TIMESTAMPTZ NOT NULL
 		);`,
+		// changes: the value of amoxtli_lexeme_changes.n the statistics were
+		// computed at.
+		`ALTER TABLE amoxtli_lexeme_stats_meta ADD COLUMN IF NOT EXISTS changes BIGINT NOT NULL DEFAULT 0;`,
+		`CREATE TABLE IF NOT EXISTS amoxtli_lexeme_changes (
+			id INTEGER PRIMARY KEY,
+			n BIGINT NOT NULL
+		);`,
 	}
 }
 
-// noteChunksChanged records that n chunks were written or deleted, so that the
-// lexeme statistics get computed again once enough of them changed.
-func (i *Index) noteChunksChanged(n int64) {
-	if n > 0 {
-		i.bm25Changed.Add(n)
-	}
+// execer runs a statement on a pool or in a transaction.
+type execer interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }
 
-// forgetLexemeStats drops the statistics, here and in the database, after the
-// whole table was replaced (RestoreSnapshot).
-func (i *Index) forgetLexemeStats(ctx context.Context, pool *pgxpool.Pool) error {
-	i.bm25Mu.Lock()
-	defer i.bm25Mu.Unlock()
-	for _, sql := range []string{`TRUNCATE amoxtli_lexeme_stats`, `DELETE FROM amoxtli_lexeme_stats_meta`} {
-		if _, err := pool.Exec(ctx, sql); err != nil {
-			return errors.WithStack(err)
-		}
+// noteChunksChanged counts n chunks written or deleted, so that the lexeme
+// statistics get computed again once enough of them changed. Run in the
+// write's own transaction when there is one.
+func noteChunksChanged(ctx context.Context, db execer, n int64) error {
+	if n <= 0 {
+		return nil
 	}
-	i.bm25Chunks = 0
-	i.bm25Changed.Store(0)
-	return nil
+	_, err := db.Exec(ctx, `INSERT INTO amoxtli_lexeme_changes (id, n) VALUES (1, $1)
+		ON CONFLICT (id) DO UPDATE SET n = amoxtli_lexeme_changes.n + EXCLUDED.n`, n)
+	return errors.WithStack(err)
+}
+
+// lexemeStatsState reads whether there are statistics, and whether more than
+// bm25RefreshRatio of their chunks changed since they were computed.
+func lexemeStatsState(ctx context.Context, pool *pgxpool.Pool) (have, stale bool, err error) {
+	var chunks, at, now int64
+	err = pool.QueryRow(ctx, `SELECT
+			m.id IS NOT NULL, coalesce(m.chunks, 0), coalesce(m.changes, 0),
+			coalesce((SELECT n FROM amoxtli_lexeme_changes WHERE id = 1), 0)
+		FROM (SELECT 1) one
+		LEFT JOIN amoxtli_lexeme_stats_meta m ON m.id = 1`).Scan(&have, &chunks, &at, &now)
+	if err != nil {
+		return false, false, errors.WithStack(err)
+	}
+	return have, have && float64(now-at) > bm25RefreshRatio*float64(max(chunks, 1)), nil
 }
 
 // ensureLexemeStats makes sure the search has statistics to read. With none
-// usable it computes them before returning; with stale ones it starts a
+// it computes them before returning; with stale ones it starts a
 // recomputation in the background and returns at once.
 func (i *Index) ensureLexemeStats(ctx context.Context, pool *pgxpool.Pool) error {
-	stale, err := i.checkLexemeStats(ctx, pool)
+	have, stale, err := lexemeStatsState(ctx, pool)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if !stale {
-		return nil
-	}
-	i.bm25Mu.Lock()
-	have := i.bm25Chunks > 0
-	i.bm25Mu.Unlock()
 	if !have {
 		return i.refreshLexemeStats(ctx, pool, true)
 	}
-	if i.bm25Refreshing.CompareAndSwap(false, true) {
+	if stale && i.bm25Refreshing.CompareAndSwap(false, true) {
 		go func() {
 			defer i.bm25Refreshing.Store(false)
 			ctx, cancel := context.WithTimeout(context.Background(), bm25RefreshTimeout)
@@ -137,54 +146,12 @@ func (i *Index) ensureLexemeStats(ctx context.Context, pool *pgxpool.Pool) error
 	return nil
 }
 
-// checkLexemeStats reports whether the statistics must be computed again.
-// Without statistics in memory, or every bm25CheckEvery, it compares the
-// stored statistics with the number of chunks in the table.
-func (i *Index) checkLexemeStats(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
-	i.bm25Mu.Lock()
-	defer i.bm25Mu.Unlock()
-
-	if i.bm25Chunks > 0 && time.Since(i.bm25Checked) < bm25CheckEvery {
-		return float64(i.bm25Changed.Load()) > bm25RefreshRatio*float64(i.bm25Chunks), nil
-	}
-
-	var stored, current int64
-	err := pool.QueryRow(ctx, `SELECT
-			coalesce((SELECT chunks FROM amoxtli_lexeme_stats_meta WHERE id = 1), 0),
-			(SELECT count(*) FROM amoxtli_chunks)`).Scan(&stored, &current)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
-	i.bm25Checked = time.Now()
-	if stored == 0 {
-		i.bm25Chunks = 0
-		return true, nil
-	}
-	// Adopt what another process computed, or what this one computed last.
-	i.bm25Chunks = stored
-	drift := max(current-stored, stored-current)
-	return float64(max(drift, i.bm25Changed.Load())) > bm25RefreshRatio*float64(stored), nil
-}
-
 // refreshLexemeStats computes the statistics from the chunks; with
-// onlyIfMissing, not when another search computed them while this one waited.
-// Another process may be computing them at the same time: an advisory lock
-// makes it wait.
+// onlyIfMissing, not when they appeared while this call waited for another
+// one. Processes computing them at the same time wait on an advisory lock.
 func (i *Index) refreshLexemeStats(ctx context.Context, pool *pgxpool.Pool, onlyIfMissing bool) error {
 	i.bm25RefreshMu.Lock()
 	defer i.bm25RefreshMu.Unlock()
-
-	if onlyIfMissing {
-		i.bm25Mu.Lock()
-		have := i.bm25Chunks > 0
-		i.bm25Mu.Unlock()
-		if have {
-			return nil
-		}
-	}
-
-	// The writes counted from here on are not covered by this computation.
-	counted := i.bm25Changed.Load()
 
 	start := time.Now()
 	tx, err := pool.Begin(ctx)
@@ -196,33 +163,37 @@ func (i *Index) refreshLexemeStats(ctx context.Context, pool *pgxpool.Pool, only
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('amoxtli_lexeme_stats'))`); err != nil {
 		return errors.WithStack(err)
 	}
+	if onlyIfMissing {
+		var have bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM amoxtli_lexeme_stats_meta WHERE id = 1)`).Scan(&have); err != nil {
+			return errors.WithStack(err)
+		}
+		if have {
+			return nil
+		}
+	}
+	// The changes counted before the scan: a write landing during it counts
+	// toward the next recomputation, at worst once too many.
 	statements := []string{
-		`TRUNCATE amoxtli_lexeme_stats`,
+		`DELETE FROM amoxtli_lexeme_stats`,
+		`INSERT INTO amoxtli_lexeme_stats_meta (id, chunks, avg_len, computed_at, changes)
+			SELECT 1, 0, 0, now(), coalesce((SELECT n FROM amoxtli_lexeme_changes WHERE id = 1), 0)
+			ON CONFLICT (id) DO UPDATE SET changes = EXCLUDED.changes`,
 		`INSERT INTO amoxtli_lexeme_stats (lexeme, ndoc)
 			SELECT word, ndoc FROM ts_stat('SELECT tsv FROM amoxtli_chunks')`,
-		`INSERT INTO amoxtli_lexeme_stats_meta (id, chunks, avg_len, computed_at)
-			SELECT 1, count(*), coalesce(avg(length(tsv)), 0), now() FROM amoxtli_chunks
-			ON CONFLICT (id) DO UPDATE SET chunks = EXCLUDED.chunks, avg_len = EXCLUDED.avg_len, computed_at = EXCLUDED.computed_at`,
+		`UPDATE amoxtli_lexeme_stats_meta SET (chunks, avg_len, computed_at) =
+			(SELECT count(*), coalesce(avg(length(tsv)), 0), now() FROM amoxtli_chunks)
+			WHERE id = 1`,
 	}
 	for _, sql := range statements {
 		if _, err := tx.Exec(ctx, sql); err != nil {
 			return errors.Wrapf(err, "could not compute the lexeme statistics")
 		}
 	}
-	var chunks int64
-	if err := tx.QueryRow(ctx, `SELECT chunks FROM amoxtli_lexeme_stats_meta WHERE id = 1`).Scan(&chunks); err != nil {
-		return errors.WithStack(err)
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return errors.WithStack(err)
 	}
-
-	i.bm25Mu.Lock()
-	i.bm25Chunks = max(chunks, 1)
-	i.bm25Checked = time.Now()
-	i.bm25Changed.Add(-counted)
-	i.bm25Mu.Unlock()
-	slog.DebugContext(ctx, "postgres: lexeme statistics computed", slog.Int64("chunks", chunks), slog.Duration("elapsed", time.Since(start)))
+	slog.DebugContext(ctx, "postgres: lexeme statistics computed", slog.Duration("elapsed", time.Since(start)))
 	return nil
 }
 

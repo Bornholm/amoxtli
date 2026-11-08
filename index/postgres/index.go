@@ -20,7 +20,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/internal/cdc"
@@ -47,16 +46,9 @@ type Index struct {
 	simpleUnion       bool
 	efSearchFactor    int
 	// bm25 scores the full-text leg with BM25 instead of ts_rank (see
-	// bm25.go). bm25Mu guards bm25Chunks, the number of chunks the stored
-	// lexeme statistics were computed on (0: none known), and bm25Checked,
-	// when they were last compared with the table; bm25Changed counts the
-	// chunks this process wrote or deleted since. bm25RefreshMu and
-	// bm25Refreshing let one recomputation run at a time.
+	// bm25.go); bm25RefreshMu and bm25Refreshing let one recomputation of its
+	// statistics run at a time.
 	bm25           bool
-	bm25Mu         sync.Mutex
-	bm25Chunks     int64
-	bm25Checked    time.Time
-	bm25Changed    atomic.Int64
 	bm25RefreshMu  sync.Mutex
 	bm25Refreshing atomic.Bool
 }
@@ -296,7 +288,7 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	i.noteChunksChanged(tag.RowsAffected() + int64(len(chunksToProcess)))
+	changed := tag.RowsAffected() + int64(len(chunksToProcess))
 
 	// Refresh this index's copy of the document metadata in the same
 	// transaction as its chunks, so the two can never disagree. The delete
@@ -382,6 +374,11 @@ func (i *Index) Index(ctx context.Context, document model.Document, funcs ...ind
 	}
 
 	if err := flushBatch(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	// Last, so that the counter's row stays locked as briefly as possible.
+	if err := noteChunksChanged(ctx, tx, changed); err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -479,7 +476,9 @@ func (i *Index) DeleteBySource(ctx context.Context, source *url.URL) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	i.noteChunksChanged(tag.RowsAffected())
+	if err := noteChunksChanged(ctx, pool, tag.RowsAffected()); err != nil {
+		return errors.WithStack(err)
+	}
 
 	// A stale metadata row would let a filter match a document this index no
 	// longer holds.
@@ -506,7 +505,9 @@ func (i *Index) DeleteByID(ctx context.Context, ids ...model.SectionID) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	i.noteChunksChanged(tag.RowsAffected())
+	if err := noteChunksChanged(ctx, pool, tag.RowsAffected()); err != nil {
+		return errors.WithStack(err)
+	}
 
 	return nil
 }
@@ -601,7 +602,7 @@ func (i *Index) search(ctx context.Context, query string, filter index.Filter, o
 		hits = append(hits, index.Hit{Source: hit.Source, Section: model.SectionID(hit.SectionID), Score: fusedScores[id]})
 	}
 
-	return index.AggregateHits(hits, opts.MaxResults)
+	return index.AggregateHits(hits, limit)
 }
 
 // tsvectorExpr builds the SQL producing a chunk's (or a query's) tsvector.
