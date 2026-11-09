@@ -1,11 +1,13 @@
 package sqlitevec
 
 import (
+	"bufio"
 	"context"
 	"encoding/gob"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/bornholm/amoxtli/backup"
@@ -36,83 +38,116 @@ type SnapshottedRecord struct {
 }
 
 // GenerateSnapshot implements snapshot.Snapshotable.
+//
+// The whole index is read in one statement under the connection lock and
+// written to a temporary file; the returned reader streams that file with the
+// lock released, and Close removes it. The snapshot is therefore the state of
+// the index at one point in time, and a slow or departed reader never holds
+// up the index, at the cost of disk space for the snapshot.
 func (i *Index) GenerateSnapshot(ctx context.Context) (io.ReadCloser, error) {
-	r, w := io.Pipe()
+	file, err := os.CreateTemp("", "amoxtli-sqlitevec-snapshot-*")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	snapshot := &tempSnapshot{File: file}
+	if err := i.writeSnapshot(ctx, file); err != nil {
+		snapshot.Close()
+		return nil, errors.WithStack(err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		snapshot.Close()
+		return nil, errors.WithStack(err)
+	}
+	return snapshot, nil
+}
 
-	go func() {
-		defer w.Close()
+// tempSnapshot is a snapshot written to a temporary file, removed on Close.
+type tempSnapshot struct{ *os.File }
 
-		encoder := gob.NewEncoder(w)
+func (s *tempSnapshot) Close() error {
+	err := s.File.Close()
+	if rerr := os.Remove(s.Name()); rerr != nil && err == nil {
+		err = rerr
+	}
+	return errors.WithStack(err)
+}
 
-		metadata := SnapshottedMetadata{
-			Model: i.model,
+// writeSnapshot encodes the metadata and every record to file, under the
+// connection lock. A retry starts the file again.
+func (i *Index) writeSnapshot(ctx context.Context, file *os.File) error {
+	return i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+		if err := file.Truncate(0); err != nil {
+			return errors.WithStack(err)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return errors.WithStack(err)
+		}
+		buffered := bufio.NewWriter(file)
+		encoder := gob.NewEncoder(buffered)
+
+		if err := encoder.Encode(SnapshottedMetadata{Model: i.model}); err != nil {
+			return errors.WithStack(err)
 		}
 
-		if err := encoder.Encode(metadata); err != nil {
-			w.CloseWithError(errors.WithStack(err))
-			return
-		}
+		// One record per chunk. The vector blob lives in vec0; a chunk in
+		// several collections has one identical vector row per collection,
+		// so any of them (MIN map id) is representative.
+		sql := `
+			SELECT
+				e.id,
+				e.source,
+				e.section_id,
+				e.chunk_index,
+				(
+					SELECT v.embedding FROM embeddings_vec2 v
+					WHERE v.rowid = ( SELECT MIN(m.id) FROM embeddings_vec_map m WHERE m.embeddings_id = e.id )
+				),
+				COALESCE(json_group_array(ec.collection_id) FILTER ( WHERE ec.collection_id IS NOT NULL ), '[]') AS collections,
+				COALESCE(dm.metadata, '') AS metadata
+			FROM embeddings e
+			LEFT JOIN embeddings_collections ec ON e.id = ec.embeddings_id
+			LEFT JOIN document_metadata dm ON dm.source = e.source
+			GROUP BY e.id, e.source, e.section_id, e.chunk_index, dm.metadata
+			;
+		`
 
-		err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
-			// One record per chunk. The vector blob lives in vec0; a chunk in
-			// several collections has one identical vector row per collection,
-			// so any of them (MIN map id) is representative.
-			sql := `
-				SELECT
-					e.id,
-					e.source,
-					e.section_id,
-					e.chunk_index,
-					(
-						SELECT v.embedding FROM embeddings_vec2 v
-						WHERE v.rowid = ( SELECT MIN(m.id) FROM embeddings_vec_map m WHERE m.embeddings_id = e.id )
-					),
-					COALESCE(json_group_array(ec.collection_id) FILTER ( WHERE ec.collection_id IS NOT NULL ), '[]') AS collections,
-					COALESCE(dm.metadata, '') AS metadata
-				FROM embeddings e
-				LEFT JOIN embeddings_collections ec ON e.id = ec.embeddings_id
-				LEFT JOIN document_metadata dm ON dm.source = e.source
-				GROUP BY e.id, e.source, e.section_id, e.chunk_index, dm.metadata
-				;
-			`
-
-			stmt, _, err := conn.Prepare(sql)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-
-			defer stmt.Close()
-
-			for stmt.Step() {
-				record := SnapshottedRecord{}
-				record.Source = stmt.ColumnText(1)
-				record.SectionID = stmt.ColumnText(2)
-				record.ChunkIndex = stmt.ColumnInt(3)
-				record.Embeddings = stmt.ColumnBlob(4, []byte{})
-				rawCollections := stmt.ColumnBlob(5, []byte{})
-				if err := json.Unmarshal(rawCollections, &record.Collections); err != nil {
-					return errors.WithStack(err)
-				}
-				record.Metadata = stmt.ColumnText(6)
-
-				if err := encoder.Encode(record); err != nil {
-					return errors.WithStack(err)
-				}
-			}
-
-			if err := stmt.Err(); err != nil {
-				return errors.WithStack(err)
-			}
-
-			return nil
-		}, sqlite3.LOCKED, sqlite3.BUSY)
+		stmt, _, err := conn.Prepare(sql)
 		if err != nil {
-			w.CloseWithError(errors.WithStack(err))
-			return
+			return errors.WithStack(err)
 		}
-	}()
 
-	return io.NopCloser(r), nil
+		defer stmt.Close()
+
+		for n := 0; stmt.Step(); n++ {
+			// The export holds the lock: give it up as soon as the caller
+			// has gone.
+			if n%256 == 0 {
+				if err := ctx.Err(); err != nil {
+					return errors.WithStack(err)
+				}
+			}
+			record := SnapshottedRecord{}
+			record.Source = stmt.ColumnText(1)
+			record.SectionID = stmt.ColumnText(2)
+			record.ChunkIndex = stmt.ColumnInt(3)
+			record.Embeddings = stmt.ColumnBlob(4, []byte{})
+			rawCollections := stmt.ColumnBlob(5, []byte{})
+			if err := json.Unmarshal(rawCollections, &record.Collections); err != nil {
+				return errors.WithStack(err)
+			}
+			record.Metadata = stmt.ColumnText(6)
+
+			if err := encoder.Encode(record); err != nil {
+				return errors.WithStack(err)
+			}
+		}
+
+		if err := stmt.Err(); err != nil {
+			return errors.WithStack(err)
+		}
+
+		return errors.WithStack(buffered.Flush())
+	}, sqlite3.LOCKED, sqlite3.BUSY)
 }
 
 // RestoreSnapshot implements snapshot.Snapshotable.
@@ -129,7 +164,7 @@ func (i *Index) RestoreSnapshot(ctx context.Context, r io.Reader) error {
 		return errors.Errorf("could not restore snapshot with a different embedding model '%s'", metadata.Model)
 	}
 
-	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+	err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 		for _, sql := range []string{
 			"DELETE FROM embeddings_vec2;",
 			"DELETE FROM embeddings_vec_map;",
@@ -186,7 +221,7 @@ func (i *Index) restoreRecords(ctx context.Context, records ...*SnapshottedRecor
 		slog.DebugContext(ctx, "restored record batch", slog.Any("batchSize", len(records)), slog.Duration("duration", time.Since(start)))
 	}()
 
-	err := i.withRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
+	err := i.withLockedRetry(ctx, func(ctx context.Context, conn *sqlite3.Conn) error {
 		insertStmt, _, err := conn.Prepare("INSERT INTO embeddings ( source, section_id, chunk_index ) VALUES (?, ?, ?) RETURNING id;")
 		if err != nil {
 			return errors.WithStack(err)
