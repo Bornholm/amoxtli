@@ -33,6 +33,10 @@ type ManagerOptions struct {
 	MaxWordPerSection int
 	FileConverter     convert.Converter
 	Reranker          Reranker
+	// RerankWindow, when positive, is the number of first fused candidates
+	// handed to the reranker, whatever the page size. Zero keeps the window
+	// relative to the page size (see rerankTop).
+	RerankWindow int
 	// SourceCode, when set, enables source-code indexing for the file
 	// extensions registered in the registry.
 	SourceCode *sourcecode.Registry
@@ -67,6 +71,15 @@ func WithManagerStagingDir(dir string) ManagerOptionFunc {
 func WithManagerReranker(reranker Reranker) ManagerOptionFunc {
 	return func(opts *ManagerOptions) {
 		opts.Reranker = reranker
+	}
+}
+
+// WithManagerRerankWindow sets how many first fused candidates the reranker
+// orders, whatever the page size; the others follow in their fused order.
+// Zero or less keeps the default window, relative to the page size.
+func WithManagerRerankWindow(n int) ManagerOptionFunc {
+	return func(opts *ManagerOptions) {
+		opts.RerankWindow = n
 	}
 }
 
@@ -132,6 +145,7 @@ type Manager struct {
 	index             index.Index
 	taskRunner        task.Runner
 	reranker          Reranker
+	rerankWindow      int
 
 	// Per-manager staging directory for files awaiting indexing (created
 	// lazily by IndexFile, removed by CleanupTempDir). When stagingDirOverride
@@ -308,7 +322,7 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 		rerankCtx, span := telemetry.Tracer().Start(ctx, "ingest.rerank",
 			trace.WithAttributes(attribute.Int(telemetry.AttrCandidateCount, len(results))),
 		)
-		results, err = rerankTop(rerankCtx, m.reranker, query, results, pageSize)
+		results, err = rerankTop(rerankCtx, m.reranker, query, results, m.rerankWindowFor(pageSize))
 		span.End()
 		if err != nil {
 			return nil, errors.WithStack(err)
@@ -334,11 +348,20 @@ const rerankWindowFactor = 4
 // the reranker enough context to promote a strong-but-lower-ranked candidate.
 const minRerankWindow = 20
 
-// rerankTop reranks only the top window of results (bounded relative to the page
-// size) and leaves the remaining candidates in their original fused order after
-// them. This keeps deep pagination working while capping the reranker's cost.
-func rerankTop(ctx context.Context, reranker Reranker, query string, results []*index.SearchResult, pageSize int) ([]*index.SearchResult, error) {
-	window := max(pageSize*rerankWindowFactor, minRerankWindow)
+// rerankWindowFor is the number of first fused candidates handed to the
+// reranker for a page of pageSize results: the configured window when there
+// is one, otherwise a multiple of the page size with a floor.
+func (m *Manager) rerankWindowFor(pageSize int) int {
+	if m.rerankWindow > 0 {
+		return m.rerankWindow
+	}
+	return max(pageSize*rerankWindowFactor, minRerankWindow)
+}
+
+// rerankTop reranks only the first window results and leaves the remaining
+// candidates in their original fused order after them. This keeps deep
+// pagination working while capping the reranker's cost.
+func rerankTop(ctx context.Context, reranker Reranker, query string, results []*index.SearchResult, window int) ([]*index.SearchResult, error) {
 	if len(results) <= window {
 		return reranker.Rerank(ctx, query, results)
 	}
@@ -931,6 +954,7 @@ func NewManager(store Store, idx index.Index, taskRunner task.Runner, funcs ...M
 		imageEnricher:      opts.ImageEnricher,
 		blobs:              opts.Blobs,
 		reranker:           opts.Reranker,
+		rerankWindow:       opts.RerankWindow,
 		stagingDirOverride: opts.StagingDir,
 	}
 

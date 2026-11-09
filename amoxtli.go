@@ -244,7 +244,7 @@ func New(ctx context.Context, funcs ...Option) (*Codex, error) {
 		reranker.lexical = retrieval.NewLexicalReranker(store, lexicalOpts...)
 	}
 	if reranker.llm != nil || reranker.lexical != nil {
-		managerOpts = append(managerOpts, ingest.WithManagerReranker(&reranker))
+		managerOpts = append(managerOpts, ingest.WithManagerReranker(&reranker), ingest.WithManagerRerankWindow(opts.rerankWindow))
 	}
 
 	manager := ingest.NewManager(store, idx, taskRunner, managerOpts...)

@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"testing"
 
@@ -192,5 +193,44 @@ func TestManagerSearchRerankBeforePagination(t *testing.T) {
 	}
 	if len(page.Results) != 2 || page.Results[0].Source.Host != "c" || page.Results[1].Source.Host != "b" {
 		t.Fatalf("expected reranked (reversed) order c,b, got %+v", page.Results)
+	}
+}
+
+// countingReranker records how many candidates it was handed.
+type countingReranker struct{ handed int }
+
+func (r *countingReranker) Rerank(ctx context.Context, query string, results []*index.SearchResult) ([]*index.SearchResult, error) {
+	r.handed = len(results)
+	return results, nil
+}
+
+func TestManagerSearchRerankWindow(t *testing.T) {
+	var results []*index.SearchResult
+	for i := range 30 {
+		results = append(results, result(fmt.Sprintf("d%02d", i), float64(30-i), model.SectionID(fmt.Sprintf("s%02d", i))))
+	}
+
+	for _, tc := range []struct {
+		name   string
+		window int
+		want   int
+	}{
+		{"page relative", 0, minRerankWindow},
+		{"configured", 5, 5},
+		{"wider than the pool", 100, 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newSearchManager(&stubIndex{results: results}, &stubStore{})
+			reranker := &countingReranker{}
+			m.reranker = reranker
+			m.rerankWindow = tc.window
+
+			if _, err := m.Search(context.Background(), "q", WithSearchMaxResults(3)); err != nil {
+				t.Fatalf("search: %+v", err)
+			}
+			if reranker.handed != tc.want {
+				t.Fatalf("reranker handed %d candidates, want %d", reranker.handed, tc.want)
+			}
+		})
 	}
 }
