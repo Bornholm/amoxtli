@@ -71,7 +71,7 @@ func TestRerankerPromptCapsSectionWords(t *testing.T) {
 	store, results := longSectionsFixture(500)
 
 	r := NewLLMReranker(nil, store, 8000, WithMaxSectionWords(50))
-	prompt, err := r.getUserPrompt(context.Background(), "q", results)
+	prompt, _, err := r.getUserPrompt(context.Background(), "q", results)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestRerankerPromptCapsSectionWords(t *testing.T) {
 
 	// A total budget smaller than the section cap wins.
 	r = NewLLMReranker(nil, store, 30, WithMaxSectionWords(50))
-	prompt, err = r.getUserPrompt(context.Background(), "q", results)
+	prompt, _, err = r.getUserPrompt(context.Background(), "q", results)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
