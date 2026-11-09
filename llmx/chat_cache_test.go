@@ -108,6 +108,33 @@ func TestChatCacheKeyCoversSeedAndMessages(t *testing.T) {
 	}
 }
 
+// TestChatCacheKeyCoversReasoning checks that the reasoning options are part
+// of the key, and that a call without them keeps the key it had before they
+// were.
+func TestChatCacheKeyCoversReasoning(t *testing.T) {
+	inner := &chatStub{}
+	c := newChatTestCache(t, inner)
+
+	plainPath, _ := c.chatPath(llm.NewChatCompletionOptions(seeded(1)...))
+	for _, opts := range [][]llm.ChatCompletionOptionFunc{
+		seeded(1),
+		append(seeded(1), llm.WithReasoning(llm.NewReasoningOptions(llm.ReasoningEffortNone))),
+		append(seeded(1), llm.WithReasoning(llm.NewReasoningOptions(llm.ReasoningEffortHigh))),
+		append(seeded(1), llm.WithReasoning(llm.NewReasoningOptions(llm.ReasoningEffortNone))),
+	} {
+		if _, err := c.ChatCompletion(context.Background(), opts...); err != nil {
+			t.Fatalf("unexpected error: %+v", err)
+		}
+	}
+
+	if got := inner.calls(); got != 3 {
+		t.Errorf("inner calls = %d, want 3 (none and high are two entries, the repeated none a hit)", got)
+	}
+	if _, err := os.Stat(plainPath); err != nil {
+		t.Errorf("the call without reasoning options is not under its former key: %v", err)
+	}
+}
+
 // TestChatCacheSkipsUnseededCalls checks that a call without a seed always
 // passes through and writes nothing.
 func TestChatCacheSkipsUnseededCalls(t *testing.T) {

@@ -119,15 +119,18 @@ type chatCacheEntry struct {
 // completion. encoding/json sorts map keys, so schemas built from maps
 // marshal deterministically.
 type chatKey struct {
-	Namespace           string           `json:"namespace"`
-	Seed                int              `json:"seed"`
-	Temperature         float64          `json:"temperature"`
-	MaxCompletionTokens *int             `json:"max_completion_tokens,omitempty"`
-	ResponseFormat      string           `json:"response_format,omitempty"`
-	SchemaName          string           `json:"schema_name,omitempty"`
-	SchemaDescription   string           `json:"schema_description,omitempty"`
-	Schema              any              `json:"schema,omitempty"`
-	Messages            []chatCacheEntry `json:"messages"`
+	Namespace           string  `json:"namespace"`
+	Seed                int     `json:"seed"`
+	Temperature         float64 `json:"temperature"`
+	MaxCompletionTokens *int    `json:"max_completion_tokens,omitempty"`
+	ResponseFormat      string  `json:"response_format,omitempty"`
+	SchemaName          string  `json:"schema_name,omitempty"`
+	SchemaDescription   string  `json:"schema_description,omitempty"`
+	Schema              any     `json:"schema,omitempty"`
+	// Reasoning changes the answer: two calls that differ only by it must
+	// not share an entry. Absent, it leaves the keys written before it.
+	Reasoning *llm.ReasoningOptions `json:"reasoning,omitempty"`
+	Messages  []chatCacheEntry      `json:"messages"`
 }
 
 // ChatCompletion implements llm.ChatCompletionClient. Deterministic calls —
@@ -225,6 +228,7 @@ func (c *CachingClient) chatPath(opts *llm.ChatCompletionOptions) (string, bool)
 		Temperature:         opts.Temperature,
 		MaxCompletionTokens: opts.MaxCompletionTokens,
 		ResponseFormat:      string(opts.ResponseFormat),
+		Reasoning:           opts.Reasoning,
 	}
 
 	if opts.ResponseSchema != nil {
