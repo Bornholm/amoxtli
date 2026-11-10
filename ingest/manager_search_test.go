@@ -216,7 +216,11 @@ func TestManagerSearchRerankWindow(t *testing.T) {
 	for i := range 2 * maxCandidateFetch {
 		host := fmt.Sprintf("d%04d", i)
 		results = append(results, result(host, float64(2*maxCandidateFetch-i), model.SectionID("s"+host)))
-		metadata["test://"+host] = map[string]any{"lang": "fr"}
+		parity := "odd"
+		if i%2 == 0 {
+			parity = "even"
+		}
+		metadata["test://"+host] = map[string]any{"lang": "fr", "parity": parity}
 	}
 
 	for _, tc := range []struct {
@@ -238,6 +242,10 @@ func TestManagerSearchRerankWindow(t *testing.T) {
 		{"pinned pool", 150, nil, 100, 150},
 		{"pinned pool with a filter", 150, index.Filter{index.Eq("lang", "fr")}, 100, 150},
 		{"pinned pool wider than the window", 50, nil, 200, 50},
+		// A filter that keeps one candidate in two: the fetch must widen
+		// until the window is full of survivors, pinned pool or not.
+		{"selective filter", 150, index.Filter{index.Eq("parity", "even")}, 0, 150},
+		{"pinned pool with a selective filter", 150, index.Filter{index.Eq("parity", "even")}, 100, 150},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newSearchManager(&stubIndex{results: results, limit: true}, &stubStore{metadata: metadata})
