@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/bornholm/amoxtli/index"
@@ -32,19 +33,25 @@ You are a document retrieval reranker.
 
 ## Input
 - **Query**: The user's search query
-- **Documents**: A list of documents, each with an identifier and content
+- **Documents**: A list of documents, each with a number and content
 
 ## Task
-Order ALL the provided document identifiers from the most relevant to the query
+Order ALL the provided document numbers from the most relevant to the query
 to the least relevant. Judge relevance by how directly and completely each
-document answers or supports the query. Every identifier given in the input must
+document answers or supports the query. Every number given in the input must
 appear exactly once in the output.
 
 ## Output Format (strict JSON, no markdown fencing)
-{"ranking": ["most-relevant-id", "next-id", "least-relevant-id"]}
+{"ranking": [3, 1, 2]}
 `
 
 // Rerank implements ingest.Reranker.
+//
+// The sections are shown to the LLM under short numbers rather than their
+// identifiers: a number costs one token and the LLM cannot mistype it. When
+// the LLM call or its answer fails, the results keep their order and the
+// search goes on: the reranker only refines an order that is already usable.
+// A cancelled context still ends the search.
 func (r *LLMReranker) Rerank(ctx context.Context, query string, results []*index.SearchResult) ([]*index.SearchResult, error) {
 	if len(results) <= 1 {
 		return results, nil
@@ -55,9 +62,13 @@ func (r *LLMReranker) Rerank(ctx context.Context, query string, results []*index
 		return nil, errors.WithStack(err)
 	}
 
-	userPrompt, err := r.getUserPrompt(ctx, query, results)
+	userPrompt, shown, err := r.getUserPrompt(ctx, query, results)
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+
+	if len(shown) <= 1 {
+		return results, nil
 	}
 
 	seed, err := text.IntHash(systemPrompt + query)
@@ -67,19 +78,37 @@ func (r *LLMReranker) Rerank(ctx context.Context, query string, results []*index
 
 	ctx = slogx.WithAttrs(ctx, slog.Int("seed", seed))
 
+	rank, err := r.rank(ctx, systemPrompt, userPrompt, seed, shown)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.WithStack(ctxErr)
+		}
+		slog.WarnContext(ctx, "reranker failed, keeping the fused order", slog.Any("error", err))
+		return results, nil
+	}
+
+	slog.DebugContext(ctx, "reranker ranking", slog.Int("rankedSections", len(rank)))
+
+	return applyRanking(results, rank), nil
+}
+
+// rank asks the LLM for the order of the shown sections, numbered from 1, and
+// returns the rank of each section it placed. Numbers out of range and
+// repeated ones are ignored.
+func (r *LLMReranker) rank(ctx context.Context, systemPrompt, userPrompt string, seed int, shown []model.SectionID) (map[model.SectionID]int, error) {
 	completion, err := r.llm.ChatCompletion(ctx,
 		llm.WithJSONResponse(
 			llm.NewResponseSchema(
 				"RerankedResults",
-				"The document identifiers ordered from most to least relevant",
+				"The document numbers ordered from most to least relevant",
 				map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"ranking": map[string]any{
 							"type":        "array",
-							"description": "Document identifiers ordered from most to least relevant",
+							"description": "Document numbers ordered from most to least relevant",
 							"items": map[string]any{
-								"type": "string",
+								"type": "integer",
 							},
 						},
 					},
@@ -99,7 +128,7 @@ func (r *LLMReranker) Rerank(ctx context.Context, query string, results []*index
 	}
 
 	type llmResponse struct {
-		Ranking []string `json:"ranking"`
+		Ranking []int `json:"ranking"`
 	}
 
 	responses, err := llm.ParseJSON[llmResponse](completion.Message())
@@ -108,12 +137,15 @@ func (r *LLMReranker) Rerank(ctx context.Context, query string, results []*index
 	}
 
 	// Build the section rank map from the (possibly multiple) responses,
-	// keeping the first position seen for each identifier.
+	// keeping the first position seen for each number.
 	rank := map[model.SectionID]int{}
 	next := 0
 	for _, resp := range responses {
-		for _, id := range resp.Ranking {
-			sectionID := model.SectionID(id)
+		for _, n := range resp.Ranking {
+			if n < 1 || n > len(shown) {
+				continue
+			}
+			sectionID := shown[n-1]
 			if _, seen := rank[sectionID]; seen {
 				continue
 			}
@@ -122,9 +154,11 @@ func (r *LLMReranker) Rerank(ctx context.Context, query string, results []*index
 		}
 	}
 
-	slog.DebugContext(ctx, "reranker ranking", slog.Int("rankedSections", len(rank)))
+	if len(rank) == 0 {
+		return nil, errors.New("the LLM ranked none of the documents")
+	}
 
-	return applyRanking(results, rank), nil
+	return rank, nil
 }
 
 // applyRanking reorders results and their sections according to the section
@@ -182,10 +216,12 @@ func applyRanking(results []*index.SearchResult, rank map[model.SectionID]int) [
 	return out
 }
 
-func (r *LLMReranker) getUserPrompt(ctx context.Context, query string, results []*index.SearchResult) (string, error) {
+// getUserPrompt writes the query and the sections within the word budget,
+// numbered from 1, and returns the sections in the order of their numbers.
+func (r *LLMReranker) getUserPrompt(ctx context.Context, query string, results []*index.SearchResult) (string, []model.SectionID, error) {
 	sectionsMap, err := r.store.GetSectionsByIDs(ctx, allSectionIDs(results))
 	if err != nil {
-		return "", errors.WithStack(err)
+		return "", nil, errors.WithStack(err)
 	}
 
 	maxTotalWords := r.maxTotalWords
@@ -199,6 +235,7 @@ func (r *LLMReranker) getUserPrompt(ctx context.Context, query string, results [
 	sb.WriteString(query)
 	sb.WriteString("\n\n## Documents\n\n")
 
+	var shown []model.SectionID
 	for _, res := range results {
 		for _, s := range res.Sections {
 			section, exists := sectionsMap[s]
@@ -210,16 +247,15 @@ func (r *LLMReranker) getUserPrompt(ctx context.Context, query string, results [
 				break
 			}
 
-			sb.WriteString("### Document ")
-			sb.WriteString(string(section.ID()))
-			sb.WriteString("\n\n**Identifier:** ")
-			sb.WriteString(string(section.ID()))
-			sb.WriteString("\n\n")
-
 			content, err := section.Content()
 			if err != nil {
-				return "", errors.WithStack(err)
+				return "", nil, errors.WithStack(err)
 			}
+
+			shown = append(shown, section.ID())
+			sb.WriteString("### Document ")
+			sb.WriteString(strconv.Itoa(len(shown)))
+			sb.WriteString("\n\n")
 
 			text, consumed := truncateSection(string(content), r.maxSectionWords, maxTotalWords-totalWords)
 			totalWords += consumed
@@ -229,7 +265,7 @@ func (r *LLMReranker) getUserPrompt(ctx context.Context, query string, results [
 		}
 	}
 
-	return sb.String(), nil
+	return sb.String(), shown, nil
 }
 
 // NewLLMReranker builds an LLM-backed reranker. maxTotalWords bounds the total

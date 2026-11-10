@@ -85,6 +85,9 @@ type options struct {
 	decompositionMaxSubQueries int
 	// Reranking reorders fused results with an LLM before pagination.
 	reranking bool
+	// rerankWindow is the number of first fused candidates the reranker
+	// orders; 0 keeps the manager's window, relative to the page size.
+	rerankWindow int
 	// lexicalReranking reorders fused results with the model-free lexical
 	// reranker. Mutually exclusive with reranking: the manager holds a single
 	// reranker slot.
@@ -430,6 +433,18 @@ func WithQueryDecomposition(maxSubQueries int) Option {
 func WithReranking() Option {
 	return func(o *options) {
 		o.reranking = true
+	}
+}
+
+// WithRerankWindow sets how many first fused candidates the reranker
+// (WithReranking, WithLexicalReranking) orders, whatever the page size; the
+// others follow in their fused order. By default the window is four times the
+// page size, and at least 20. A wider window lets the reranker promote
+// documents the fusion ranked low, at the cost of a longer prompt for the LLM
+// reranker.
+func WithRerankWindow(n int) Option {
+	return func(o *options) {
+		o.rerankWindow = n
 	}
 }
 
