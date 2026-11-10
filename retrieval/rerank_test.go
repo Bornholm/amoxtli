@@ -5,8 +5,12 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/bornholm/amoxtli/telemetry"
 	"github.com/bornholm/genai/llm"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/model"
@@ -171,5 +175,49 @@ func TestLLMReranker_IgnoresOutOfRangeAndRepeatedNumbers(t *testing.T) {
 		if out[i].Sections[0] != want {
 			t.Fatalf("result %d = %q, want %q", i, out[i].Sections[0], want)
 		}
+	}
+}
+
+// TestLLMReranker_RecordsFallbackOnSpan checks that a failed rerank is
+// recorded on the span of the context it runs in, so that it can be counted.
+func TestLLMReranker_RecordsFallbackOnSpan(t *testing.T) {
+	results := []*index.SearchResult{
+		resultForSource("docA", "a"),
+		resultForSource("docB", "b"),
+	}
+
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	ctx, span := provider.Tracer("test").Start(context.Background(), "ingest.rerank")
+	out, err := NewLLMReranker(&failingLLM{}, rerankStore(), 0).Rerank(ctx, "q", results)
+	span.End()
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+	if out[0].Sections[0] != "a" || out[1].Sections[0] != "b" {
+		t.Fatalf("fused order not kept: %q %q", out[0].Sections[0], out[1].Sections[0])
+	}
+
+	ended := recorder.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("expected 1 ended span, got %d", len(ended))
+	}
+	fallback := false
+	for _, kv := range ended[0].Attributes() {
+		if kv.Key == attribute.Key(telemetry.AttrRerankFallback) && kv.Value.AsBool() {
+			fallback = true
+		}
+	}
+	if !fallback {
+		t.Errorf("span has no %s=true attribute: %v", telemetry.AttrRerankFallback, ended[0].Attributes())
+	}
+	recorded := false
+	for _, ev := range ended[0].Events() {
+		if ev.Name == "exception" {
+			recorded = true
+		}
+	}
+	if !recorded {
+		t.Errorf("span has no recorded error: %v", ended[0].Events())
 	}
 }

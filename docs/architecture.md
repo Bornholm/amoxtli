@@ -189,7 +189,10 @@ peut rendre une page courte alors que d'autres documents correspondent. C'est le
 prix du filtrage hors de l'index : pour des filtres sélectifs sur de gros
 corpus, privilégier un backend qui saura pousser le filtre dans sa requête
 (`index.FilterableIndex`, ci-dessous). `WithSearchCandidatePoolSize` reste
-disponible pour forcer une fenêtre fixe, sans adaptation.
+disponible pour forcer une fenêtre fixe, qui ne s'adapte pas à la page. Seule
+exception : avec un reranker, une fenêtre plus petite que celle du reranking
+(`WithRerankWindow`) y est relevée et, sous filtre, élargie jusqu'à ce que la
+fenêtre du reranking soit pleine de survivants (500 candidats au plus).
 
 #### Push-down du filtre (`index.FilterableIndex`, ⚠ expérimental)
 

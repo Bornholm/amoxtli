@@ -16,9 +16,14 @@ import (
 // has a method named Index, which would collide with an embedded field.)
 type stubIndex struct {
 	results []*index.SearchResult
+	// limit, when set, makes the index honour MaxResults as a real one does.
+	limit bool
 }
 
 func (s *stubIndex) Search(ctx context.Context, query string, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	if s.limit && opts.MaxResults > 0 && opts.MaxResults < len(s.results) {
+		return s.results[:opts.MaxResults], nil
+	}
 	return s.results, nil
 }
 
@@ -206,26 +211,56 @@ func (r *countingReranker) Rerank(ctx context.Context, query string, results []*
 
 func TestManagerSearchRerankWindow(t *testing.T) {
 	var results []*index.SearchResult
-	for i := range 30 {
-		results = append(results, result(fmt.Sprintf("d%02d", i), float64(30-i), model.SectionID(fmt.Sprintf("s%02d", i))))
+	metadata := map[string]map[string]any{}
+	// More candidates than the fetch bound, so that the bound is tested.
+	for i := range 2 * maxCandidateFetch {
+		host := fmt.Sprintf("d%04d", i)
+		results = append(results, result(host, float64(2*maxCandidateFetch-i), model.SectionID("s"+host)))
+		parity := "odd"
+		if i%2 == 0 {
+			parity = "even"
+		}
+		metadata["test://"+host] = map[string]any{"lang": "fr", "parity": parity}
 	}
 
 	for _, tc := range []struct {
 		name   string
 		window int
+		filter index.Filter
+		pool   int
 		want   int
 	}{
-		{"page relative", 0, minRerankWindow},
-		{"configured", 5, 5},
-		{"wider than the pool", 100, 30},
+		{"page relative", 0, nil, 0, minRerankWindow},
+		{"configured", 5, nil, 0, 5},
+		// Above the default candidate pool of 100.
+		{"wider than the default pool", 150, nil, 0, 150},
+		// A filter that every candidate passes would stop the fetch as soon
+		// as the page is full.
+		{"with a filter", 60, index.Filter{index.Eq("lang", "fr")}, 0, 60},
+		{"above the fetch bound", 2 * maxCandidateFetch, nil, 0, maxCandidateFetch},
+		// Codex.SearchPage pins a pool of 100.
+		{"pinned pool", 150, nil, 100, 150},
+		{"pinned pool with a filter", 150, index.Filter{index.Eq("lang", "fr")}, 100, 150},
+		{"pinned pool wider than the window", 50, nil, 200, 50},
+		// A filter that keeps one candidate in two: the fetch must widen
+		// until the window is full of survivors, pinned pool or not.
+		{"selective filter", 150, index.Filter{index.Eq("parity", "even")}, 0, 150},
+		{"pinned pool with a selective filter", 150, index.Filter{index.Eq("parity", "even")}, 100, 150},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m := newSearchManager(&stubIndex{results: results}, &stubStore{})
+			m := newSearchManager(&stubIndex{results: results, limit: true}, &stubStore{metadata: metadata})
 			reranker := &countingReranker{}
 			m.reranker = reranker
 			m.rerankWindow = tc.window
 
-			if _, err := m.Search(context.Background(), "q", WithSearchMaxResults(3)); err != nil {
+			opts := []SearchOptionFunc{WithSearchMaxResults(3)}
+			if tc.pool > 0 {
+				opts = append(opts, WithSearchCandidatePoolSize(tc.pool))
+			}
+			if tc.filter != nil {
+				opts = append(opts, WithSearchFilter(tc.filter))
+			}
+			if _, err := m.Search(context.Background(), "q", opts...); err != nil {
 				t.Fatalf("search: %+v", err)
 			}
 			if reranker.handed != tc.want {

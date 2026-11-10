@@ -76,7 +76,11 @@ func WithManagerReranker(reranker Reranker) ManagerOptionFunc {
 
 // WithManagerRerankWindow sets how many first fused candidates the reranker
 // orders, whatever the page size; the others follow in their fused order.
-// Zero or less keeps the default window, relative to the page size.
+// Zero or less keeps the default window, relative to the page size. The
+// search fetches at least that many candidates, up to the fetch bound of 500,
+// including when the candidate pool is pinned (WithSearchCandidatePoolSize).
+// The LLM reranker also stops at its word budget (see
+// amoxtli.WithMaxTotalWords).
 func WithManagerRerankWindow(n int) ManagerOptionFunc {
 	return func(opts *ManagerOptions) {
 		opts.RerankWindow = n
@@ -169,9 +173,11 @@ type SearchOptions struct {
 	// page. Use the NextCursor returned by the previous call.
 	Cursor string
 	// CandidatePoolSize pins how many fused candidates are fetched before
-	// filtering, reranking and pagination, disabling the adaptive sizing. 0
-	// (the default) lets the Manager size the window from the requested page,
-	// widening it while a filter leaves too few survivors.
+	// filtering, reranking and pagination: the pool does not adapt to the
+	// page, except that with a reranker it is raised to the rerank window and,
+	// under a filter, widened until the window is full of survivors (up to 500
+	// candidates). 0 (the default) lets the Manager size the window from the
+	// requested page, widening it while a filter leaves too few survivors.
 	CandidatePoolSize int
 }
 
@@ -217,7 +223,12 @@ func WithSearchCursor(cursor string) SearchOptionFunc {
 }
 
 // WithSearchCandidatePoolSize overrides the number of fused candidates fetched
-// before filtering, reranking and pagination.
+// before filtering, reranking and pagination. The pool does not adapt to the
+// page, so that every page of a cursor fetches the same window, with one
+// exception: with a reranker, a pool smaller than the rerank window is raised
+// to it, and under a filter widened until the window is full of survivors (up
+// to 500 candidates). A cursor cannot go past the pool: the pagination ends
+// there, so pin a pool at least as deep as the pages it must serve.
 func WithSearchCandidatePoolSize(size int) SearchOptionFunc {
 	return func(opts *SearchOptions) {
 		opts.CandidatePoolSize = size
@@ -310,7 +321,21 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 		collections = append(collections, coll.ID())
 	}
 
-	results, err := m.searchCandidates(ctx, query, collections, opts, target)
+	// The reranker orders the first window candidates: fetch at least that
+	// many, so that a configured window is not cut short by the candidate
+	// pool, nor by a filter that stops as soon as the page is full. A filter
+	// therefore keeps widening its fetch until the window is full of
+	// survivors (up to maxCandidateFetch), which costs more rounds on a
+	// selective filter: that is the price of a full window. The window
+	// depends only on the page size and the configuration, never on the
+	// cursor, which keeps replayed pages identical.
+	fetch, window := target, 0
+	if m.reranker != nil {
+		window = min(m.rerankWindowFor(pageSize), maxCandidateFetch)
+		fetch = max(fetch, window)
+	}
+
+	results, err := m.searchCandidates(ctx, query, collections, opts, fetch, window)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -382,7 +407,12 @@ func rerankTop(ctx context.Context, reranker Reranker, query string, results []*
 // until enough results survive, the backend runs out of candidates, or the hard
 // bound is reached. The growth is deterministic — it depends only on target —
 // so replaying a page fetches the same window and returns the same ordering.
-func (m *Manager) searchCandidates(ctx context.Context, query string, collections []model.CollectionID, opts *SearchOptions, target int) (candidates []*index.SearchResult, err error) {
+//
+// window is the rerank window (0 without a reranker): a pinned pool is raised
+// to it, and under a filter widened until the window is full of survivors. That
+// growth depends only on the pool, the window and the filter's survivors,
+// never on the cursor, so every page of a cursor fetches the same window.
+func (m *Manager) searchCandidates(ctx context.Context, query string, collections []model.CollectionID, opts *SearchOptions, target, window int) (candidates []*index.SearchResult, err error) {
 	// The over-fetch loop below can query the index several times: the span
 	// reports the window that ended up being needed, next to the number of
 	// candidates that survived the filter.
@@ -402,7 +432,7 @@ func (m *Manager) searchCandidates(ctx context.Context, query string, collection
 	if filterable, ok := index.AsFilterable(m.index); ok && len(opts.Filter) > 0 {
 		limit := target
 		if opts.CandidatePoolSize > 0 {
-			limit = opts.CandidatePoolSize
+			limit = max(opts.CandidatePoolSize, window)
 		}
 
 		results, err := filterable.SearchFiltered(ctx, query, opts.Filter, index.SearchOptions{
@@ -428,9 +458,14 @@ func (m *Manager) searchCandidates(ctx context.Context, query string, collection
 		return results, nil
 	}
 
-	// An explicit pool size is an override: honour it verbatim, no adaptation.
+	// An explicit pool size is an override: no adaptation to the page, so
+	// that every page of a cursor fetches the same window. The rerank window
+	// is the one exception, since it does not depend on the page either: the
+	// pool is raised to it, and under a filter widened until the window is
+	// full of survivors.
 	if opts.CandidatePoolSize > 0 {
-		results, err := search(opts.CandidatePoolSize)
+		size := min(max(opts.CandidatePoolSize, window), maxCandidateFetch)
+		results, err := search(size)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -444,7 +479,21 @@ func (m *Manager) searchCandidates(ctx context.Context, query string, collection
 			return nil, errors.WithStack(err)
 		}
 
-		return filter.apply(ctx, results)
+		for {
+			kept, err := filter.apply(ctx, results)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+
+			if len(kept) >= window || len(results) < size || size >= maxCandidateFetch {
+				return kept, nil
+			}
+
+			size = min(size*candidateFetchGrowth, maxCandidateFetch)
+			if results, err = search(size); err != nil {
+				return nil, errors.WithStack(err)
+			}
+		}
 	}
 
 	// Without a filter nothing is dropped after the fact, so one round always

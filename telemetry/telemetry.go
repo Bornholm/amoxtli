@@ -45,6 +45,9 @@ const (
 	// AttrSectionCount is the number of sections handled by a stage (hydrated,
 	// judged, reranked).
 	AttrSectionCount = "amoxtli.search.section_count"
+	// AttrRerankFallback is true on the rerank span when the LLM reranker
+	// failed and the results kept their fused order.
+	AttrRerankFallback = "amoxtli.rerank.fallback"
 	// AttrVisionOutcome labels how an image description ended: "ok",
 	// "error" or "rejected" (refused before any call, e.g. an oversized
 	// image).

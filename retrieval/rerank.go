@@ -10,10 +10,13 @@ import (
 	"github.com/bornholm/amoxtli/index"
 	"github.com/bornholm/amoxtli/internal/text"
 	"github.com/bornholm/amoxtli/model"
+	"github.com/bornholm/amoxtli/telemetry"
 	"github.com/bornholm/genai/llm"
 	"github.com/bornholm/genai/llm/prompt"
 	"github.com/bornholm/go-x/slogx"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // LLMReranker reorders search results by asking an LLM to rank the retrieved
@@ -51,7 +54,9 @@ appear exactly once in the output.
 // identifiers: a number costs one token and the LLM cannot mistype it. When
 // the LLM call or its answer fails, the results keep their order and the
 // search goes on: the reranker only refines an order that is already usable.
-// A cancelled context still ends the search.
+// The failure is logged and recorded on the current span (AttrRerankFallback);
+// a provider that always fails therefore shows as a fallback on every search,
+// each still paying its call. A cancelled context still ends the search.
 func (r *LLMReranker) Rerank(ctx context.Context, query string, results []*index.SearchResult) ([]*index.SearchResult, error) {
 	if len(results) <= 1 {
 		return results, nil
@@ -83,6 +88,11 @@ func (r *LLMReranker) Rerank(ctx context.Context, query string, results []*index
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, errors.WithStack(ctxErr)
 		}
+		// The search goes on, so the failure is recorded where it can be
+		// counted: on the rerank span, besides the log.
+		span := trace.SpanFromContext(ctx)
+		span.RecordError(err)
+		span.SetAttributes(attribute.Bool(telemetry.AttrRerankFallback, true))
 		slog.WarnContext(ctx, "reranker failed, keeping the fused order", slog.Any("error", err))
 		return results, nil
 	}

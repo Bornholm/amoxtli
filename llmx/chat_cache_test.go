@@ -2,6 +2,8 @@ package llmx
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -110,12 +112,16 @@ func TestChatCacheKeyCoversSeedAndMessages(t *testing.T) {
 
 // TestChatCacheKeyCoversReasoning checks that the reasoning options are part
 // of the key, and that a call without them keeps the key it had before they
-// were.
+// were: its path is pinned to the digest of the key as it was written then.
 func TestChatCacheKeyCoversReasoning(t *testing.T) {
 	inner := &chatStub{}
 	c := newChatTestCache(t, inner)
 
-	plainPath, _ := c.chatPath(llm.NewChatCompletionOptions(seeded(1)...))
+	// The key of seeded(1) before the reasoning options joined it.
+	formerKey := `{"namespace":"stub-chat","seed":1,"temperature":0.2,"response_format":"default","messages":[{"role":"user","content":"hypothetical answer please"}]}`
+	sum := sha256.Sum256([]byte(formerKey))
+	digest := hex.EncodeToString(sum[:])
+	plainPath := filepath.Join(c.dir, "chat", digest[:2], digest+".json")
 	for _, opts := range [][]llm.ChatCompletionOptionFunc{
 		seeded(1),
 		append(seeded(1), llm.WithReasoning(llm.NewReasoningOptions(llm.ReasoningEffortNone))),
