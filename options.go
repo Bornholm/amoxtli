@@ -442,6 +442,12 @@ func WithReranking() Option {
 // page size, and at least 20. A wider window lets the reranker promote
 // documents the fusion ranked low, at the cost of a longer prompt for the LLM
 // reranker.
+//
+// Two bounds apply. The search fetches at least the window's candidates, up
+// to 500, unless the search pins its candidate pool. The LLM reranker shows
+// sections until the WithMaxTotalWords budget is spent (8000 words, or 40
+// sections of the default 200 words): the candidates past it keep their fused
+// order, so a window above 40 needs a larger budget to take effect.
 func WithRerankWindow(n int) Option {
 	return func(o *options) {
 		o.rerankWindow = n

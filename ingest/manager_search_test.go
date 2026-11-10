@@ -16,9 +16,14 @@ import (
 // has a method named Index, which would collide with an embedded field.)
 type stubIndex struct {
 	results []*index.SearchResult
+	// limit, when set, makes the index honour MaxResults as a real one does.
+	limit bool
 }
 
 func (s *stubIndex) Search(ctx context.Context, query string, opts index.SearchOptions) ([]*index.SearchResult, error) {
+	if s.limit && opts.MaxResults > 0 && opts.MaxResults < len(s.results) {
+		return s.results[:opts.MaxResults], nil
+	}
 	return s.results, nil
 }
 
@@ -206,30 +211,43 @@ func (r *countingReranker) Rerank(ctx context.Context, query string, results []*
 
 func TestManagerSearchRerankWindow(t *testing.T) {
 	var results []*index.SearchResult
-	for i := range 30 {
-		results = append(results, result(fmt.Sprintf("d%02d", i), float64(30-i), model.SectionID(fmt.Sprintf("s%02d", i))))
+	metadata := map[string]map[string]any{}
+	for i := range 300 {
+		host := fmt.Sprintf("d%03d", i)
+		results = append(results, result(host, float64(300-i), model.SectionID("s"+host)))
+		metadata["test://"+host] = map[string]any{"lang": "fr"}
 	}
 
 	for _, tc := range []struct {
 		name   string
 		window int
+		filter index.Filter
 		want   int
 	}{
-		{"page relative", 0, minRerankWindow},
-		{"configured", 5, 5},
-		{"wider than the pool", 100, 30},
+		{"page relative", 0, nil, minRerankWindow},
+		{"configured", 5, nil, 5},
+		// Above the default candidate pool of 100.
+		{"wider than the default pool", 150, nil, 150},
+		// A filter that every candidate passes would stop the fetch as soon
+		// as the page is full.
+		{"with a filter", 60, index.Filter{index.Eq("lang", "fr")}, 60},
+		{"above the fetch bound", 1000, nil, maxCandidateFetch},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m := newSearchManager(&stubIndex{results: results}, &stubStore{})
+			m := newSearchManager(&stubIndex{results: results, limit: true}, &stubStore{metadata: metadata})
 			reranker := &countingReranker{}
 			m.reranker = reranker
 			m.rerankWindow = tc.window
 
-			if _, err := m.Search(context.Background(), "q", WithSearchMaxResults(3)); err != nil {
+			opts := []SearchOptionFunc{WithSearchMaxResults(3)}
+			if tc.filter != nil {
+				opts = append(opts, WithSearchFilter(tc.filter))
+			}
+			if _, err := m.Search(context.Background(), "q", opts...); err != nil {
 				t.Fatalf("search: %+v", err)
 			}
-			if reranker.handed != tc.want {
-				t.Fatalf("reranker handed %d candidates, want %d", reranker.handed, tc.want)
+			if reranker.handed != min(tc.want, len(results)) {
+				t.Fatalf("reranker handed %d candidates, want %d", reranker.handed, min(tc.want, len(results)))
 			}
 		})
 	}

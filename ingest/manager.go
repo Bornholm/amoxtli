@@ -76,7 +76,10 @@ func WithManagerReranker(reranker Reranker) ManagerOptionFunc {
 
 // WithManagerRerankWindow sets how many first fused candidates the reranker
 // orders, whatever the page size; the others follow in their fused order.
-// Zero or less keeps the default window, relative to the page size.
+// Zero or less keeps the default window, relative to the page size. The
+// search fetches at least that many candidates, up to the fetch bound of 500;
+// an explicit candidate pool (WithSearchCandidatePoolSize) still wins. The
+// LLM reranker also stops at its word budget (see amoxtli.WithMaxTotalWords).
 func WithManagerRerankWindow(n int) ManagerOptionFunc {
 	return func(opts *ManagerOptions) {
 		opts.RerankWindow = n
@@ -310,7 +313,17 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 		collections = append(collections, coll.ID())
 	}
 
-	results, err := m.searchCandidates(ctx, query, collections, opts, target)
+	// The reranker orders the first window candidates: fetch at least that
+	// many, so that a configured window is not cut short by the candidate
+	// pool, nor by a filter that stops as soon as the page is full. The fetch
+	// still depends only on the page and the configuration, which keeps
+	// replayed pages identical.
+	fetch := target
+	if m.reranker != nil {
+		fetch = max(fetch, m.rerankWindowFor(pageSize))
+	}
+
+	results, err := m.searchCandidates(ctx, query, collections, opts, fetch)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
