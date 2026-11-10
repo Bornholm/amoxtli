@@ -212,9 +212,10 @@ func (r *countingReranker) Rerank(ctx context.Context, query string, results []*
 func TestManagerSearchRerankWindow(t *testing.T) {
 	var results []*index.SearchResult
 	metadata := map[string]map[string]any{}
-	for i := range 300 {
-		host := fmt.Sprintf("d%03d", i)
-		results = append(results, result(host, float64(300-i), model.SectionID("s"+host)))
+	// More candidates than the fetch bound, so that the bound is tested.
+	for i := range 2 * maxCandidateFetch {
+		host := fmt.Sprintf("d%04d", i)
+		results = append(results, result(host, float64(2*maxCandidateFetch-i), model.SectionID("s"+host)))
 		metadata["test://"+host] = map[string]any{"lang": "fr"}
 	}
 
@@ -222,16 +223,21 @@ func TestManagerSearchRerankWindow(t *testing.T) {
 		name   string
 		window int
 		filter index.Filter
+		pool   int
 		want   int
 	}{
-		{"page relative", 0, nil, minRerankWindow},
-		{"configured", 5, nil, 5},
+		{"page relative", 0, nil, 0, minRerankWindow},
+		{"configured", 5, nil, 0, 5},
 		// Above the default candidate pool of 100.
-		{"wider than the default pool", 150, nil, 150},
+		{"wider than the default pool", 150, nil, 0, 150},
 		// A filter that every candidate passes would stop the fetch as soon
 		// as the page is full.
-		{"with a filter", 60, index.Filter{index.Eq("lang", "fr")}, 60},
-		{"above the fetch bound", 1000, nil, maxCandidateFetch},
+		{"with a filter", 60, index.Filter{index.Eq("lang", "fr")}, 0, 60},
+		{"above the fetch bound", 2 * maxCandidateFetch, nil, 0, maxCandidateFetch},
+		// Codex.SearchPage pins a pool of 100.
+		{"pinned pool", 150, nil, 100, 150},
+		{"pinned pool with a filter", 150, index.Filter{index.Eq("lang", "fr")}, 100, 150},
+		{"pinned pool wider than the window", 50, nil, 200, 50},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newSearchManager(&stubIndex{results: results, limit: true}, &stubStore{metadata: metadata})
@@ -240,14 +246,17 @@ func TestManagerSearchRerankWindow(t *testing.T) {
 			m.rerankWindow = tc.window
 
 			opts := []SearchOptionFunc{WithSearchMaxResults(3)}
+			if tc.pool > 0 {
+				opts = append(opts, WithSearchCandidatePoolSize(tc.pool))
+			}
 			if tc.filter != nil {
 				opts = append(opts, WithSearchFilter(tc.filter))
 			}
 			if _, err := m.Search(context.Background(), "q", opts...); err != nil {
 				t.Fatalf("search: %+v", err)
 			}
-			if reranker.handed != min(tc.want, len(results)) {
-				t.Fatalf("reranker handed %d candidates, want %d", reranker.handed, min(tc.want, len(results)))
+			if reranker.handed != tc.want {
+				t.Fatalf("reranker handed %d candidates, want %d", reranker.handed, tc.want)
 			}
 		})
 	}

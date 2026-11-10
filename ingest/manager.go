@@ -77,9 +77,10 @@ func WithManagerReranker(reranker Reranker) ManagerOptionFunc {
 // WithManagerRerankWindow sets how many first fused candidates the reranker
 // orders, whatever the page size; the others follow in their fused order.
 // Zero or less keeps the default window, relative to the page size. The
-// search fetches at least that many candidates, up to the fetch bound of 500;
-// an explicit candidate pool (WithSearchCandidatePoolSize) still wins. The
-// LLM reranker also stops at its word budget (see amoxtli.WithMaxTotalWords).
+// search fetches at least that many candidates, up to the fetch bound of 500,
+// and raises a smaller pinned candidate pool (WithSearchCandidatePoolSize) to
+// it. The LLM reranker also stops at its word budget (see
+// amoxtli.WithMaxTotalWords).
 func WithManagerRerankWindow(n int) ManagerOptionFunc {
 	return func(opts *ManagerOptions) {
 		opts.RerankWindow = n
@@ -315,12 +316,20 @@ func (m *Manager) Search(ctx context.Context, query string, funcs ...SearchOptio
 
 	// The reranker orders the first window candidates: fetch at least that
 	// many, so that a configured window is not cut short by the candidate
-	// pool, nor by a filter that stops as soon as the page is full. The fetch
-	// still depends only on the page and the configuration, which keeps
-	// replayed pages identical.
+	// pool, nor by a filter that stops as soon as the page is full. A filter
+	// therefore keeps widening its fetch until the window is full of
+	// survivors (up to maxCandidateFetch), which costs more rounds on a
+	// selective filter: that is the price of a full window. A pinned pool
+	// smaller than the window (Codex.SearchPage pins 100) is raised to it.
+	// The fetch still depends only on the page and the configuration, which
+	// keeps replayed pages identical.
 	fetch := target
 	if m.reranker != nil {
-		fetch = max(fetch, m.rerankWindowFor(pageSize))
+		window := min(m.rerankWindowFor(pageSize), maxCandidateFetch)
+		fetch = max(fetch, window)
+		if opts.CandidatePoolSize > 0 && opts.CandidatePoolSize < window {
+			opts.CandidatePoolSize = window
+		}
 	}
 
 	results, err := m.searchCandidates(ctx, query, collections, opts, fetch)

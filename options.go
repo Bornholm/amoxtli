@@ -444,10 +444,12 @@ func WithReranking() Option {
 // reranker.
 //
 // Two bounds apply. The search fetches at least the window's candidates, up
-// to 500, unless the search pins its candidate pool. The LLM reranker shows
-// sections until the WithMaxTotalWords budget is spent (8000 words, or 40
-// sections of the default 200 words): the candidates past it keep their fused
-// order, so a window above 40 needs a larger budget to take effect.
+// to 500, SearchPage included. The LLM reranker shows sections until the
+// WithMaxTotalWords budget is spent, and the candidates past it keep their
+// fused order. With the default 200 words per section, the default 8000 words
+// cover about 40 full sections: shorter sections let more candidates in,
+// results of several sections fewer. A wide window over long sections needs
+// a larger budget to take effect.
 func WithRerankWindow(n int) Option {
 	return func(o *options) {
 		o.rerankWindow = n
